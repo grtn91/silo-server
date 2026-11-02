@@ -65,8 +65,15 @@ export function useRestoreJobs() {
 export function useStartRestore(backupId: string) {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: ({ digest, selection }: { digest: string; selection: RestoreSelection }) =>
-      startRestore(captureAdminAuthority(), backupId, digest, selection),
+    mutationFn: ({
+      digest,
+      selection,
+      acceptUnauthenticated,
+    }: {
+      digest: string;
+      selection: RestoreSelection;
+      acceptUnauthenticated?: boolean;
+    }) => startRestore(captureAdminAuthority(), backupId, digest, selection, acceptUnauthenticated),
     retry: false,
     onSettled: () => queryClient.invalidateQueries({ queryKey: adminKeys.backups() }),
   });

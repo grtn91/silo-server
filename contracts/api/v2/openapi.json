@@ -3374,6 +3374,10 @@
             "format": "int64",
             "type": "integer"
           },
+          "clean": {
+            "description": "Whether this copy counts as a clean copy for rotation: complete, with every file, and verified under this server's SECRET_KEY. Rotation always keeps the newest clean copy, even beyond backup.keep",
+            "type": "boolean"
+          },
           "completed_at": {
             "description": "RFC 3339 instant in UTC with millisecond precision",
             "format": "date-time",
@@ -3439,12 +3443,13 @@
             "type": "integer"
           },
           "status": {
-            "description": "complete: manifest written, checksums recorded, table of contents readable; it does not claim a restore was tested. complete_with_warnings: some referenced files were missing when copied, or the restore set left items out (restore_set_omitted). in_progress: being written now. incomplete: no manifest and nothing running; deleted after 24 hours",
+            "description": "complete: manifest written, checksums recorded, table of contents readable; it does not claim a restore was tested. complete_with_warnings: some referenced files were missing when copied, or the restore set left items out (restore_set_omitted). in_progress: being written now. incomplete: no manifest and nothing running; deleted after 24 hours. unverified: this server cannot authenticate the manifest (another SECRET_KEY, none recorded, or changed since it was written); a restore needs confirmation, and one whose manifest names this key but does not verify shows no details and cannot be restored",
             "enum": [
               "complete",
               "complete_with_warnings",
               "in_progress",
-              "incomplete"
+              "incomplete",
+              "unverified"
             ],
             "type": "string"
           }
@@ -3460,7 +3465,8 @@
           "missing_blobs",
           "restore_set_omitted",
           "objects",
-          "key_matches"
+          "key_matches",
+          "clean"
         ],
         "type": "object"
       },
@@ -3975,6 +3981,10 @@
       "AdminBackupRestoreBody": {
         "additionalProperties": false,
         "properties": {
+          "accept_unauthenticated": {
+            "description": "Confirms restoring from a backup whose manifest this server cannot authenticate (authenticated false in the preview); refused without it",
+            "type": "boolean"
+          },
           "digest": {
             "description": "The digest the preview returned",
             "pattern": "^[0-9a-f]{64}$",
@@ -4941,6 +4951,10 @@
       "AdminBackupRestoreSet": {
         "additionalProperties": false,
         "properties": {
+          "authenticated": {
+            "description": "Whether the backup's manifest verified under this server's SECRET_KEY. When false the server cannot tell whether the backup was changed after it was written, and a restore needs accept_unauthenticated",
+            "type": "boolean"
+          },
           "backup_id": {
             "description": "The backup previewed",
             "type": "string"
@@ -5019,6 +5033,7 @@
           "created_at",
           "same_server",
           "key_matches",
+          "authenticated",
           "missing_blobs",
           "omitted",
           "never_restored_settings",

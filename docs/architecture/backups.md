@@ -93,6 +93,33 @@ The check value is HKDF-SHA256 over `SECRET_KEY` with info
 prints the value, so an operator can tell which key a backup needs without
 showing either key.
 
+`mac` authenticates the rest of the manifest: HMAC-SHA256 under a key
+derived from `SECRET_KEY` (HKDF-SHA256, info `silo/backup-manifest/v1`,
+`secret.BackupManifestKey`) of the manifest encoded with `mac` empty, in hex.
+It covers the id, kind, server id, times, every object's name, size, and
+checksum, and every other field. Anyone who can write the destination can
+change an object and its checksum together; only a server with the key can
+write a `mac` that verifies. Every read checks it before trusting anything
+else in the manifest: the listing, downloads and download links, a
+selective restore's preview and restore, `silo backup restore`, and
+`silo backup verify`. The check is a strict state machine, with no legacy
+path (every Silo that writes manifests signs them):
+
+- The manifest names this server's check value: its `mac` must verify, or
+  it is refused (`ErrManifestTampered`), a missing `mac` included, even with
+  `--accept-lost-credentials`.
+- It names another check value, none, or `SECRET_KEY` is not set here: it
+  cannot be authenticated. `silo backup restore` refuses it unless the
+  operator passes `--accept-lost-credentials`, the flag that already accepts
+  a backup taken with another key (whose encrypted settings are lost), and
+  says plainly that the backup cannot be verified; `silo backup verify`
+  warns. A selective restore needs the admin's confirmation
+  (`accept_unauthenticated`), and the listing shows it as `unverified`.
+- A manifest a destination read must also name the folder and server it was
+  read from. A folder whose manifest names this key and does not verify is
+  listed as `unverified` with no details, cannot be restored or downloaded,
+  and the sweep leaves it.
+
 ## Taking a backup
 
 1. Preflight: the user store is PostgreSQL, the destination exists, its id
@@ -314,9 +341,13 @@ away copies the admin meant to keep.
   swept.
 - `nightly` and `manual` copies share `backup.keep`; older ones beyond it are
   deleted, oldest first.
-- The newest `nightly` or `manual` copy without warnings is never deleted, even
-  when that keeps one more than `backup.keep`, so repeated runs with missing
-  blobs cannot rotate away the last copy that has every blob.
+- The newest clean `nightly` or `manual` copy is never deleted, even when
+  that keeps one more than `backup.keep`, so repeated runs with missing blobs
+  cannot rotate away the last copy that has every blob. A clean copy is
+  complete, has every blob, and verifies under this server's `SECRET_KEY`:
+  one this server can restore without extra flags. An unverified copy never
+  stands in for it. The listing sends `clean` per backup, and the page
+  predicts rotation from that instead of deciding it again.
 - `before-restore` copies are deleted after 7 days and do not count toward
   `backup.keep`.
 - Rotation manages only the current server id's prefix, and never deletes a backup that is the source of a queued or
@@ -480,7 +511,16 @@ grouped by the admin page that edits each key: a key or prefix with its class.
   `backup.*`, and state the server writes for itself under an admin prefix:
   sweep and cleanup checkpoints, `recommendations.embedding_lock` (the
   stored vectors' model and dimensions), and
-  `recommendations.policy_marked_generation`.
+  `recommendations.policy_marked_generation`. The network-security and
+  sign-in trust toggles are server-specific too (`trustSettings`): whether
+  webhooks and media-server connections may reach private networks
+  (`*.allow_private_destinations`), `clientip.trusted_proxies`, sign-up,
+  self-service password reset, local password sign-in, and matching
+  external sign-ins by email. A backup is only as trustworthy as its
+  destination, and one of these turned on would let a profile reach this
+  server's private network or let someone sign in, so they stay as the live
+  server has them. `TestTrustSettingsAreServerSpecific` fails on a setting
+  named like one that is not in the list.
 
 A key the table does not match is never offered. `TestEverySettingIsClassified`
 fails for any admin setting default, sensitive setting, or branding asset key
@@ -674,6 +714,18 @@ are written under ids the restore just took, so a legitimate restore finds
 them absent or equal; an archive naming a live asset's key cannot replace
 it, whether or not the item's transaction later commits.
 
+A restored blob meets the checks an upload of its kind meets, before it
+reaches storage (`checkRestoredBlob`): a branding asset its kind's size limit,
+the type its extension serves, and the kind's processing
+(`branding.CheckStoredAsset`); any other image at most 10 MB, a JPEG, PNG, or
+WebP by its bytes, and a source `imageutil.CheckImage` accepts. A blob that
+fails fails its item with `ErrRestoredFileRefused`; other items go on.
+
+The job extracts only the blobs its selected items write (`selectedBlobs`),
+sizing them from the preview's read of the same restore set, and refuses to
+start (`ErrNotEnoughTempSpace`) unless the temporary directory has their size
+plus 1 GB free. The rest of the archive is read, checked, and discarded.
+
 Before its first item, a restore records each store's identity
 (`blobstore.RecordIdentity`), which a store opened with settings would do on
 its first write through a pool connection; items write files inside their
@@ -697,7 +749,14 @@ the same order, so the two wait for each other instead of deadlocking:
   again themselves, which is free in the same transaction, so no caller can
   skip it.
 - Page sections and featured sections: the section editor's order (see
-  `selective_sections.go`).
+  `selective_sections.go`): collection parents, then section rows in id
+  order, then surface revisions. A section whose collection references
+  changed between its read and its row lock is `sections.ErrReferencesChanged`:
+  its new parents are never locked under the section lock.
+- Any item that fails with that, a deadlock (`40P01`), or a serialization
+  failure (`40001`) rolls back to its savepoint and starts again from its
+  read, up to three times, and is then left out as changed during the
+  restore (`changed_since_preview`).
 - Accounts and profiles: `userdata.Preparer`'s order, the account locks, then
   each data type's own, then data rows.
 - Libraries, plugins, and settings write through the editor's own functions
@@ -1047,14 +1106,16 @@ never renamed: a value is bound to its key name.
 `secretTables` in `internal/backup/credentials.go` classifies every table
 that holds a bearer secret or a public capability, each one way:
 
-- Left out: short-lived secrets (sessions, sign-in flows, reset and
-  verification tokens, Watch Together join codes). The dump leaves their
+- Left out: short-lived secrets and capabilities (sessions, sign-in flows,
+  reset and verification tokens, Watch Together join codes, Audiobookshelf
+  playback sessions, whose id alone opens the public track route). The dump leaves their
   rows out, so a restore never brings back a session or token revoked
   after the backup, and after a full restore every client signs in again.
 - Carried from the live server: long-lived credentials that clients and
   other services present to Silo (API keys, pending invitations, invite
   codes, autoscan webhook tokens, audiobook RSS feed links, Plex and
-  Jellyfin webhook sync secrets with their profile mappings), and the
+  Jellyfin webhook sync secrets with their profile mappings, external
+  sign-in links and sign-in providers), and the
   destinations that receive notifications without a session (browser and
   mobile push registrations, notification webhooks, notification email
   addresses, Discord links, server notification channels): one removed
@@ -1068,11 +1129,15 @@ that holds a bearer secret or a public capability, each one way:
   URL slugs, worker leases, delivery histories, account passwords and
   profile PINs with their accounts).
 
-`TestSecretTablesAreClassifiedDB` scans the schema for secret-like column
-names (tokens, secrets, slugs, hashes, codes) and destination-like ones
-(push endpoints and keys, subscriptions, webhooks, callbacks, encrypted
-URLs, channel ids) and fails on a table missing from the list, so a new
-credential or destination table needs a decision before it ships.
+Every other table is classified too (`internal/backup/tables.go`): the
+logs and queues the dump leaves out (`loggedTables`), the server's data
+(`restoredDataTables`), and the running server's own state, restored as it
+is and rebuilt or reconciled by the server (`serverStateTables`: caches,
+queues, job, lease, and lock state, revisions, samples).
+`TestEveryTableIsClassifiedDB` reads every table after the migrations and
+fails on one in no list or in two, and on a listed name that is not a table,
+so a new table needs a decision before it ships; a layer that adds one
+classifies it.
 
 Sensitive settings (`catalog.SensitiveSettingKeys`) are classified the same
 way in `internal/backup/settings_secrets.go`. The signing keys Silo

@@ -51,12 +51,13 @@ export function startRestore(
   id: string,
   digest: string,
   selection: RestoreSelection,
+  acceptUnauthenticated = false,
 ) {
   return readAsAdmin(context, () =>
     v2("POST /api/v2/admin/backups/{id}/restore", {
       profileContext: context,
       path: { id },
-      body: { digest, selection },
+      body: { digest, selection, accept_unauthenticated: acceptUnauthenticated || undefined },
       retryAuthentication: false,
     }),
   );

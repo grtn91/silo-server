@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -214,6 +215,10 @@ func TestBackupRestoreRoundTripDB(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	manifestKey, err := secret.BackupManifestKey(masterKey)
+	if err != nil {
+		t.Fatal(err)
+	}
 	settings := catalog.NewEncryptedSettingsRepo(catalog.NewServerSettingsRepo(pool), cipher)
 	root := t.TempDir()
 	store, err := blobstore.NewFilesystem(root)
@@ -226,10 +231,11 @@ func TestBackupRestoreRoundTripDB(t *testing.T) {
 	svc := New(Options{
 		Pool: pool, DatabaseURL: dsn, Settings: settings,
 		Stores: blobstore.Stores{Assets: store, Operational: store}, Destination: NewStoreDestination(store),
-		Locker:    PostgresLocker{Pool: pool},
-		ServerID:  func(context.Context) (string, error) { return serverID, nil },
-		KeyCheck:  keyCheck,
-		FindTools: func(context.Context) (Tools, error) { return tools, nil },
+		Locker:      PostgresLocker{Pool: pool},
+		ServerID:    func(context.Context) (string, error) { return serverID, nil },
+		KeyCheck:    keyCheck,
+		ManifestKey: manifestKey,
+		FindTools:   func(context.Context) (Tools, error) { return tools, nil },
 	})
 	held, err := svc.opts.Locker.TryLock(ctx)
 	if err != nil {
@@ -252,10 +258,11 @@ func TestBackupRestoreRoundTripDB(t *testing.T) {
 	blobsInto := t.TempDir()
 	loader := PGLoader{Tools: tools}
 	if _, err := RestoreSeparate(ctx, src, loader, SeparateOptions{
-		Validate: ValidateOptions{KeyCheck: keyCheck}, Into: into, BlobsInto: blobsInto,
+		Validate: ValidateOptions{KeyCheck: keyCheck, ManifestKey: manifestKey}, Into: into, BlobsInto: blobsInto,
 	}); err != nil {
 		t.Fatal(err)
 	}
+	checkManifestTampering(t, src, manifestKey, keyCheck)
 
 	in, err := loader.Inspect(ctx, into)
 	if err != nil {
@@ -298,6 +305,41 @@ func TestBackupRestoreRoundTripDB(t *testing.T) {
 		t.Fatalf("verify into a used database = %v, want refusal", err)
 	}
 	checkAnotherKey(t, src, loader, pool, dsn, seed.secretKey)
+}
+
+// checkManifestTampering: a backup whose manifest was changed after it was
+// written, here an object's checksum rewritten to match other bytes, is
+// refused before anything reads its objects.
+func checkManifestTampering(t *testing.T, src *Source, manifestKey []byte, keyCheck string) {
+	t.Helper()
+	path := filepath.Join(src.Dir, ManifestName)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.WriteFile(path, data, 0o600) })
+	m, err := ParseManifest(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Objects[0].SHA256 = strings.Repeat("0", 64)
+	changed, err := json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, changed, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tampered, err := OpenSource(src.Dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tampered.Validate(t.Context(), ValidateOptions{KeyCheck: keyCheck, ManifestKey: manifestKey}); !errors.Is(err, ErrManifestTampered) {
+		t.Fatalf("validating a changed manifest = %v, want ErrManifestTampered", err)
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // checkRestoredFiles: every blob the backup holds is restored, and a
@@ -553,59 +595,55 @@ func checkAnotherKey(t *testing.T, src *Source, loader PGLoader, pool *pgxpool.P
 	}
 }
 
-// secretColumn is a column name that can hold a bearer secret or a public
-// capability, or name a destination that receives data without a session;
-// notSecretColumn excludes names it matches that never do.
-var (
-	secretColumn = `token|secret|slug|key_hash|password|pin_hash|ticket|api_key(_ref|_hash)?$|flow_hash|binder_hash|code_challenge|(^|_)codes?(_hash)?$` +
-		// Destinations that receive data without a session.
-		`|endpoint|p256dh|(^|_)auth$|subscription|webhook|callback|url_ciphertext|channel_id|installation_key|_ciphertext$`
-	notSecretColumn = `_codes$|status_code$|warning_code$|failure_code$|token_type$|token_expir|password_login_enabled$|password_change_required$`
-)
-
-// TestSecretTablesAreClassifiedDB: every table with a secret-like column is
-// in secretTables, so a new credential cannot be restored from a backup
-// without someone deciding whether it should be, and every name there is
-// a table, so the dump excludes or the restore carries something by it.
-func TestSecretTablesAreClassifiedDB(t *testing.T) {
+// TestEveryTableIsClassifiedDB: every table of the schema, after the
+// migrations, is in exactly one list (secretTables, loggedTables,
+// restoredDataTables, serverStateTables), and every listed name is a table,
+// so a new table cannot reach a backup or a restore without someone
+// deciding whether it is data, server state, a log, or a credential the
+// restore leaves out or takes from the live server.
+func TestEveryTableIsClassifiedDB(t *testing.T) {
 	pool, _ := backuptest.Database(t)
 	ctx := t.Context()
-	rows, err := pool.Query(ctx, `
-		SELECT c.relname::text, string_agg(a.attname::text, ', ' ORDER BY a.attnum)
-		FROM pg_attribute a
-		JOIN pg_class c ON c.oid = a.attrelid
-		JOIN pg_namespace n ON n.oid = c.relnamespace
-		WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p') AND NOT c.relispartition
-		  AND a.attnum > 0 AND NOT a.attisdropped AND a.attname ~ $1 AND a.attname !~ $2
-		GROUP BY c.relname ORDER BY c.relname`, secretColumn, notSecretColumn)
+	tables, err := collectStrings(ctx, pool, `
+		SELECT c.relname::text FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p') AND NOT c.relispartition ORDER BY 1`)
 	if err != nil {
 		t.Fatal(err)
 	}
-	classified := map[string]bool{}
+	listed := map[string]string{}
+	add := func(list, name string) {
+		if other, ok := listed[name]; ok {
+			t.Errorf("%s is in %s and %s", name, other, list)
+		}
+		listed[name] = list
+	}
 	for _, table := range secretTables {
-		if classified[table.name] {
-			t.Errorf("%s is in secretTables twice", table.name)
-		}
-		classified[table.name] = true
-		var found bool
-		if err := pool.QueryRow(ctx, `SELECT to_regclass('public.' || $1) IS NOT NULL`, table.name).Scan(&found); err != nil || !found {
-			t.Errorf("secretTables names %s, which is not a table (%v)", table.name, err)
-		}
+		add("secretTables", table.name)
 		if (table.handling == secretCarried) != (table.carry != nil) || table.why == "" {
 			t.Errorf("secretTables entry %s: a carried table needs a carry spec, every entry a reason", table.name)
 		}
 	}
-	for rows.Next() {
-		var table, columns string
-		if err := rows.Scan(&table, &columns); err != nil {
-			t.Fatal(err)
-		}
-		if !classified[table] {
-			t.Errorf("%s has secret-like columns (%s) and is not in secretTables: decide whether a restore leaves it out, carries the live rows, or restores it", table, columns)
+	for _, name := range loggedTables {
+		add("loggedTables", name)
+	}
+	for _, name := range restoredDataTables {
+		add("restoredDataTables", name)
+	}
+	for _, name := range serverStateTables {
+		add("serverStateTables", name)
+	}
+	present := map[string]bool{}
+	for _, table := range tables {
+		present[table] = true
+		if _, ok := listed[table]; !ok {
+			t.Errorf("table %s is not classified: add it to internal/backup (tables.go or secretTables in credentials.go) as data, "+
+				"server state, a log, or a credential a restore leaves out or carries from the live server", table)
 		}
 	}
-	if err := rows.Err(); err != nil {
-		t.Fatal(err)
+	for name, list := range listed {
+		if !present[name] {
+			t.Errorf("%s names %s, which is not a table", list, name)
+		}
 	}
 }
 

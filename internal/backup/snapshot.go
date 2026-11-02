@@ -37,17 +37,18 @@ const (
 // sourceLibraryPoster names what references a library poster blob.
 const sourceLibraryPoster = "library poster"
 
-// excludedTableData lists the tables whose rows a dump leaves out: logs and
-// queues that are large and rebuildable or disposable, and the short-lived
-// secrets of secretTables (secretLeftOut). Their schema is always kept. Each entry
+// excludedTableData lists the tables whose rows a dump leaves out: the logs
+// and queues of loggedTables, and the short-lived secrets of secretTables
+// (secretLeftOut). Their schema is always kept. Each entry
 // also excludes its partitions.
 func excludedTableData(includeIntroFingerprints bool) []string {
-	tables := []string{"activity_log", "operational_logs", "policy_decisions", "catalog_search_index_events"}
-	tables = append(tables, leftOutTables()...)
-	if !includeIntroFingerprints {
-		tables = append(tables, "media_intro_fingerprints")
+	var tables []string
+	for _, t := range loggedTables {
+		if t != tableIntroFingerprints || !includeIntroFingerprints {
+			tables = append(tables, t)
+		}
 	}
-	return tables
+	return append(tables, leftOutTables()...)
 }
 
 // blobRef is one blob the snapshot references.

@@ -144,7 +144,7 @@ func seedSelective(t *testing.T, pool *pgxpool.Pool, settings *catalog.Encrypted
 		poster: "library poster", seed.artwork: "uploaded poster", "local/movies/" + seed.items[0] + "/abcd1234/poster/w500.r1.jpg": "uploaded w500",
 		collectionPoster: "collection poster", "collection-images/" + cid + "/poster/w300.abcd.jpg": "collection w300",
 	} {
-		if err := store.Put(ctx, key, []byte(data)); err != nil {
+		if err := store.Put(ctx, key, testImage(t, data)); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -206,6 +206,10 @@ func newSelectiveFixture(t *testing.T) *selectiveFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
+	manifestKey, err := secret.BackupManifestKey(masterKey)
+	if err != nil {
+		t.Fatal(err)
+	}
 	store, err := blobstore.NewFilesystem(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -213,7 +217,7 @@ func newSelectiveFixture(t *testing.T) *selectiveFixture {
 	f := &selectiveFixture{pool: pool, store: store, serverID: "selective-" + randomHex(t, 4),
 		settings: catalog.NewEncryptedSettingsRepo(catalog.NewServerSettingsRepo(pool), cipher)}
 	f.svc = New(Options{
-		Pool: pool, DatabaseURL: dsn, Settings: f.settings, Cipher: cipher, KeyCheck: keyCheck,
+		Pool: pool, DatabaseURL: dsn, Settings: f.settings, Cipher: cipher, KeyCheck: keyCheck, ManifestKey: manifestKey,
 		Stores: blobstore.Stores{Assets: store, Operational: store}, Destination: NewStoreDestination(store),
 		Locker:    PostgresLocker{Pool: pool},
 		ServerID:  func(context.Context) (string, error) { return f.serverID, nil },

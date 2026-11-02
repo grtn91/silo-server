@@ -766,8 +766,8 @@
 
 # Backups: the full restore round trip (needs the PostgreSQL 18 client), the
 # manifest written last and the sweep, the cluster-wide subsystem lock, the
-# published status of the operation holding it, and every table holding a
-# secret classified for backup and restore. Selective restore: the
+# published status of the operation holding it, and every table classified
+# for backup and restore. Selective restore: the
 # restore round trip with re-run after interruption, idempotency and digest
 # refusal; plugins never installed from a backup, only reconfigured; restore job fencing;
 # a restored library whose setup partly failed, or whose provider placement
@@ -780,7 +780,7 @@
 ./internal/backup TestStatusBelongsToTheOperationHoldingTheLockDB
 ./internal/backup TestStatusRecordsTheLastSuccessDB
 ./internal/backup TestBackupAndDeleteWithOnePoolConnectionDB
-./internal/backup TestSecretTablesAreClassifiedDB
+./internal/backup TestEveryTableIsClassifiedDB
 ./internal/backup TestSelectiveRestoreDB
 ./internal/backup TestTemplateCollectionsAndHomeSectionsDB
 ./internal/backup TestIdentityTwinsRestoreOneToOneDB

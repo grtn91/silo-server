@@ -179,7 +179,7 @@ func runBackupRestore(ctx context.Context, args []string, out io.Writer) error {
 	if err != nil {
 		return err
 	}
-	src, tools, validate, err := openBackupSource(ctx, f.from, keyCheck, f.acceptLostCredentials)
+	src, tools, validate, err := openBackupSource(ctx, f.from, masterKey, keyCheck, f.acceptLostCredentials)
 	if err != nil {
 		return err
 	}
@@ -345,11 +345,11 @@ func runBackupVerify(ctx context.Context, args []string, out io.Writer) error {
 	_ = godotenv.Load(*envFile)
 	// The drill runs anywhere: without SECRET_KEY it only cannot say whether
 	// the key matches.
-	_, keyCheck, err := backupMasterKey(false)
+	masterKey, keyCheck, err := backupMasterKey(false)
 	if err != nil {
 		return err
 	}
-	src, tools, validate, err := openBackupSource(ctx, *from, keyCheck, true)
+	src, tools, validate, err := openBackupSource(ctx, *from, masterKey, keyCheck, true)
 	if err != nil {
 		return err
 	}
@@ -383,9 +383,11 @@ func backupMasterKey(required bool) ([]byte, string, error) {
 var findBackupTools = backup.FindTools
 
 // openBackupSource opens the backup folder at from, the tools that restore
-// it, and the checks a restore runs: keyCheck is this SECRET_KEY's check
-// value, and acceptLostCredentials restores a backup taken with another key.
-func openBackupSource(ctx context.Context, from, keyCheck string, acceptLostCredentials bool) (*backup.Source, backup.Tools, backup.ValidateOptions, error) {
+// it, and the checks a restore runs: masterKey and keyCheck are this
+// SECRET_KEY and its check value (a backup written under it must carry a
+// manifest MAC that verifies), and acceptLostCredentials restores a backup
+// taken with another key.
+func openBackupSource(ctx context.Context, from string, masterKey []byte, keyCheck string, acceptLostCredentials bool) (*backup.Source, backup.Tools, backup.ValidateOptions, error) {
 	src, err := backup.OpenSource(from)
 	if err != nil {
 		return nil, backup.Tools{}, backup.ValidateOptions{}, err
@@ -402,6 +404,11 @@ func openBackupSource(ctx context.Context, from, keyCheck string, acceptLostCred
 		return nil, backup.Tools{}, backup.ValidateOptions{}, err
 	}
 	validate := backup.ValidateOptions{KeyCheck: keyCheck, BinaryMigrations: carried, AcceptLostCredentials: acceptLostCredentials}
+	if masterKey != nil {
+		if validate.ManifestKey, err = secret.BackupManifestKey(masterKey); err != nil {
+			return nil, backup.Tools{}, backup.ValidateOptions{}, err
+		}
+	}
 	if len(carried) > 0 {
 		validate.BinaryGooseVersion = carried[len(carried)-1]
 	}

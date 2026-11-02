@@ -69,7 +69,9 @@ type RestoreSet struct {
 	// blobs maps each blob key in the archive to its extracted file, or to
 	// "" when the read did not extract.
 	blobs map[string]string
-	dir   string
+	// blobSizes is each blob's size in bytes, extracted or not.
+	blobSizes map[string]int64
+	dir       string
 	// metadataBytes estimates what the set holds in memory: its documents
 	// and blob keys, for the preview cache's bound.
 	metadataBytes int64
@@ -94,6 +96,9 @@ type ReadOptions struct {
 	// subdirectory in for plugin archives and blobs. A preview leaves it
 	// empty: their bytes are checked and discarded.
 	ExtractDir string
+	// Extract, when set, picks the blobs an extracting read writes to
+	// ExtractDir; the rest are checked and discarded like a preview's.
+	Extract func(key string) bool
 }
 
 // ReadRestoreSet reads and validates a whole restore set:
@@ -112,7 +117,7 @@ func ReadRestoreSet(ctx context.Context, r io.Reader, opts ReadOptions) (_ *Rest
 	digest := sha256.New()
 	counted := &countingReader{r: io.TeeReader(r, digest)}
 	tr := tar.NewReader(counted)
-	rs := &RestoreSet{blobs: map[string]string{}}
+	rs := &RestoreSet{blobs: map[string]string{}, blobSizes: map[string]int64{}}
 	if opts.ExtractDir != "" {
 		if rs.dir, err = os.MkdirTemp(opts.ExtractDir, "restore-set-"); err != nil {
 			return nil, err
@@ -124,7 +129,7 @@ func ReadRestoreSet(ctx context.Context, r io.Reader, opts ReadOptions) (_ *Rest
 		}()
 	}
 
-	p := &restoreSetParser{rs: rs, seen: map[string]bool{}, documents: map[string][]byte{}}
+	p := &restoreSetParser{rs: rs, extract: opts.Extract, seen: map[string]bool{}, documents: map[string][]byte{}}
 	for entries := 0; ; entries++ {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -186,8 +191,10 @@ type restoreSetParser struct {
 	// ladderDirs are the image directories of referenced artwork originals;
 	// the variants stored beside an original may ride along with it.
 	ladderDirs map[string]sectionSpec
-	seen       map[string]bool
-	documents  map[string][]byte
+	// extract is ReadOptions.Extract.
+	extract   func(key string) bool
+	seen      map[string]bool
+	documents map[string][]byte
 	// logical sums the entries' sizes as their headers state them.
 	logical int64
 }
@@ -384,12 +391,17 @@ func (p *restoreSetParser) blob(key string, h *tar.Header, tr io.Reader) error {
 	if h.Size > maxRestoreSetBlob {
 		return fmt.Errorf("blob %q is larger than %d bytes", key, maxRestoreSetBlob)
 	}
-	target, err := p.extract("blob", h, tr, "")
+	dir := p.rs.dir
+	if p.extract != nil && !p.extract(key) {
+		dir = ""
+	}
+	target, err := p.copyEntry(dir, "blob", h, tr, "")
 	if err != nil {
 		return err
 	}
 	p.rs.blobs[key] = target
-	p.rs.metadataBytes += int64(len(key) + len(target))
+	p.rs.blobSizes[key] = h.Size
+	p.rs.metadataBytes += int64(2*len(key)+len(target)) + 8
 	return nil
 }
 
@@ -413,15 +425,15 @@ func (p *restoreSetParser) archive(h *tar.Header, tr io.Reader, want FileDigest)
 	return nil
 }
 
-// extract copies an entry to a new file in the extraction directory, or
-// discards it, checking its digest when one is expected.
-func (p *restoreSetParser) extract(kind string, h *tar.Header, tr io.Reader, wantSHA string) (string, error) {
+// copyEntry copies an entry to a new file in dir, or discards it when dir
+// is "", checking its digest when one is expected.
+func (p *restoreSetParser) copyEntry(dir, kind string, h *tar.Header, tr io.Reader, wantSHA string) (string, error) {
 	sum := sha256.New()
 	var w io.Writer = sum
 	var file *os.File
-	if p.rs.dir != "" {
+	if dir != "" {
 		var err error
-		if file, err = os.CreateTemp(p.rs.dir, kind+"-"); err != nil {
+		if file, err = os.CreateTemp(dir, kind+"-"); err != nil {
 			return "", err
 		}
 		defer func() { _ = file.Close() }()

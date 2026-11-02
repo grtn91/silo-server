@@ -17,7 +17,13 @@ import (
 var (
 	ErrInvalidSectionConfig    = errors.New("invalid section config")
 	ErrSectionRevisionMismatch = errors.New("section revision mismatch")
-	ErrSectionOrderMismatch    = errors.New("ordered IDs must name each section in the surface exactly once")
+	// ErrReferencesChanged is returned by WriteSectionInTx when the
+	// section's collection references changed between its first read and
+	// the row lock. Taking the new collection parents under the section
+	// lock would reverse Repository.attemptMutation's order, so the caller
+	// rolls the transaction back and starts again from the read.
+	ErrReferencesChanged    = errors.New("the section's collection references changed while it was written")
+	ErrSectionOrderMismatch = errors.New("ordered IDs must name each section in the surface exactly once")
 )
 
 type sectionTransactionKey struct{}
@@ -463,8 +469,9 @@ func WriteSectionInTx(ctx context.Context, tx pgx.Tx, s *PageSection, create boo
 
 // lockWrittenRows locks, in id order, the rows WriteSectionInTx writes:
 // the section itself unless it is new, and the sections a featured one
-// unfeatures on its surface. A collection the section came to reference
-// since previous was read is locked as well.
+// unfeatures on its surface. A section whose collection references changed
+// since previous was read is ErrReferencesChanged: its new parents are
+// never locked under the section's row lock.
 func lockWrittenRows(ctx context.Context, tx pgx.Tx, s *PageSection, create bool, previous []string) error {
 	var ids []string
 	if !create {
@@ -499,7 +506,7 @@ func lockWrittenRows(ctx context.Context, tx pgx.Tx, s *PageSection, create bool
 			continue
 		}
 		if current := referencesOf([]*PageSection{row}); !slices.Equal(current, previous) {
-			return catalog.LockLibraryCollectionReferences(ctx, tx, current, nil)
+			return ErrReferencesChanged
 		}
 	}
 	return nil

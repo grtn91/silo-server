@@ -14214,6 +14214,8 @@ export interface components {
        * @description Files copied into blobs.tar
        */
       blob_count: number;
+      /** @description Whether this copy counts as a clean copy for rotation: complete, with every file, and verified under this server's SECRET_KEY. Rotation always keeps the newest clean copy, even beyond backup.keep */
+      clean: boolean;
       /**
        * Format: date-time
        * @description RFC 3339 instant in UTC with millisecond precision
@@ -14242,10 +14244,10 @@ export interface components {
       /** Format: int64 */
       size_bytes: number;
       /**
-       * @description complete: manifest written, checksums recorded, table of contents readable; it does not claim a restore was tested. complete_with_warnings: some referenced files were missing when copied, or the restore set left items out (restore_set_omitted). in_progress: being written now. incomplete: no manifest and nothing running; deleted after 24 hours
+       * @description complete: manifest written, checksums recorded, table of contents readable; it does not claim a restore was tested. complete_with_warnings: some referenced files were missing when copied, or the restore set left items out (restore_set_omitted). in_progress: being written now. incomplete: no manifest and nothing running; deleted after 24 hours. unverified: this server cannot authenticate the manifest (another SECRET_KEY, none recorded, or changed since it was written); a restore needs confirmation, and one whose manifest names this key but does not verify shows no details and cannot be restored
        * @enum {string}
        */
-      status: "complete" | "complete_with_warnings" | "in_progress" | "incomplete";
+      status: "complete" | "complete_with_warnings" | "in_progress" | "incomplete" | "unverified";
     };
     AdminBackupActive: {
       backup_id?: string;
@@ -14451,6 +14453,8 @@ export interface components {
       username: string;
     };
     AdminBackupRestoreBody: {
+      /** @description Confirms restoring from a backup whose manifest this server cannot authenticate (authenticated false in the preview); refused without it */
+      accept_unauthenticated?: boolean;
       /** @description The digest the preview returned */
       digest: string;
       selection: components["schemas"]["AdminBackupRestoreSelection"];
@@ -14858,6 +14862,8 @@ export interface components {
       users?: components["schemas"]["AdminBackupRestoreUserSelection"][];
     };
     AdminBackupRestoreSet: {
+      /** @description Whether the backup's manifest verified under this server's SECRET_KEY. When false the server cannot tell whether the backup was changed after it was written, and a restore needs accept_unauthenticated */
+      authenticated: boolean;
       /** @description The backup previewed */
       backup_id?: string;
       /**

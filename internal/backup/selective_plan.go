@@ -785,7 +785,11 @@ type RestorePreview struct {
 	CreatedAt     time.Time `json:"created_at"`
 	SameServer    bool      `json:"same_server"`
 	KeyMatches    bool      `json:"key_matches"`
-	MissingBlobs  []string  `json:"missing_blobs"`
+	// Authenticated is set when the backup's manifest verified under this
+	// server's SECRET_KEY; otherwise a restore needs the admin's
+	// confirmation (RestoreRequest.AcceptUnauthenticated).
+	Authenticated bool     `json:"authenticated"`
+	MissingBlobs  []string `json:"missing_blobs"`
 	// Omitted lists items the backup could not carry.
 	Omitted []OmittedItem `json:"omitted"`
 	// NeverRestoredSettings are the server-specific keys and prefixes.
@@ -801,7 +805,7 @@ func (s *Service) Preview(ctx context.Context, id string) (*RestorePreview, erro
 }
 
 func (s *Service) preview(ctx context.Context, src restoreSource) (*RestorePreview, error) {
-	rs, err := s.previewSet(ctx, src)
+	rs, authenticated, err := s.previewSet(ctx, src)
 	if err != nil {
 		return nil, err
 	}
@@ -809,7 +813,7 @@ func (s *Service) preview(ctx context.Context, src restoreSource) (*RestorePrevi
 	p := s.newPlanner(rs, s.opts.Pool)
 	out := &RestorePreview{BackupID: src.backupID, Digest: rs.Digest, FormatVersion: rs.Index.Version, ServerID: rs.Index.ServerID,
 		ServerName: rs.Index.ServerName, SiloVersion: rs.Index.SiloVersion, CreatedAt: rs.Index.CreatedAt,
-		SameServer: rs.Index.ServerID == serverID, KeyMatches: p.keyMatches, MissingBlobs: append([]string{}, rs.MissingBlobs...),
+		SameServer: rs.Index.ServerID == serverID, KeyMatches: p.keyMatches, Authenticated: authenticated, MissingBlobs: append([]string{}, rs.MissingBlobs...),
 		Omitted:               append([]OmittedItem{}, rs.Index.Omitted...),
 		NeverRestoredSettings: ServerSpecificSettings(),
 		Libraries:             []LibraryMapping{}, Sections: []PreviewSection{}}

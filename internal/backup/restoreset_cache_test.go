@@ -37,7 +37,8 @@ func TestPreviewsShareOneValidatedRestoreSet(t *testing.T) {
 		t.Fatal(err)
 	}
 	dest := &countingDestination{Destination: NewStoreDestination(store)}
-	svc := New(Options{Destination: dest, ServerID: func(context.Context) (string, error) { return "server", nil }})
+	svc := New(Options{Destination: dest, KeyCheck: testKeyCheck, ManifestKey: testManifestKey,
+		ServerID: func(context.Context) (string, error) { return "server", nil }})
 	put := func(id string) {
 		index, entries := testRestoreSet()
 		index.ServerName = id // each backup's archive differs
@@ -62,7 +63,7 @@ func TestPreviewsShareOneValidatedRestoreSet(t *testing.T) {
 	sets := make([]*RestoreSet, 8)
 	for i := range sets {
 		wg.Go(func() {
-			rs, err := svc.previewSet(ctx, restoreSource{backupID: first})
+			rs, _, err := svc.previewSet(ctx, restoreSource{backupID: first})
 			if err != nil {
 				t.Error(err)
 			}
@@ -70,7 +71,7 @@ func TestPreviewsShareOneValidatedRestoreSet(t *testing.T) {
 		})
 	}
 	wg.Wait()
-	if _, err := svc.previewSet(ctx, restoreSource{backupID: first}); err != nil {
+	if _, _, err := svc.previewSet(ctx, restoreSource{backupID: first}); err != nil {
 		t.Fatal(err)
 	}
 	if n := dest.opens.Load(); n != 1 {
@@ -81,7 +82,7 @@ func TestPreviewsShareOneValidatedRestoreSet(t *testing.T) {
 			t.Fatal("previews did not share one validated restore set")
 		}
 	}
-	if _, err := svc.previewSet(ctx, restoreSource{backupID: second}); err != nil {
+	if _, _, err := svc.previewSet(ctx, restoreSource{backupID: second}); err != nil {
 		t.Fatal(err)
 	}
 	if n := dest.opens.Load(); n != 2 {

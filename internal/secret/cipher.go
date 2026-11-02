@@ -73,6 +73,17 @@ func KeyCheckValue(masterKey []byte) (string, error) {
 	return digits[0:4] + "-" + digits[4:8] + "-" + digits[8:12] + "-" + digits[12:16], nil
 }
 
+// manifestKeyInfo domain-separates the key that authenticates backup
+// manifests from every other use of the master key.
+const manifestKeyInfo = "silo/backup-manifest/v1"
+
+// BackupManifestKey derives the HMAC-SHA256 key backup manifests are
+// authenticated with: HKDF-SHA256 with manifestKeyInfo, 32 bytes. Only a
+// server holding SECRET_KEY can produce or check a manifest's MAC.
+func BackupManifestKey(masterKey []byte) ([]byte, error) {
+	return deriveFromMasterKey(masterKey, manifestKeyInfo, 32, "backup manifest key")
+}
+
 // deriveFromMasterKey is HKDF-SHA256 over masterKey with info, refusing a key
 // shorter than New accepts. what names the derived value in errors.
 func deriveFromMasterKey(masterKey []byte, info string, length int, what string) ([]byte, error) {

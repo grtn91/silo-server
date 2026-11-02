@@ -174,6 +174,10 @@ type RestoreRequest struct {
 	// Users are the chosen accounts of the users section, with their
 	// targets, profiles, and data types.
 	Users []UserSelection `json:"users,omitempty"`
+	// AcceptUnauthenticated is the admin's confirmation to restore from a
+	// backup whose manifest this server cannot authenticate
+	// (RestorePreview.Authenticated false).
+	AcceptUnauthenticated bool `json:"accept_unauthenticated,omitempty"`
 }
 
 // maxSelectedItems bounds one restore request.
@@ -205,22 +209,37 @@ func (r RestoreRequest) source() restoreSource {
 	return restoreSource{backupID: r.BackupID}
 }
 
-// locate returns a source's digest, frozen in its manifest, and a function
-// that opens it. The digest is of the stored bytes; the opened reader hashes
-// them as it reads.
-func (s *Service) locate(ctx context.Context, src restoreSource) (string, func(context.Context) (*storedReader, error), error) {
+// locatedSource is a restore set as its manifest records it.
+type locatedSource struct {
+	// digest is of the stored bytes, frozen in the manifest; the opened
+	// reader hashes them as it reads.
+	digest string
+	// authenticated is set when the manifest verified under this server's
+	// SECRET_KEY (Manifest.checkMAC); a manifest of another key cannot be.
+	authenticated bool
+	open          func(context.Context) (*storedReader, error)
+}
+
+// locate reads a source's manifest, which completeBackup refuses when it
+// was changed after the backup wrote it, and returns its restore set.
+func (s *Service) locate(ctx context.Context, src restoreSource) (locatedSource, error) {
 	b, err := s.completeBackup(ctx, src.backupID)
 	if err != nil {
-		return "", nil, err
+		return locatedSource{}, err
 	}
 	entry, ok := b.manifest.object(RestoreSetName)
 	if b.manifest.RestoreSet == nil || !ok {
-		return "", nil, ErrNoRestoreSet
+		return locatedSource{}, ErrNoRestoreSet
 	}
-	return entry.SHA256, func(ctx context.Context) (*storedReader, error) {
+	return locatedSource{digest: entry.SHA256, authenticated: b.manifest.authenticated, open: func(ctx context.Context) (*storedReader, error) {
 		return s.openPlain(ctx, b, RestoreSetName)
-	}, nil
+	}}, nil
 }
+
+// ErrUnauthenticated refuses restoring from a backup this server cannot
+// authenticate (written under another SECRET_KEY) without the admin's
+// confirmation: anyone who can write its destination could have changed it.
+var ErrUnauthenticated = &SelectionError{Message: "this backup was written under another SECRET_KEY, so this server cannot tell whether it was changed since; confirm to restore from it anyway"}
 
 // readStoredRestoreSet reads a restore set from body and records the digest
 // of the stored bytes it read, which is what manifests and uploads freeze.
@@ -239,20 +258,21 @@ func readStoredRestoreSet(ctx context.Context, body *storedReader, opts ReadOpti
 }
 
 // openRestoreSet reads a source's restore set and checks it against the
-// digest recorded for it. extract writes plugin archives and blobs to a
+// digest recorded for it. A non-nil extract writes the blobs it picks to a
 // temporary directory the caller removes with Cleanup.
-func (s *Service) openRestoreSet(ctx context.Context, src restoreSource, extract bool) (*RestoreSet, error) {
-	digest, open, err := s.locate(ctx, src)
+func (s *Service) openRestoreSet(ctx context.Context, src restoreSource, extract func(key string) bool) (*RestoreSet, error) {
+	located, err := s.locate(ctx, src)
 	if err != nil {
 		return nil, err
 	}
-	body, err := open(ctx)
+	digest := located.digest
+	body, err := located.open(ctx)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = body.Close() }()
-	opts := ReadOptions{}
-	if extract {
+	opts := ReadOptions{Extract: extract}
+	if extract != nil {
 		opts.ExtractDir = os.TempDir()
 	}
 	rs, err := readStoredRestoreSet(ctx, body, opts)
@@ -271,13 +291,14 @@ func (s *Service) openRestoreSet(ctx context.Context, src restoreSource, extract
 
 // previewSet returns a source's validated restore set for a preview,
 // sharing one read among previews of the same archive (restoreSetCache).
-func (s *Service) previewSet(ctx context.Context, src restoreSource) (*RestoreSet, error) {
-	digest, _, err := s.locate(ctx, src)
+func (s *Service) previewSet(ctx context.Context, src restoreSource) (*RestoreSet, bool, error) {
+	located, err := s.locate(ctx, src)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	return s.restoreSets.get(ctx, digest, func(ctx context.Context) (*RestoreSet, error) {
-		rs, err := s.openRestoreSet(ctx, src, false)
+	digest := located.digest
+	rs, err := s.restoreSets.get(ctx, digest, func(ctx context.Context) (*RestoreSet, error) {
+		rs, err := s.openRestoreSet(ctx, src, nil)
 		if err != nil {
 			return nil, err
 		}
@@ -286,6 +307,7 @@ func (s *Service) previewSet(ctx context.Context, src restoreSource) (*RestoreSe
 		}
 		return rs, nil
 	})
+	return rs, located.authenticated, err
 }
 
 // StartRestore checks a request and queues the restore job. Nothing is read
@@ -333,12 +355,15 @@ func (s *Service) StartRestore(ctx context.Context, userID int, req RestoreReque
 	defer held.Release(context.WithoutCancel(ctx))
 	ctx, cancel := withLost(ctx, held)
 	defer cancel()
-	digest, _, err := s.locate(ctx, req.source())
+	located, err := s.locate(ctx, req.source())
 	if err != nil {
 		return nil, err
 	}
-	if req.Digest != digest {
+	if req.Digest != located.digest {
 		return nil, ErrDigestMismatch
+	}
+	if !located.authenticated && !req.AcceptUnauthenticated {
+		return nil, ErrUnauthenticated
 	}
 	job, err := s.targets.CreateJob(ctx, userID, req)
 	if err != nil {
