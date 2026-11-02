@@ -818,6 +818,7 @@
 ./internal/backup TestRestoreLockOrderDB
 ./internal/backup TestProfileImportAndDeleteLockOrderDB
 ./internal/watchlist TestPrepareCreatesAndLocksTitlesDB
+./internal/watchlist TestExportLeavesOutTitlesAboveTheCeilingDB
 ./internal/watchstate TestHistoryHideMergeDB
 ./internal/watchstate TestProgressMergeKeepsHeartbeatDB
 ./internal/watchstate TestPluginSourcedPlaysDB

@@ -106,6 +106,10 @@ func (BackupData) Export(ctx context.Context, tx pgx.Tx, owner userdata.Owner, k
 			&w.Certification, &w.VoteAverage, &w.AddedAt); err != nil {
 			return userdata.Export{}, err
 		}
+		// A profile's export leaves out titles its watchlist hides now.
+		if !keep.HasTitle(w.Certification) {
+			continue
+		}
 		titles = append(titles, w)
 	}
 	if err := rows.Err(); err != nil {

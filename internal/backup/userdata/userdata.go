@@ -18,6 +18,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+
+	"github.com/Silo-Server/silo-server/internal/access"
 )
 
 // Data type ids. They name a profile's data in a restore set, a profile
@@ -237,12 +239,28 @@ func ResolveAll(ctx context.Context, items Items, ids []string) (map[string]stri
 }
 
 // Prepared is one profile's document of a type, before it is imported.
-// Keep reports whether an export keeps rows about an item: a profile's own
-// export keeps only what the profile may see now. Nil keeps everything.
-type Keep func(item string) bool
+// Keep is what an export keeps: a profile's own export keeps only what the
+// profile may see now. The zero Keep, an administrator backup's, keeps
+// everything.
+type Keep struct {
+	// Item reports whether rows about a catalog item are kept; nil keeps
+	// every item.
+	Item func(item string) bool
+	// MaxContentRating is the profile's rating ceiling for watchlisted
+	// titles outside the library; "" keeps every title (HasTitle).
+	MaxContentRating string
+}
 
-// Has is keep(item); a nil Keep has every item.
-func (k Keep) Has(item string) bool { return k == nil || k(item) }
+// Has reports whether rows about item are kept.
+func (k Keep) Has(item string) bool { return k.Item == nil || k.Item(item) }
+
+// HasTitle reports whether a watchlisted title outside the library, by its
+// stored certification, is kept: by the rule the watchlist shows it with
+// (access.RatingAllowed), so a title without one fails closed under a
+// ceiling.
+func (k Keep) HasTitle(certification string) bool {
+	return access.RatingAllowed(certification, k.MaxContentRating)
+}
 
 type Prepared struct {
 	Owner Owner

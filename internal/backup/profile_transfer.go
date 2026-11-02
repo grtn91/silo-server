@@ -45,6 +45,8 @@ type ProfileExport struct {
 	ProfileName string                     `json:"profile_name"`
 	Data        map[string]json.RawMessage `json:"data"`
 	Items       []ItemRef                  `json:"items"`
+	// summaries are each data type's checks, kept by ParseProfileExport.
+	summaries map[string]userdata.Summary
 }
 
 // Errors a profile import answers with.
@@ -83,49 +85,75 @@ type ProfileTransfer struct {
 	pool     *pgxpool.Pool
 	serverID func(context.Context) (string, error)
 	now      func() time.Time
-	// imports admits imports before they take a pool connection: at most
-	// maxConcurrentImports on this server, and one per account.
-	imports   chan struct{}
-	mu        sync.Mutex
-	importing map[int]bool
+	// slots admits exports and imports before they read a document or take
+	// a pool connection: at most maxConcurrentTransfers on this server, and
+	// one per account.
+	slots        chan struct{}
+	mu           sync.Mutex
+	transferring map[int]bool
 }
 
-// maxConcurrentImports bounds the profile imports one server runs at once.
-// An import holds a pool connection for its whole transaction, so imports
-// arriving together must not take the pool other requests need.
-const maxConcurrentImports = 2
+// maxConcurrentTransfers bounds the profile exports and imports one server
+// runs at once. Each holds a pool connection for its whole transaction and
+// a whole document in memory, so transfers arriving together must not take
+// the pool or the memory other requests need.
+const maxConcurrentTransfers = 2
 
-// ErrProfileImportBusy refuses an import while another runs for the same
-// account, or while this server already runs maxConcurrentImports.
-var ErrProfileImportBusy = errors.New("another profile import is running; try again when it finishes")
+// ErrProfileTransferBusy refuses an export or import while another runs
+// for the same account, or while this server already runs
+// maxConcurrentTransfers.
+var ErrProfileTransferBusy = errors.New("another profile export or import is running; try again when it finishes")
 
 // NewProfileTransfer serves profile export and import over pool.
 func NewProfileTransfer(pool *pgxpool.Pool, serverID func(context.Context) (string, error)) *ProfileTransfer {
 	return &ProfileTransfer{pool: pool, serverID: serverID, now: time.Now,
-		imports: make(chan struct{}, maxConcurrentImports), importing: map[int]bool{}}
+		slots: make(chan struct{}, maxConcurrentTransfers), transferring: map[int]bool{}}
 }
 
-// admit takes an import slot for userID without waiting, or refuses with
-// ErrProfileImportBusy. release gives it back.
+// admit takes a transfer slot for userID without waiting, or refuses with
+// ErrProfileTransferBusy. release gives it back.
 func (t *ProfileTransfer) admit(userID int) (release func(), err error) {
 	select {
-	case t.imports <- struct{}{}:
+	case t.slots <- struct{}{}:
 	default:
-		return nil, ErrProfileImportBusy
+		return nil, ErrProfileTransferBusy
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if t.importing[userID] {
-		<-t.imports
-		return nil, ErrProfileImportBusy
+	if t.transferring[userID] {
+		<-t.slots
+		return nil, ErrProfileTransferBusy
 	}
-	t.importing[userID] = true
+	t.transferring[userID] = true
 	return func() {
 		t.mu.Lock()
-		delete(t.importing, userID)
+		delete(t.transferring, userID)
 		t.mu.Unlock()
-		<-t.imports
+		<-t.slots
 	}, nil
+}
+
+// admittedKey marks a context whose caller holds userID's transfer slot.
+type admittedKey struct{}
+
+// Admit takes userID's transfer slot before the caller reads an import's
+// body, so a refused import buffers nothing. The returned context carries
+// it to Import, which then does not take it again; release gives it back
+// once Import has returned.
+func (t *ProfileTransfer) Admit(ctx context.Context, userID int) (context.Context, func(), error) {
+	release, err := t.admit(userID)
+	if err != nil {
+		return ctx, nil, err
+	}
+	return context.WithValue(ctx, admittedKey{}, userID), release, nil
+}
+
+// slotFor takes userID's slot unless ctx already holds it (Admit).
+func (t *ProfileTransfer) slotFor(ctx context.Context, userID int) (func(), error) {
+	if held, ok := ctx.Value(admittedKey{}).(int); ok && held == userID {
+		return func() {}, nil
+	}
+	return t.admit(userID)
 }
 
 // ProfileExportCapability describes profile export and import for clients.
@@ -141,11 +169,22 @@ func (t *ProfileTransfer) Capability() ProfileExportCapability {
 	return ProfileExportCapability{Format: ProfileExportFormat, Version: ProfileExportVersion, MaxImportBytes: MaxProfileImportBytes, DataTypes: UserDataTypeIDs()}
 }
 
+// ErrProfileExportTooLarge refuses an export larger than an import
+// accepts: no server could import it.
+var ErrProfileExportTooLarge = fmt.Errorf("this profile's data is larger than an import accepts (%d bytes)", MaxProfileImportBytes)
+
 // Export writes the profile's data, read in one snapshot, as the profile
 // may see it now: rows about titles its library access or maturity limits
-// hide are left out, as every other read of its data leaves them out.
+// hide are left out, as every other read of its data leaves them out. It
+// takes the account's transfer slot first, so exports cannot crowd out the
+// pool, and stops once the document is larger than an import accepts.
 func (t *ProfileTransfer) Export(ctx context.Context, scope ProfileImportScope) ([]byte, error) {
 	userID, profileID := scope.UserID, scope.ProfileID
+	release, err := t.slotFor(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 	serverID, err := t.serverID(ctx)
 	if err != nil {
 		return nil, err
@@ -170,10 +209,14 @@ func (t *ProfileTransfer) Export(ctx context.Context, scope ProfileImportScope) 
 		return nil, err
 	}
 	var items []string
+	size := 0
 	for _, dt := range userDataTypes {
 		exp, err := dt.Export(ctx, tx, owner, keep)
 		if err != nil {
 			return nil, fmt.Errorf("exporting %s: %w", dt.ID(), err)
+		}
+		if size += len(exp.Data); size > MaxProfileImportBytes {
+			return nil, ErrProfileExportTooLarge
 		}
 		doc.Data[dt.ID()] = exp.Data
 		items = append(items, exp.Items...)
@@ -181,38 +224,45 @@ func (t *ProfileTransfer) Export(ctx context.Context, scope ProfileImportScope) 
 	if doc.Items, err = readItemRefs(ctx, tx, items); err != nil {
 		return nil, err
 	}
-	return json.Marshal(doc)
+	out, err := json.Marshal(doc)
+	if err == nil && len(out) > MaxProfileImportBytes {
+		return nil, ErrProfileExportTooLarge
+	}
+	return out, err
 }
 
 // exportVisibility is the Keep of a profile's export: every item the
 // profile's data names, read in the export's snapshot, checked once against
-// the catalog visibility the importer applies (contentFilter). The data is
-// read twice, first to learn which items it names.
+// the catalog visibility the importer applies (contentFilter), and the
+// profile's rating ceiling for watchlisted titles outside the library. The
+// first pass only records the items each type asks about and keeps no row,
+// so the data is held in memory once.
 func exportVisibility(ctx context.Context, tx pgx.Tx, owner userdata.Owner, scope ProfileImportScope) (userdata.Keep, error) {
+	keep := userdata.Keep{MaxContentRating: scope.Maturity.MaxContentRating}
 	var ids []string
+	record := userdata.Keep{Item: func(id string) bool { ids = append(ids, id); return false }}
 	for _, dt := range userDataTypes {
-		exp, err := dt.Export(ctx, tx, owner, nil)
-		if err != nil {
-			return nil, fmt.Errorf("exporting %s: %w", dt.ID(), err)
+		if _, err := dt.Export(ctx, tx, owner, record); err != nil {
+			return keep, fmt.Errorf("exporting %s: %w", dt.ID(), err)
 		}
-		ids = append(ids, exp.Items...)
 	}
 	slices.Sort(ids)
 	ids = slices.Compact(ids)
 	if len(ids) == 0 {
-		return nil, nil
+		return keep, nil
 	}
 	visible, err := catalog.FilterAccessibleContentIDsInTransaction(ctx, tx, ids, scope.AllowedLibraryIDs, nil, scope.Maturity)
 	if err != nil {
-		return nil, fmt.Errorf("checking access to items: %w", err)
+		return keep, fmt.Errorf("checking access to items: %w", err)
 	}
 	// An id the catalog no longer holds hides nothing: no read can show it,
 	// and the export keeps the profile's own record of it for another server.
 	known, err := newItemResolver(ctx, tx, nil, ids)
 	if err != nil {
-		return nil, err
+		return keep, err
 	}
-	return func(id string) bool { return visible[id] || !known.present[id] }, nil
+	keep.Item = func(id string) bool { return visible[id] || !known.present[id] }
+	return keep, nil
 }
 
 // ProfileImportScope is the signed-in profile an import writes to or an
@@ -243,7 +293,9 @@ type ProfileImportResult struct {
 
 // ParseProfileExport checks an untrusted document: its size, nesting,
 // format and version, that it carries no account or access field, strict
-// decoding, and each data type's own checks.
+// decoding, and each data type's own checks. It decodes the document once
+// into its top-level members and once strictly; each data type's own
+// checks read its member once.
 func ParseProfileExport(data []byte) (*ProfileExport, error) {
 	if len(data) > MaxProfileImportBytes {
 		return nil, ErrProfileImportTooLarge
@@ -251,13 +303,17 @@ func ParseProfileExport(data []byte) (*ProfileExport, error) {
 	if err := checkJSONDepth(data); err != nil {
 		return nil, &InvalidProfileExportError{Err: err}
 	}
-	var head struct {
-		Format  string `json:"format"`
-		Version int    `json:"version"`
-	}
-	if err := json.Unmarshal(data, &head); err != nil {
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(data, &top); err != nil {
 		return nil, &InvalidProfileExportError{Err: err}
 	}
+	var head struct {
+		Format  string
+		Version int
+	}
+	// A member of the wrong type fails strict decoding below.
+	_ = json.Unmarshal(top["format"], &head.Format)
+	_ = json.Unmarshal(top["version"], &head.Version)
 	if head.Format != ProfileExportFormat {
 		return nil, &InvalidProfileExportError{Err: fmt.Errorf("format %q is not %s", head.Format, ProfileExportFormat)}
 	}
@@ -267,24 +323,30 @@ func ParseProfileExport(data []byte) (*ProfileExport, error) {
 	if head.Version < 1 {
 		return nil, &InvalidProfileExportError{Err: fmt.Errorf("version %d is not valid", head.Version)}
 	}
-	if err := refuseAccessFields(data); err != nil {
+	if err := refuseAccessFields(top); err != nil {
 		return nil, err
 	}
 	var doc ProfileExport
 	if err := decodeStrict(data, &doc); err != nil {
 		return nil, &InvalidProfileExportError{Err: err}
 	}
+	if err := refusePreferenceAccessFields(doc.Data[userdata.Preferences]); err != nil {
+		return nil, err
+	}
 	if len(doc.ProfileName) > maxAccountField || (doc.ServerID != "" && !validServerID(doc.ServerID)) {
 		return nil, &InvalidProfileExportError{Err: errors.New("the source is not valid")}
 	}
+	doc.summaries = map[string]userdata.Summary{}
 	for id, raw := range doc.Data {
 		dt, ok := userDataType(id)
 		if !ok {
 			return nil, &InvalidProfileExportError{Err: fmt.Errorf("unknown data %q", id)}
 		}
-		if _, err := dt.Validate(raw); err != nil {
+		sum, err := dt.Validate(raw)
+		if err != nil {
 			return nil, &InvalidProfileExportError{Err: fmt.Errorf("%s: %w", id, err)}
 		}
+		doc.summaries[id] = sum
 	}
 	if len(doc.Items) > userdata.MaxEntries {
 		return nil, &InvalidProfileExportError{Err: errors.New("too many items")}
@@ -299,35 +361,26 @@ func ParseProfileExport(data []byte) (*ProfileExport, error) {
 	return &doc, nil
 }
 
-// refuseAccessFields looks for account and access fields where a profile
-// record would hold them: the top level and the profile preferences.
-func refuseAccessFields(data []byte) error {
-	var top map[string]json.RawMessage
-	if err := json.Unmarshal(data, &top); err != nil {
-		return &InvalidProfileExportError{Err: err}
-	}
-	check := func(fields map[string]json.RawMessage) error {
-		for key := range fields {
-			if accessFieldNames[key] {
-				return fmt.Errorf("%w (%s)", ErrProfileImportAccessFields, key)
-			}
+// refuseAccessFields refuses account and access fields among a document's
+// top-level members.
+func refuseAccessFields(fields map[string]json.RawMessage) error {
+	for key := range fields {
+		if accessFieldNames[key] {
+			return fmt.Errorf("%w (%s)", ErrProfileImportAccessFields, key)
 		}
-		return nil
 	}
-	if err := check(top); err != nil {
-		return err
-	}
-	var payload struct {
-		Data map[string]json.RawMessage `json:"data"`
-	}
+	return nil
+}
+
+// refusePreferenceAccessFields refuses them among the profile preferences,
+// where a profile record would hold them. Preferences that do not decode
+// here fail their own checks.
+func refusePreferenceAccessFields(raw json.RawMessage) error {
 	var prefs struct {
 		Profile map[string]json.RawMessage `json:"profile"`
 	}
-	// A data member that does not decode here fails strict decoding later.
-	if json.Unmarshal(data, &payload) == nil {
-		if raw, ok := payload.Data[userdata.Preferences]; ok && json.Unmarshal(raw, &prefs) == nil {
-			return check(prefs.Profile)
-		}
+	if raw != nil && json.Unmarshal(raw, &prefs) == nil {
+		return refuseAccessFields(prefs.Profile)
 	}
 	return nil
 }
@@ -335,6 +388,11 @@ func refuseAccessFields(data []byte) error {
 // Import merges a profile export into the signed-in profile, in one
 // transaction, with the restore's merge rules.
 func (t *ProfileTransfer) Import(ctx context.Context, scope ProfileImportScope, data []byte) (*ProfileImportResult, error) {
+	release, err := t.slotFor(ctx, scope.UserID)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 	doc, err := ParseProfileExport(data)
 	if err != nil {
 		return nil, err
@@ -343,11 +401,6 @@ func (t *ProfileTransfer) Import(ctx context.Context, scope ProfileImportScope, 
 	if err != nil {
 		return nil, err
 	}
-	release, err := t.admit(scope.UserID)
-	if err != nil {
-		return nil, err
-	}
-	defer release()
 	tx, err := t.pool.Begin(ctx)
 	if err != nil {
 		return nil, err
@@ -374,9 +427,7 @@ func (t *ProfileTransfer) Import(ctx context.Context, scope ProfileImportScope, 
 	}
 	result := &ProfileImportResult{SameServer: doc.ServerID == serverID, Data: []ReportData{}}
 	var extra []string
-	for id, raw := range doc.Data {
-		dt, _ := userDataType(id)
-		sum, _ := dt.Validate(raw)
+	for _, sum := range doc.summaries {
 		extra = append(extra, sum.Items...)
 	}
 	items, err := newItemResolver(ctx, tx, doc.Items, extra)

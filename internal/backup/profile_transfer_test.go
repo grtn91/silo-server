@@ -52,21 +52,22 @@ func TestParseProfileExportRefusesHostileDocuments(t *testing.T) {
 }
 
 // Imports are admitted before they take a pool connection: one per
-// account, and maxConcurrentImports on the server.
+// account, and maxConcurrentTransfers on the server, exports and imports
+// alike.
 func TestProfileImportAdmission(t *testing.T) {
 	transfer := NewProfileTransfer(nil, nil)
 	first, err := transfer.admit(1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := transfer.admit(1); !errors.Is(err, ErrProfileImportBusy) {
+	if _, err := transfer.admit(1); !errors.Is(err, ErrProfileTransferBusy) {
 		t.Fatalf("a second import for one account = %v, want busy", err)
 	}
 	second, err := transfer.admit(2)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := transfer.admit(3); !errors.Is(err, ErrProfileImportBusy) {
+	if _, err := transfer.admit(3); !errors.Is(err, ErrProfileTransferBusy) {
 		t.Fatalf("an import past the server's limit = %v, want busy", err)
 	}
 	first()
@@ -76,6 +77,22 @@ func TestProfileImportAdmission(t *testing.T) {
 	}
 	second()
 	third()
+
+	// A slot the caller took before reading the body (Admit) carries to
+	// the transfer, which does not take another; any other context does.
+	ctx, release, err := transfer.Admit(t.Context(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	held, err := transfer.slotFor(ctx, 1)
+	if err != nil {
+		t.Fatalf("the admitted import took another slot: %v", err)
+	}
+	held()
+	if _, err := transfer.slotFor(t.Context(), 1); !errors.Is(err, ErrProfileTransferBusy) {
+		t.Fatalf("an export beside an admitted import = %v, want busy", err)
+	}
+	release()
 }
 
 // A restored password or PIN hash this server would not check at its own

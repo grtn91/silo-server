@@ -931,8 +931,21 @@ Personal collection posters are not carried. The export holds what the
 profile may see now, as every other read of its data does: rows about titles
 outside its libraries or above its content-rating or advisory limits are left
 out, and so are those titles' item references (`userdata.Keep`, checked once
-in the export's snapshot). A title the catalog no longer holds stays, since
+in the export's snapshot). Watchlisted titles outside the library are kept
+by the watchlist's own rule: their stored certification under the profile's
+rating ceiling (`access.RatingAllowed`), so a title without one is left out
+under a ceiling. A title the catalog no longer holds stays, since
 no read can show it. A server backup's user documents are not filtered.
+The export reads the data once to learn which items it names, keeping no
+row, and once to write it, and refuses (413) a document larger than an
+import accepts.
+
+Exports and imports share one admission (`ProfileTransfer.admit`): one per
+account and two per server at a time, refused (409) rather than queued, and
+taken before either opens a transaction. An import's slot is taken before
+its body is read (an operation middleware on `importProfile`), so a busy
+server buffers nothing; the import parses the document once into its
+top-level members, once strictly, and runs each data type's checks once.
 
 An import writes only the profile of the session, never one the document
 names, in one transaction, with the merge rules above. It refuses a document

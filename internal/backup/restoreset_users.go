@@ -233,18 +233,22 @@ func (b *restoreSetBuild) addUsers(ctx context.Context, tx pgx.Tx, spec sectionS
 	return nil
 }
 
+// omit records an account the restore set leaves out. Every text field is
+// cut to the length the reader accepts (validateOmitted): one long name
+// must not make the whole index unreadable.
 func (b *restoreSetBuild) omit(spec sectionSpec, account AccountEntry, reason, message string) {
 	label := account.Username
 	if label == "" {
 		label = account.Email
 	}
-	b.index.Omitted = append(b.index.Omitted, OmittedItem{Section: spec.id, ID: strconv.Itoa(account.ID), Label: label, Reason: reason, Message: message})
+	b.index.Omitted = append(b.index.Omitted, OmittedItem{Section: spec.id, ID: strconv.Itoa(account.ID),
+		Label: truncateText(label, maxAccountField), Reason: reason, Message: truncateText(message, maxOmittedText)})
 }
 
 // omitFailed records an account whose export failed, with what failed and
 // the underlying error as separate fields a client can group by.
 func (b *restoreSetBuild) omitFailed(spec sectionSpec, account AccountEntry, err error) {
-	b.omit(spec, account, OmittedExportFailed, truncateText("Its data could not be read: "+err.Error(), maxOmittedText))
+	b.omit(spec, account, OmittedExportFailed, "Its data could not be read: "+err.Error())
 	last := &b.index.Omitted[len(b.index.Omitted)-1]
 	last.Cause, last.Error = exportCause(err), truncateText(rootError(err).Error(), maxOmittedText)
 }
@@ -443,7 +447,7 @@ func exportUser(ctx context.Context, tx pgx.Tx, account AccountEntry) (UserDocum
 		}
 		p.Data = map[string]json.RawMessage{}
 		for _, t := range userDataTypes {
-			exp, err := t.Export(ctx, tx, userdata.Owner{UserID: account.ID, ProfileID: p.ID}, nil)
+			exp, err := t.Export(ctx, tx, userdata.Owner{UserID: account.ID, ProfileID: p.ID}, userdata.Keep{})
 			if err != nil {
 				return doc, nil, &exportError{part: t.ID(), profile: p.ID, err: err}
 			}

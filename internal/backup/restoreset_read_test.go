@@ -15,6 +15,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Silo-Server/silo-server/internal/backup/userdata"
 )
@@ -604,4 +605,32 @@ func withPAXRecords(t *testing.T, archive []byte, name string, records map[strin
 	}
 	t.Fatalf("no header for %s", name)
 	return nil
+}
+
+// An account left out of a restore set is recorded with fields the reader
+// accepts, however long its name or error: one long username must not make
+// the whole index unreadable.
+func TestOmittedAccountsStayReadable(t *testing.T) {
+	long := strings.Repeat("é", 400) // 800 bytes, over maxAccountField
+	cases := []struct {
+		name    string
+		account AccountEntry
+		err     error
+	}{
+		{"long username", AccountEntry{ID: 1, Username: long}, errors.New("boom")},
+		{"long email", AccountEntry{ID: 2, Email: long + "@example.com"}, errors.New("boom")},
+		{"long error", AccountEntry{ID: 3, Username: "a"}, errors.New(strings.Repeat("x", 3*maxOmittedText))},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var b restoreSetBuild
+			b.omitFailed(sectionSpec{id: SectionUsers}, tc.account, &exportError{part: "ratings", err: fmt.Errorf("reading ratings: %w", tc.err)})
+			if err := validateOmitted(b.index.Omitted); err != nil {
+				t.Fatalf("omitted %+v: %v", b.index.Omitted, err)
+			}
+			if !utf8.ValidString(b.index.Omitted[0].Label) || b.index.Omitted[0].Label == "" {
+				t.Fatalf("label %q is not valid text", b.index.Omitted[0].Label)
+			}
+		})
+	}
 }
