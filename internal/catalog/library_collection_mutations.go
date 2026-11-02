@@ -328,3 +328,34 @@ func lockManualLibraryCollection(ctx context.Context, tx pgx.Tx, id string) (int
 	}
 	return libraryID, nil
 }
+
+// AddLibraryCollectionLibrariesInTx adds libraryIDs to a collection's library
+// scope in the caller's transaction, under the parent and membership-order
+// locks an edit takes, and keeps the libraries already in scope as they are.
+// It returns how many it added.
+func AddLibraryCollectionLibrariesInTx(ctx context.Context, tx pgx.Tx, collectionID string, libraryIDs []int) (int, error) {
+	libraryIDs = normalizeCollectionLibraryIDs(0, libraryIDs)
+	if len(libraryIDs) == 0 {
+		return 0, nil
+	}
+	if err := lockLibraryCollectionParent(ctx, tx, collectionID); err != nil {
+		return 0, err
+	}
+	if err := lockLibraryCollectionMembershipOrders(ctx, tx, collectionID, libraryIDs); err != nil {
+		return 0, err
+	}
+	added := 0
+	for _, libraryID := range libraryIDs {
+		tag, err := tx.Exec(ctx, `
+			INSERT INTO library_collection_libraries (collection_id, library_id, group_id, sort_order)
+			SELECT $1, $2, NULL, COALESCE((
+				SELECT MAX(sort_order) + 1 FROM library_collection_libraries WHERE library_id = $2 AND group_id IS NULL
+			), 0)
+			ON CONFLICT (collection_id, library_id) DO NOTHING`, collectionID, libraryID)
+		if err != nil {
+			return added, fmt.Errorf("writing collection library scope: %w", err)
+		}
+		added += int(tag.RowsAffected())
+	}
+	return added, nil
+}
