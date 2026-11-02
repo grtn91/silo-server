@@ -30,7 +30,18 @@ type ControlDB interface {
 	AllowConnections(ctx context.Context, name string, allow bool) error
 	// Terminate ends every session on name other than this command's.
 	Terminate(ctx context.Context, name string) error
+	// LockRestore takes the lock one full restore or recovery of live
+	// holds from before its preflight until it returns, without waiting:
+	// another holder answers ErrRestoreRunning.
+	LockRestore(ctx context.Context, live string) (unlock func(context.Context), err error)
 }
+
+// ErrRestoreRunning refuses a full restore or a recovery while another one
+// of the same database runs. Two at once would both pass preflight (each
+// control connection is on the maintenance database, where neither sees the
+// other on the live one), overwrite the same files, and could each rename the
+// database the other installed.
+var ErrRestoreRunning = errors.New("another restore or recovery of this database is running")
 
 // ErrSwapUnresolved reports databases whose names match no state the swap
 // can be in. Nothing more is changed; the databases stay closed.
@@ -102,12 +113,13 @@ func RestoreSwap(ctx context.Context, src *Source, loader DatabaseLoader, ctl Co
 		now = opts.Now
 	}
 	m := src.Manifest
-	// Step 1.
-	if err := src.Validate(ctx, opts.Validate); err != nil {
+	live, unlock, err := lockLive(ctx, ctl, opts.LiveURL)
+	if err != nil {
 		return err
 	}
-	live, err := databaseName(opts.LiveURL)
-	if err != nil {
+	defer unlock(ctx)
+	// Step 1.
+	if err := src.Validate(ctx, opts.Validate); err != nil {
 		return err
 	}
 	stamp := now().UTC().Format("20060102t150405z")
@@ -231,6 +243,17 @@ func openSwapStores(ctx context.Context, src *Source, opts SwapOptions, stamp st
 // after its preflight: whatever it changed there would be lost, and the
 // credentials the restore carries from the live server could be stale.
 var ErrLiveInUse = errors.New("a client connected to the live database during the restore")
+
+// lockLive takes the full-restore lock of the database liveURL names
+// (ControlDB.LockRestore) and returns that name.
+func lockLive(ctx context.Context, ctl ControlDB, liveURL string) (string, func(context.Context), error) {
+	live, err := databaseName(liveURL)
+	if err != nil {
+		return "", nil, err
+	}
+	unlock, err := ctl.LockRestore(ctx, live)
+	return live, unlock, err
+}
 
 // carryIdleCredentials carries the live server's credentials into the
 // restored database. They are as they will be at the swap only while no
@@ -687,6 +710,11 @@ func RecoverSwap(ctx context.Context, journalPath string, ctl ControlDB, cipher 
 		return err
 	}
 	defer j.close()
+	unlock, err := ctl.LockRestore(ctx, j.header.LiveDatabase)
+	if err != nil {
+		return err
+	}
+	defer unlock(ctx)
 	s := &swap{ctl: ctl, j: j, out: out, stores: blobStores{}}
 	state, err := s.observe(ctx)
 	if err != nil {

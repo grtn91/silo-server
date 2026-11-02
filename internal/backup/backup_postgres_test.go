@@ -794,3 +794,54 @@ func TestBackupAndDeleteWithOnePoolConnectionDB(t *testing.T) {
 		t.Fatalf("the deleted backup still holds %d objects", len(objects))
 	}
 }
+
+// TestFullRestoresAreSerializedDB: two full restores of one database cannot
+// run at once. Each control connection is on the maintenance database, so
+// neither preflight sees the other; the restore lock refuses the second
+// before it reads the backup or changes anything, names the holder, and
+// frees when its holder returns or its connection dies.
+func TestFullRestoresAreSerializedDB(t *testing.T) {
+	_, dsn := backuptest.Database(t)
+	ctx := t.Context()
+	live, err := databaseName(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	connect := func() *PGControl {
+		ctl, err := ConnectControl(ctx, dsn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = ctl.Close(context.Background()) })
+		return ctl
+	}
+	first, second := connect(), connect()
+	unlock, err := first.LockRestore(ctx, live)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = RestoreSwap(ctx, &Source{Manifest: &Manifest{}}, nil, second, SwapOptions{LiveURL: dsn})
+	if !errors.Is(err, ErrRestoreRunning) || !strings.Contains(err.Error(), "process ") {
+		t.Fatalf("a second restore = %v, want ErrRestoreRunning naming the holder", err)
+	}
+	other, err := second.LockRestore(ctx, live+"_other")
+	if err != nil {
+		t.Fatalf("another database's restore: %v", err)
+	}
+	other(ctx)
+	unlock(ctx)
+	if _, err := second.LockRestore(ctx, live); err != nil {
+		t.Fatalf("after the first returned: %v", err)
+	}
+	// A restore that dies, still holding it, frees the lock with its
+	// connection.
+	if err := second.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	third := connect()
+	if unlock, err := third.LockRestore(ctx, live); err != nil {
+		t.Fatalf("after the holder's connection closed: %v", err)
+	} else {
+		unlock(ctx)
+	}
+}
