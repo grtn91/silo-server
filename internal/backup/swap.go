@@ -167,9 +167,7 @@ func RestoreSwap(ctx context.Context, src *Source, loader DatabaseLoader, ctl Co
 	if err := clearLostSettings(ctx, loader, restoredURL, m, opts.Validate, opts.Cipher, out); err != nil {
 		return discard(err)
 	}
-	// The live server's credentials, read now: preflight found no other
-	// client on the live database, so they are as they will be at the swap.
-	if err := carryCredentials(ctx, loader, restoredURL, opts.LiveURL, out); err != nil {
+	if err := carryIdleCredentials(ctx, ctl, live, loader, restoredURL, opts.LiveURL, out); err != nil {
 		return discard(err)
 	}
 	// A subtitle the backup left out may still be in the live storage the
@@ -227,6 +225,36 @@ func openSwapStores(ctx context.Context, src *Source, opts SwapOptions, stamp st
 		return blobstore.Stores{}, nil, err
 	}
 	return opened, sealed, nil
+}
+
+// ErrLiveInUse stops a restore when a client connected to the live database
+// after its preflight: whatever it changed there would be lost, and the
+// credentials the restore carries from the live server could be stale.
+var ErrLiveInUse = errors.New("a client connected to the live database during the restore")
+
+// carryIdleCredentials carries the live server's credentials into the
+// restored database. They are as they will be at the swap only while no
+// other client is on the live database: one that connected since preflight
+// stops the restore here, and the swap checks again once the live database
+// is closed (swap.run).
+func carryIdleCredentials(ctx context.Context, ctl ControlDB, live string, loader DatabaseLoader, restoredURL, liveURL string, out io.Writer) error {
+	if err := checkLiveIdle(ctx, ctl, live); err != nil {
+		return err
+	}
+	return carryCredentials(ctx, loader, restoredURL, liveURL, out)
+}
+
+// checkLiveIdle requires that no client other than this command is on the
+// live database.
+func checkLiveIdle(ctx context.Context, ctl ControlDB, live string) error {
+	others, err := ctl.OtherConnections(ctx, live)
+	if err != nil {
+		return fmt.Errorf("checking for other connections: %w", err)
+	}
+	if others > 0 {
+		return fmt.Errorf("%w: %d other clients are connected to %s, so changes they made since the restore began, credentials included, would be lost. Stop Silo on every server, turn off automatic restarts, and run the restore again", ErrLiveInUse, others, live)
+	}
+	return nil
 }
 
 // swapPreflight is §10.2 step 2: no other client on the live database, the
@@ -394,6 +422,11 @@ func (s *swap) run(ctx context.Context, src *Source, databaseOnly bool) error {
 		return s.settle(ctx, fmt.Errorf("closing %s: %w", h.LiveDatabase, err))
 	}
 	if err := s.j.step(ctx, stepLiveClosed); err != nil {
+		return s.settle(ctx, err)
+	}
+	// A client still connected now joined after the credentials were
+	// carried: ending its session would lose what it changed since.
+	if err := checkLiveIdle(ctx, s.ctl, h.LiveDatabase); err != nil {
 		return s.settle(ctx, err)
 	}
 	if err := s.ctl.Terminate(ctx, h.LiveDatabase); err != nil {

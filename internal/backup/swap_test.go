@@ -66,6 +66,10 @@ type fakeControl struct {
 	// openAfter records, after each statement, which databases admitted
 	// connections.
 	openAfter [][]string
+	// joinOnLoad and joinOnCarry connect a client to the live database
+	// while the restore loads the dump, or right after it carries the
+	// credentials, as a server started meanwhile would.
+	joinOnLoad, joinOnCarry bool
 }
 
 func newFakeControl(t *testing.T) *fakeControl {
@@ -213,12 +217,18 @@ func (l fakeLoader) RotateSigningSecrets(context.Context, string, *secret.Cipher
 	return true, nil
 }
 func (l fakeLoader) CarryCredentials(context.Context, string, string) (CarriedCredentials, error) {
+	if l.ctl.joinOnCarry {
+		l.ctl.dbs[liveDB].sessions++
+	}
 	return CarriedCredentials{}, nil
 }
 func (l fakeLoader) Load(_ context.Context, dbURL, _ string) error {
 	name, err := databaseName(dbURL)
 	if err != nil {
 		return err
+	}
+	if l.ctl.joinOnLoad {
+		l.ctl.dbs[liveDB].sessions++
 	}
 	return l.ctl.connect(name)
 }
@@ -674,6 +684,31 @@ func TestSwapPreflightChangesNothing(t *testing.T) {
 			t.Fatalf("restore = %v, calls %v", err, f.ctl.calls)
 		}
 	})
+}
+
+// TestSwapStopsWhenAClientJoinsTheLiveDatabase: the credentials a restore
+// carries are the live server's only while nothing else is on the live
+// database. A client that connects after preflight, before or after the
+// carry, stops the restore with the live database open and unchanged,
+// rather than having its session ended and its changes lost.
+func TestSwapStopsWhenAClientJoinsTheLiveDatabase(t *testing.T) {
+	for name, join := range map[string]func(*fakeControl){
+		"while the dump loads":  func(c *fakeControl) { c.joinOnLoad = true },
+		"after the credentials": func(c *fakeControl) { c.joinOnCarry = true },
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newSwapFixture(t)
+			join(f.ctl)
+			err, _ := f.restore()
+			if !errors.Is(err, ErrLiveInUse) {
+				t.Fatalf("restore = %v, want ErrLiveInUse\n%s", err, f.output.String())
+			}
+			if slices.Contains(f.ctl.calls, "terminate "+liveDB) {
+				t.Fatalf("the swap ended the client's session: %v", f.ctl.calls)
+			}
+			f.wantRolledBack()
+		})
+	}
 }
 
 // TestSwapRefusesUnsafeArchives: blobs.tar is checked whole before anything
