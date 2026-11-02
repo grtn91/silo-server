@@ -646,7 +646,7 @@ func (s *Service) folders(ctx context.Context, t target, serverID string) ([]fol
 				slog.WarnContext(ctx, "unreadable backup manifest", "component", "backup", "id", id, "error", err)
 				continue
 			}
-			f.manifest = m
+			f.manifest, f.verified = m, m.authenticated || s.opts.ManifestKey == nil
 		}
 	}
 	out := make([]folder, 0, len(order))

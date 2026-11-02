@@ -324,9 +324,13 @@ away copies the admin meant to keep.
   swept.
 - `nightly` and `manual` copies share `backup.keep`; older ones beyond it are
   deleted, oldest first.
-- The newest `nightly` or `manual` copy without warnings is never deleted, even
-  when that keeps one more than `backup.keep`, so repeated runs with missing
-  blobs cannot rotate away the last copy that has every blob.
+- The newest clean `nightly` or `manual` copy is never deleted, even when
+  that keeps one more than `backup.keep`, so repeated runs with missing blobs
+  cannot rotate away the last copy that has every blob. A clean copy is
+  complete, has every blob, and verifies under this server's `SECRET_KEY`:
+  one this server can restore without extra flags. An unverified copy never
+  stands in for it. The listing sends `clean` per backup, and the page
+  predicts rotation from that instead of deciding it again.
 - Rotation manages only the current server id's prefix.
 - Deleting a backup takes the same lock.
 - A delete that fails leaves a warning in the task result.

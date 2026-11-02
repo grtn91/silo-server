@@ -3374,6 +3374,10 @@
             "format": "int64",
             "type": "integer"
           },
+          "clean": {
+            "description": "Whether this copy counts as a clean copy for rotation: complete, with every file, and verified under this server's SECRET_KEY. Rotation always keeps the newest clean copy, even beyond backup.keep",
+            "type": "boolean"
+          },
           "completed_at": {
             "description": "RFC 3339 instant in UTC with millisecond precision",
             "format": "date-time",
@@ -3452,7 +3456,8 @@
           "blob_count",
           "missing_blobs",
           "objects",
-          "key_matches"
+          "key_matches",
+          "clean"
         ],
         "type": "object"
       },

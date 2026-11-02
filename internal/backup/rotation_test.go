@@ -15,7 +15,12 @@ func TestPlanRotation(t *testing.T) {
 	clean := &Manifest{}
 	warned := &Manifest{MissingBlobs: []MissingBlob{{Key: "gone"}}}
 	backup := func(kind Kind, age int, m *Manifest) folder {
-		return folder{id: FolderName(day(age), kind), kind: kind, at: day(age), manifest: m}
+		return folder{id: FolderName(day(age), kind), kind: kind, at: day(age), manifest: m, verified: true}
+	}
+	unverified := func(kind Kind, age int, m *Manifest) folder {
+		f := backup(kind, age, m)
+		f.verified = false
+		return f
 	}
 	id := func(kind Kind, age int) string { return FolderName(day(age), kind) }
 
@@ -44,6 +49,25 @@ func TestPlanRotation(t *testing.T) {
 				backup(KindNightly, 3, clean)},
 			keep: 2,
 			want: []string{id(KindNightly, 3)},
+		},
+		{
+			name: "an unverified clean copy does not stand in for a verified one",
+			folders: []folder{unverified(KindNightly, 0, clean), backup(KindNightly, 1, warned), backup(KindNightly, 2, clean),
+				backup(KindNightly, 3, clean)},
+			keep: 1,
+			want: []string{id(KindNightly, 1), id(KindNightly, 3)},
+		},
+		{
+			name:    "an unverified warned copy is rotated like any other",
+			folders: []folder{backup(KindNightly, 0, clean), unverified(KindNightly, 1, warned), unverified(KindNightly, 2, clean)},
+			keep:    1,
+			want:    []string{id(KindNightly, 1), id(KindNightly, 2)},
+		},
+		{
+			name:    "with only unverified clean copies, keep applies as is",
+			folders: []folder{backup(KindNightly, 0, warned), unverified(KindNightly, 1, clean), unverified(KindNightly, 2, clean)},
+			keep:    1,
+			want:    []string{id(KindNightly, 1), id(KindNightly, 2)},
 		},
 		{
 			name:    "with every copy warned, keep applies as is",
