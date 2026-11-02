@@ -397,11 +397,8 @@ segment, backslash, or NUL; no duplicate paths, sections, or item ids;
 `restore-set.json` first; every other file listed in the index with its size
 and digest, and every listed file present; blobs only under their section's
 prefixes and only keys the section references, or variants stored in a
-referenced artwork original's directory; user documents whose file names
-their own account, with a known role, bounded fields, unique profile ids,
-avatars only under `profile-avatars/` and listed for the section, and data
-only of registered data types, each passing its owner's strict checks;
-documents that decode strictly
+referenced artwork original's directory; avatars a user document names
+listed for the section; documents that decode strictly
 (unknown fields and trailing data refused) and match the index counts; and
 limits on entries (200,000), document size (64 MiB), plugin archive and blob
 size (256 MiB), total bytes (32 GiB), and JSON nesting (32). A plugin archive
@@ -418,7 +415,11 @@ section carrying a collection its configuration does not name, item artwork
 that does not say what it is, a plugin whose configuration keys repeat or
 whose values are not JSON, and a branding entry that is not for a branding
 asset setting (`branding.AssetSettingKeys`) or whose reference is not one
-file name naming its own blob (a branding entry is written as a setting).
+file name naming its own blob (a branding entry is written as a setting), and
+a user document that names another account than its file, or whose account
+or profiles fail their checks (a known role, bounded fields, unique profile
+ids, avatars only under `profile-avatars/`, and data only of registered data
+types, each passing its owner's strict checks); that account is left out.
 The preview lists each as an unchoosable item with reason `unreadable`; an
 id listed twice still refuses the set.
 

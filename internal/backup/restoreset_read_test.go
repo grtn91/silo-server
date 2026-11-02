@@ -302,18 +302,35 @@ func TestReadRestoreSetRefusesHostileUserDocuments(t *testing.T) {
 	}
 	refuseAll(t, map[string]func(*RestoreSetIndex, *[]testEntry){
 		"users in a version 1 set": func(i *RestoreSetIndex, _ *[]testEntry) { i.Version = 1 },
-		"user document of another account": replace("users/5.json", func(e *testEntry) {
-			e.data = mustJSON(testUserDocument(6, "upload:profile-avatars/5/p1/original.webp"))
-		}),
 		"an owner flag in a user document": replace("users/5.json", func(e *testEntry) {
 			e.data = bytes.Replace(e.data, []byte(`"role":"user"`), []byte(`"role":"user","is_owner":true`), 1)
+		}),
+		"avatar not listed": userCase(func(d *UserDocument) { d.Profiles[0].Avatar = "upload:profile-avatars/5/p9/original.webp" }),
+	})
+	// A document whose own values no restore could write leaves that
+	// account out, listed, and the rest of the set readable.
+	for name, edit := range map[string]func(*RestoreSetIndex, *[]testEntry){
+		"user document of another account": replace("users/5.json", func(e *testEntry) {
+			e.data = mustJSON(testUserDocument(6, "upload:profile-avatars/5/p1/original.webp"))
 		}),
 		"an unknown role":            userCase(func(d *UserDocument) { d.Account.Role = "owner" }),
 		"unknown profile data":       userCase(func(d *UserDocument) { d.Profiles[0].Data["passwords"] = json.RawMessage(`{}`) }),
 		"repeated profile id":        userCase(func(d *UserDocument) { d.Profiles = append(d.Profiles, d.Profiles[0]) }),
-		"avatar not listed":          userCase(func(d *UserDocument) { d.Profiles[0].Avatar = "upload:profile-avatars/5/p9/original.webp" }),
 		"avatar outside the avatars": userCase(func(d *UserDocument) { d.Profiles[0].Avatar = "upload:library-posters/3.jpg" }),
-	})
+	} {
+		t.Run(name, func(t *testing.T) {
+			index, entries := testRestoreSet()
+			edit(&index, &entries)
+			resyncDigests(&index, entries)
+			rs, err := ReadRestoreSet(context.Background(), bytes.NewReader(buildTar(t, index, entries)), ReadOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(rs.Users) != 0 || len(rs.Unusable) != 1 || rs.Unusable[0].Section != SectionUsers {
+				t.Fatalf("users %d, unusable %+v", len(rs.Users), rs.Unusable)
+			}
+		})
+	}
 }
 
 // brandingCase puts one branding entry, its blob listed and present, into an

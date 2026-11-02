@@ -570,12 +570,18 @@ func (p *restoreSetParser) decodeUsers(spec sectionSpec) (int, error) {
 		if !ok {
 			return 0, fmt.Errorf("%s is missing", name)
 		}
+		label := doc.Account.Username
+		if label == "" {
+			label = doc.Account.Email
+		}
 		if strconv.Itoa(doc.Account.ID) != id {
-			return 0, fmt.Errorf("%s holds account %d", name, doc.Account.ID)
+			p.unusable(SectionUsers, KindAccount, label, "Its document names another account than its file.")
+			continue
 		}
 		blobs, err := validateUserDocument(&doc)
 		if err != nil {
-			return 0, fmt.Errorf("%s: %w", name, err)
+			p.unusable(SectionUsers, KindAccount, label, truncateText("It cannot be restored: "+err.Error(), 500))
+			continue
 		}
 		for _, key := range blobs {
 			if err := p.requireReferenced(SectionUsers, key); err != nil {
@@ -584,7 +590,7 @@ func (p *restoreSetParser) decodeUsers(spec sectionSpec) (int, error) {
 		}
 		p.rs.Users = append(p.rs.Users, doc)
 	}
-	return len(p.rs.Users), nil
+	return len(p.itemIDs(spec)), nil
 }
 
 // validateUserDocument checks an untrusted user document and returns the
