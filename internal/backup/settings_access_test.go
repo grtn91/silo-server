@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/Silo-Server/silo-server/internal/config"
+	"github.com/Silo-Server/silo-server/internal/markers"
 )
 
 // TestAccessSettingWider: a restore keeps or writes an access setting only
@@ -30,6 +31,10 @@ func TestAccessSettingWider(t *testing.T) {
 		{settingTrustedProxies, "10.0.0.0/8, 203.0.113.7", "10.0.0.0/8", true},
 		{settingTrustedProxies, "10.1.0.0/16", "10.0.0.0/8", false},
 		{"ratelimit.enabled", "false", "true", true},
+		{settingReleaseEvents, "true", "false", true},
+		{settingReleaseEvents, "false", "", false},
+		{markers.SettingShareByDefault, "true", "", true},
+		{markers.SettingMode, "both", "local", true},
 		{"ratelimit.auth.login.requests_per_minute", "1000", "20", true},
 		{"ratelimit.auth.login.requests_per_minute", "5", "", false},
 	} {
@@ -47,7 +52,9 @@ func TestAccessSettingWider(t *testing.T) {
 // has, with a default, so an unset row compares as the server reads it.
 func TestAccessSettingsAreClassified(t *testing.T) {
 	for _, key := range AccessSettingKeys() {
-		if settingDefault(key) == "" {
+		// Sharing markers is off unless set; its comparison reads an unset
+		// value as the server does.
+		if settingDefault(key) == "" && key != markers.SettingShareByDefault {
 			t.Errorf("access setting %s has no default", key)
 		}
 	}

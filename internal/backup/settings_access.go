@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/Silo-Server/silo-server/internal/config"
+	"github.com/Silo-Server/silo-server/internal/markers"
 	"github.com/Silo-Server/silo-server/internal/ratelimit"
 	"github.com/Silo-Server/silo-server/internal/secret"
 )
@@ -66,6 +67,23 @@ var accessSettings = func() map[string]widerFunc {
 		"notifications.discord_enabled":               on,
 		"notifications.server_channels_enabled":       on,
 		"notifications.fanout_enabled":                on,
+		settingReleaseEvents:                          on,
+		"notifications.ui_enabled":                    on,
+		// What leaves the server: downloads, library data sent to outside AI
+		// and embedding providers, markers shared online, and the server's
+		// advertisement on the local network.
+		"download.enabled":                            on,
+		"download.transcode_enabled":                  on,
+		"metadata_ai.enabled":                         on,
+		"subtitle_ai.enabled":                         on,
+		"subtitle_ai.transcribe_enabled":              on,
+		"recommendations.enabled":                     on,
+		"catalog.search.meilisearch.semantic_enabled": on,
+		markers.SettingShareByDefault: func(restored, live string) bool {
+			return markers.ShareByDefaultEnabled(restored) && !markers.ShareByDefaultEnabled(live)
+		},
+		markers.SettingMode:    byRank(map[string]int64{string(markers.ModeLocal): 0, string(markers.ModeOnline): 1, string(markers.ModeBoth): 1}),
+		"server.lan_discovery": on,
 		// Sign-in throttling.
 		"ratelimit.enabled": func(restored, live string) bool { return on(live, restored) },
 	}
@@ -84,6 +102,7 @@ const (
 	settingSMTPSecurity       = "email.smtp_security"
 	smtpStartTLS, smtpTLS     = "starttls", "tls"
 	smtpNone                  = "none"
+	settingReleaseEvents      = "notifications.release_events_enabled"
 )
 
 // widerFunc reports whether restored grants more than live, both effective

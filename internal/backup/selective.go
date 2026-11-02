@@ -130,6 +130,9 @@ type RestoreTargets struct {
 	// It may run again after a crash, so each step must be idempotent and
 	// must not overwrite setup an admin made since.
 	LibraryCreated func(ctx context.Context, id int) error
+	// LibrarySectionsCreated seeds a restored library's default and home
+	// sections where none exist, once the restore wrote any it carries.
+	LibrarySectionsCreated func(ctx context.Context, id int) error
 	// PluginInstalled runs a restored installation's follow-ups: the
 	// lifecycle change (EventPluginsChanged) and the provider-chain sync an
 	// upload performs. Like LibraryCreated it may run again.

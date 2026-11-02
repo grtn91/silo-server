@@ -56,6 +56,7 @@ func wireBackupRestore(deps Dependencies, admin *handlers.AdminHandler, librarie
 	}
 	if libraries != nil {
 		targets.LibraryCreated = libraries.LibraryRestored
+		targets.LibrarySectionsCreated = libraries.LibrarySectionsRestored
 		targets.CheckLibrary = libraries.CheckRestoredLibrary
 	}
 	if images != nil {

@@ -26,6 +26,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/config"
 	"github.com/Silo-Server/silo-server/internal/secret"
+	"github.com/Silo-Server/silo-server/internal/serveridentity"
 )
 
 // testDB opens SILO_TEST_DATABASE_URL, a migrated database other tests share.
@@ -250,10 +251,7 @@ func TestBackupRestoreRoundTripDB(t *testing.T) {
 		t.Fatalf("backup result = %+v, want complete with warnings naming %s", result, seed.missingKey)
 	}
 
-	src, err := OpenSource(filepath.Join(root, "backups", serverID, result.ID))
-	if err != nil {
-		t.Fatal(err)
-	}
+	src := openTestSource(t, filepath.Join(root, "backups", serverID, result.ID))
 	into := createDatabase(t, pool, dsn)
 	blobsInto := t.TempDir()
 	loader := PGLoader{Tools: tools}
@@ -312,7 +310,7 @@ func TestBackupRestoreRoundTripDB(t *testing.T) {
 // refused before anything reads its objects.
 func checkManifestTampering(t *testing.T, src *Source, manifestKey []byte, keyCheck string) {
 	t.Helper()
-	path := filepath.Join(src.Dir, ManifestName)
+	path := filepath.Join(src.Folder(), ManifestName)
 	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
@@ -330,7 +328,7 @@ func checkManifestTampering(t *testing.T, src *Source, manifestKey []byte, keyCh
 	if err := os.WriteFile(path, changed, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	tampered, err := OpenSource(src.Dir)
+	tampered, err := OpenSource(src.Folder())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -436,6 +434,33 @@ func checkCredentials(t *testing.T, loader PGLoader, pool *pgxpool.Pool, dsn, in
 	checkCarryInvitation(t, loader, pool, dsn, into, restored, "invite-"+suffix)
 	checkStricterFlags(t, loader, pool, dsn, into, restored, userID)
 	checkStricterSettings(t, loader, pool, dsn, into, restored)
+	checkOtherDeployment(t, loader, pool, dsn, into, restored)
+}
+
+// checkOtherDeployment: the restore reads this server's identity to tell its
+// own backups from another deployment's, and a carry for another deployment
+// (no live URL) leaves the restored database none of the carried rows, its
+// own copies included.
+func checkOtherDeployment(t *testing.T, loader PGLoader, pool *pgxpool.Pool, dsn, into string, restored *pgxpool.Pool) {
+	t.Helper()
+	ctx := t.Context()
+	var want string
+	if err := pool.QueryRow(ctx, `INSERT INTO server_settings (key, value) VALUES ($1, 'live-deployment')
+		ON CONFLICT (key) DO UPDATE SET value = server_settings.value RETURNING value`, serveridentity.Key).Scan(&want); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := loader.ServerID(ctx, dsn); err != nil || got != want || got == "" {
+		t.Fatalf("live server id = %q (%v), want %q", got, err, want)
+	}
+	if _, err := loader.CarryCredentials(ctx, into, ""); err != nil {
+		t.Fatal(err)
+	}
+	for _, table := range secretTablesHandled(secretCarried) {
+		var n int
+		if err := restored.QueryRow(ctx, `SELECT count(*) FROM `+table.name).Scan(&n); err != nil || n != 0 {
+			t.Fatalf("a restore for another deployment kept %d %s rows (%v)", n, table.name, err)
+		}
+	}
 }
 
 // checkStricterSettings: a full restore keeps the live value of each access
@@ -456,12 +481,14 @@ func checkStricterSettings(t *testing.T, loader PGLoader, pool *pgxpool.Pool, ds
 	set(restored, settingTrustedProxies, "10.0.0.0/8, 0.0.0.0/0")
 	set(pool, config.AuthRefreshTokenExpirySettingKey, "30d")
 	set(restored, config.AuthRefreshTokenExpirySettingKey, "7d")
+	set(pool, settingReleaseEvents, "false")
+	set(restored, settingReleaseEvents, "true")
 	kept, err := loader.KeepStricterSettings(ctx, into, dsn, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	for key, want := range map[string]string{settingLocalPasswordLogin: "false", settingTrustedProxies: "10.0.0.0/8",
-		config.AuthRefreshTokenExpirySettingKey: "7d"} {
+		config.AuthRefreshTokenExpirySettingKey: "7d", settingReleaseEvents: "false"} {
 		var got string
 		if err := restored.QueryRow(ctx, `SELECT value FROM server_settings WHERE key = $1`, key).Scan(&got); err != nil || got != want {
 			t.Fatalf("restored %s = %q (%v), want %q", key, got, err, want)
@@ -514,9 +541,21 @@ func checkStricterFlags(t *testing.T, loader PGLoader, pool *pgxpool.Pool, dsn, 
 	if _, err := pool.Exec(ctx, `INSERT INTO plugin_auth_bindings (plugin_installation_id, capability_id) VALUES ($1, 'sso')`, provider); err != nil {
 		t.Fatal(err)
 	}
+	// Autoscan turned off here since the backup: its carried token stays
+	// unusable.
+	if _, err := pool.Exec(ctx, `INSERT INTO autoscan_settings (id, enabled) VALUES (true, false) ON CONFLICT (id) DO UPDATE SET enabled = false`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := restored.Exec(ctx, `INSERT INTO autoscan_settings (id, enabled) VALUES (true, true) ON CONFLICT (id) DO UPDATE SET enabled = true`); err != nil {
+		t.Fatal(err)
+	}
 	carried, err := loader.CarryCredentials(ctx, into, dsn)
 	if err != nil {
 		t.Fatal(err)
+	}
+	var autoscanOn bool
+	if err := restored.QueryRow(ctx, `SELECT enabled FROM autoscan_settings`).Scan(&autoscanOn); err != nil || autoscanOn {
+		t.Fatalf("restored autoscan on %v (%v), want it kept off", autoscanOn, err)
 	}
 	var enabled, mustChange, providerOn, otherOn, removedOn, runningOn bool
 	if err := restored.QueryRow(ctx, `SELECT enabled, password_change_required, (SELECT enabled FROM plugin_installations WHERE id = $2),
@@ -765,6 +804,45 @@ func TestEveryTableIsClassifiedDB(t *testing.T) {
 			t.Errorf("stricterFlags %s.%s: want a boolean column of a table restored as the backup has it, it is in %q", f.table, f.column, listed[f.table])
 		}
 	}
+	checkFlagColumnsDecided(t, pool, restoredAsBackedUp)
+}
+
+// checkFlagColumnsDecided: every boolean column of a table the restore
+// brings back as the backup has it is either a stricterFlags switch or in
+// restoredFlagColumns with its reason, never both, so a new switch cannot
+// be restored without a decision; and every restoredFlagColumns entry is
+// such a column.
+func checkFlagColumnsDecided(t *testing.T, pool *pgxpool.Pool, restored map[string]bool) {
+	t.Helper()
+	columns, err := collectStrings(t.Context(), pool, `SELECT c.table_name || '.' || c.column_name FROM information_schema.columns c
+		JOIN information_schema.tables t ON t.table_schema = c.table_schema AND t.table_name = c.table_name
+		WHERE c.table_schema = 'public' AND t.table_type = 'BASE TABLE' AND c.data_type = 'boolean' ORDER BY 1`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stricter := map[string]bool{}
+	for _, f := range stricterFlags {
+		stricter[f.table+"."+f.column] = true
+	}
+	present := map[string]bool{}
+	for _, column := range columns {
+		present[column] = true
+		table, _, _ := strings.Cut(column, ".")
+		_, decided := restoredFlagColumns[column]
+		switch {
+		case !restored[table]:
+		case stricter[column] && decided:
+			t.Errorf("%s is a stricterFlags switch and in restoredFlagColumns", column)
+		case !stricter[column] && !decided:
+			t.Errorf("%s is a switch with no decision: add it to stricterFlags, or to restoredFlagColumns with why the backup's value is safe", column)
+		}
+	}
+	for column := range restoredFlagColumns {
+		table, _, _ := strings.Cut(column, ".")
+		if !present[column] || !restored[table] {
+			t.Errorf("restoredFlagColumns names %s, which is not a boolean column of a restored table", column)
+		}
+	}
 }
 
 // failingDestination fails writes of one object name.
@@ -964,4 +1042,16 @@ func TestFullRestoresAreSerializedDB(t *testing.T) {
 	} else {
 		unlock(ctx)
 	}
+}
+
+// openTestSource opens a backup folder and removes its private copies when
+// the test ends.
+func openTestSource(t *testing.T, dir string) *Source {
+	t.Helper()
+	src, err := OpenSource(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = src.Close() })
+	return src
 }

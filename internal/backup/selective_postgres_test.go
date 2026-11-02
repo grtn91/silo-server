@@ -244,6 +244,7 @@ func newSelectiveFixture(t *testing.T) *selectiveFixture {
 			})
 			return nil, func(context.Context) {}, err
 		},
+		LibrarySectionsCreated: func(context.Context, int) error { return nil },
 		LibraryCreated: func(_ context.Context, id int) error {
 			f.calls = append(f.calls, id)
 			if f.failFollowUps {
@@ -673,8 +674,10 @@ func TestSelectiveRestoreDB(t *testing.T) {
 		t.Fatalf("fenced restore = %v, follow-ups %v done %v, before-restore %q", err, f.calls, f.created, report.BeforeRestoreBackupID)
 	}
 	newLibrary := f.calls[0]
-	if n := f.pendingFollowUps(t, []int{newLibrary}); n != 1 {
-		t.Fatalf("owed follow-ups after the interruption = %d, want 1", n)
+	// The library's set-up and its sections, which wait for the end of the
+	// restore.
+	if n := f.pendingFollowUps(t, []int{newLibrary}); n != 2 {
+		t.Fatalf("owed follow-ups after the interruption = %d, want 2", n)
 	}
 	f.failFollowUps = false
 	if report, err = f.restore(t, source.ID, preview.Digest, selection, &testFence{pool: f.pool}); err != nil {
@@ -916,6 +919,55 @@ func TestTemplateCollectionsAndHomeSectionsDB(t *testing.T) {
 		t.Fatalf("the retried sync did not finish: synced %v", synced)
 	}
 	checkChangesNothing(t, f.restoreRequest(t, req))
+}
+
+// TestRestoredLibrarySectionsWaitForTheRestoreDB: a library the restore
+// recreates gets its default sections only after the restore wrote its saved
+// ones, and only where it wrote none. A default renamed before the backup
+// then comes back once, not beside a freshly seeded default.
+func TestRestoredLibrarySectionsWaitForTheRestoreDB(t *testing.T) {
+	f := newSelectiveFixture(t)
+	ctx, pool := t.Context(), f.pool
+	wirePageTargets(f, new(bool), &[]string{})
+	seed := func(ctx context.Context, id int) error {
+		return sections.NewRepository(pool).SeedDefaults(ctx, pageScopeLibrary, &id, sections.DefaultLibrarySectionsForType(&id, "movies"))
+	}
+	targets := f.svc.targets
+	targets.LibrarySectionsCreated = seed
+	f.svc.SetRestoreTargets(targets)
+	library := testLibrary(t, pool, "seeded-"+randomHex(t, 4))
+	if err := seed(ctx, library); err != nil {
+		t.Fatal(err)
+	}
+	dbExec(t, pool, `UPDATE page_sections SET title = 'Renamed before the backup'
+		WHERE id = (SELECT id FROM page_sections WHERE library_id = $1 ORDER BY position LIMIT 1)`, library)
+	saved := countRows(t, pool, `SELECT count(*) FROM page_sections WHERE library_id = $1`, library)
+	source, err := backupUnderLock(t, f.svc, KindManual)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dbExec(t, pool, `DELETE FROM media_folders WHERE id = $1`, library)
+	preview, err := f.svc.Preview(ctx, source.ID, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	selection := map[string][]string{SectionLibraries: {strconv.Itoa(library)}}
+	for _, section := range preview.Sections {
+		for _, item := range section.Items {
+			if section.ID == SectionHomeSections && item.Selectable && item.HomeSection != nil && item.HomeSection.Scope == pageScopeLibrary {
+				selection[SectionHomeSections] = append(selection[SectionHomeSections], item.ID)
+			}
+		}
+	}
+	report := f.restoreRequest(t, RestoreRequest{BackupID: source.ID, Digest: preview.Digest, Selection: selection})
+	restored := report.LibraryMap[strconv.Itoa(library)]
+	t.Cleanup(func() { _, _ = pool.Exec(context.Background(), `DELETE FROM media_folders WHERE id = $1`, restored) })
+	if n := countRows(t, pool, `SELECT count(*) FROM page_sections WHERE library_id = $1`, restored); restored == 0 || n != saved {
+		t.Fatalf("restored library %d has %d sections, want the %d saved ones and no seeded defaults beside them", restored, n, saved)
+	}
+	if n := countRows(t, pool, `SELECT count(*) FROM backup_restore_followups WHERE target_id = $1`, restored); n != 0 {
+		t.Fatalf("%d follow-ups left for the restored library", n)
+	}
 }
 
 // TestIdentityTwinsRestoreOneToOneDB: a backup with two library page

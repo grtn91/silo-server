@@ -135,6 +135,18 @@ func (h *LibraryHandler) LibraryRestored(ctx context.Context, id int) error {
 	return h.setUpNewLibrary(ctx, folder)
 }
 
+// LibrarySectionsRestored seeds a restored library's default and home
+// sections where none exist. A restore runs it after it wrote the saved
+// sections it carries, so a default renamed before the backup is not
+// seeded again beside it.
+func (h *LibraryHandler) LibrarySectionsRestored(ctx context.Context, id int) error {
+	folder, err := h.folderRepo.GetByID(ctx, id)
+	if err != nil {
+		return err
+	}
+	return errors.Join(h.seedSections(ctx, folder)...)
+}
+
 // afterLibraryCreated is the work that follows a new library in the editor,
 // as it always was: each step is best effort and its failure is logged. A
 // restore uses setUpNewLibrary instead, which returns failures so they are
@@ -197,9 +209,10 @@ func (h *LibraryHandler) queueInitialScan(ctx context.Context, folder *models.Me
 	return nil
 }
 
-// setUpNewLibrary runs every step that follows a restored library and
-// returns the steps that failed, joined. A failed step does not stop the
-// others. A provider chain already set is left alone.
+// setUpNewLibrary runs every step that follows a restored library but its
+// sections (LibrarySectionsRestored) and returns the steps that failed,
+// joined. A failed step does not stop the others. A provider chain already
+// set is left alone.
 func (h *LibraryHandler) setUpNewLibrary(ctx context.Context, folder *models.MediaFolder) error {
 	var errs []error
 	h.pokeRealtimeMonitor()
@@ -210,7 +223,6 @@ func (h *LibraryHandler) setUpNewLibrary(ctx context.Context, folder *models.Med
 		h.syncBoxSets()
 	}
 
-	errs = append(errs, h.seedSections(ctx, folder)...)
 	if err := h.seedChain(ctx, folder.ID, folder.Type); err != nil {
 		errs = append(errs, err)
 	}

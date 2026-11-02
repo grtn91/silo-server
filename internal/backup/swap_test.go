@@ -71,6 +71,10 @@ type fakeControl struct {
 	// while the restore loads the dump, or right after it carries the
 	// credentials, as a server started meanwhile would.
 	joinOnLoad, joinOnCarry bool
+	// liveServerID is the live server's identity; "" is the manifest's.
+	// carriedFrom records the live URL each credential carry read from.
+	liveServerID string
+	carriedFrom  []string
 	// restoreLocks is the restore lock table, shared by every control of
 	// one server; held names the databases locked.
 	restoreLocks *fakeRestoreLocks
@@ -244,7 +248,14 @@ func (l fakeLoader) RotateSigningSecrets(context.Context, string, *secret.Cipher
 func (l fakeLoader) KeepStricterSettings(context.Context, string, string, *secret.Cipher) ([]string, error) {
 	return nil, nil
 }
-func (l fakeLoader) CarryCredentials(context.Context, string, string) (CarriedCredentials, error) {
+func (l fakeLoader) ServerID(context.Context, string) (string, error) {
+	if l.ctl.liveServerID != "" {
+		return l.ctl.liveServerID, nil
+	}
+	return l.m.ServerID, nil
+}
+func (l fakeLoader) CarryCredentials(_ context.Context, _, liveURL string) (CarriedCredentials, error) {
+	l.ctl.carriedFrom = append(l.ctl.carriedFrom, liveURL)
 	if l.ctl.joinOnCarry {
 		l.ctl.dbs[liveDB].sessions++
 	}
@@ -341,7 +352,48 @@ func writeTestBackup(t *testing.T, entries []tarEntry) *Source {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = src.Close() })
 	return src
+}
+
+// TestValidateReadsOnlyCheckedCopies: what a restore consumes is the bytes
+// Validate checked. Validation copies each object into a private directory
+// as it hashes it, and every later read goes there, so a backup folder
+// changed after the check changes nothing; one changed before fails it.
+func TestValidateReadsOnlyCheckedCopies(t *testing.T) {
+	src := writeTestBackup(t, []tarEntry{{name: "assets/" + addedKey, data: "added poster"}})
+	origin := src.Dir
+	opts := ValidateOptions{KeyCheck: testKeyCheck, ManifestKey: testManifestKey, CopyDir: t.TempDir()}
+	if err := src.Validate(t.Context(), opts); err != nil {
+		t.Fatal(err)
+	}
+	if src.Dir == origin {
+		t.Fatal("validation left the restore reading the backup folder")
+	}
+	info, err := os.Stat(src.Dir)
+	if err != nil || info.Mode().Perm() != 0o700 {
+		t.Fatalf("private copy directory %v (%v), want 0700", info, err)
+	}
+	if err := os.WriteFile(filepath.Join(origin, DumpName), []byte("swapped after the check"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(src.path(DumpName)); err != nil || string(got) != "PGDMP fake dump" {
+		t.Fatalf("the restore reads %q (%v), want the checked dump", got, err)
+	}
+	private := src.Dir
+	if err := src.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(private); !os.IsNotExist(err) {
+		t.Fatalf("private copies left behind: %v", err)
+	}
+	// Changed before the check: refused, and no copy is left.
+	if err := src.Validate(t.Context(), opts); err == nil || !strings.Contains(err.Error(), "does not match its checksum") {
+		t.Fatalf("validating a changed dump = %v", err)
+	}
+	if entries, _ := os.ReadDir(opts.CopyDir); len(entries) != 0 {
+		t.Fatalf("a failed check left %d copies", len(entries))
+	}
 }
 
 type swapFixture struct {
@@ -756,6 +808,34 @@ func TestSwapWaitsForNoOtherRestore(t *testing.T) {
 		t.Fatalf("recover = %v (crashed %v)\n%s", err, crashed, f.output.String())
 	}
 	f.wantRolledBack()
+}
+
+// TestSwapCarriesOnlyForTheSameDeployment: the live server's credentials,
+// switches, and destinations are tied to its ids, so a restore carries them
+// only from the deployment the backup's manifest names. A backup from
+// another needs --accept-lost-credentials, refused before anything changes
+// without it, and then carries none.
+func TestSwapCarriesOnlyForTheSameDeployment(t *testing.T) {
+	f := newSwapFixture(t)
+	if err, _ := f.restore(); err != nil {
+		t.Fatalf("%v\n%s", err, f.output.String())
+	}
+	if !slices.Equal(f.ctl.carriedFrom, []string{"postgres://silo@db.invalid/" + liveDB}) {
+		t.Fatalf("the same deployment carried from %q, want the live database", f.ctl.carriedFrom)
+	}
+
+	f = newSwapFixture(t)
+	f.ctl.liveServerID = "another-deployment"
+	if err, _ := f.restore(); !errors.Is(err, ErrOtherDeployment) || len(f.ctl.calls) != 0 {
+		t.Fatalf("another deployment's backup = %v, calls %v; want ErrOtherDeployment before any change", err, f.ctl.calls)
+	}
+	f.validate.AcceptLostCredentials = true
+	if err, _ := f.restore(); err != nil {
+		t.Fatalf("%v\n%s", err, f.output.String())
+	}
+	if !slices.Equal(f.ctl.carriedFrom, []string{""}) || !strings.Contains(f.output.String(), "is not this deployment's") {
+		t.Fatalf("another deployment carried from %q, want nothing; output:\n%s", f.ctl.carriedFrom, f.output.String())
+	}
 }
 
 // TestSwapStopsWhenAClientJoinsTheLiveDatabase: the credentials a restore
