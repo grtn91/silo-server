@@ -99,12 +99,12 @@ showing either key.
    versions, the table inventory, and the referenced blob keys.
 3. Run `pg_dump --format=custom --compress=zstd:3 --snapshot=<id>` with
    `--exclude-table-data-and-children` for `activity_log`, `operational_logs`,
-   `policy_decisions`, `catalog_search_index_events`, `backup_status` (its row
-   describes the backup being taken), the sign-in tables (login sessions and
-   refresh tokens, Jellyfin and Audiobookshelf sessions, device-code, OIDC,
-   account-link, password-reset, email-verification, Discord-link, and
-   watch-provider sign-in flows; `signInTables` in
-   `internal/backup/snapshot.go` lists them), and, unless
+   `policy_decisions`, `catalog_search_index_events`, the short-lived
+   secrets of [Credentials](#credentials) (login sessions and refresh
+   tokens, Jellyfin and Audiobookshelf sessions, device-code, OIDC,
+   account-link, password-reset, email-verification, Discord-link,
+   watch-provider, and history-import sign-in flows, Watch Together rooms),
+   `backup_status` (its row describes the backup being taken), and, unless
    `backup.include_intro_fingerprints`, `media_intro_fingerprints`. The schema
    is always dumped. Leaving sign-in state out means a restore never brings
    back a session or token revoked after the backup: after a full restore
@@ -338,32 +338,46 @@ never renamed: a value is bound to its key name.
 
 ### Credentials
 
-A restore never brings back the backup's long-lived credentials: API keys,
-pending invitations, invite codes, and autoscan webhook tokens
-(`credentialTables` in `internal/backup/credentials.go`). A key revoked
-after the backup would otherwise work again, and one created since would
-stop working. API keys stay in the dump because `marker_edit_audit` refers
-to them.
+`secretTables` in `internal/backup/credentials.go` classifies every table
+that holds a bearer secret or a public capability, each one way:
 
-- A full restore (swap mode) keeps the live server's credentials as they are
-  right before the swap. After verification, in the same step that clears
-  unreadable settings, it reads them from the live database (preflight has
-  found no other client on it, so they cannot change before the swap) and
-  writes them into the restored database in one transaction, before it
-  becomes live. A restored credential identical to a live one (same id,
-  owner, and hash) is updated in place, so what refers to it stays linked;
-  the others are deleted. Accepted and revoked invitations are the restored
-  history and stay. A live credential whose account, access group, or
-  autoscan source is not in the restored data is dropped, and the command
-  lists it by id and label, never key material. Identity sequences move past
-  the ids written. Live rows are encrypted with this server's key, so they
-  stay readable after `--accept-lost-credentials`.
+- Left out: short-lived secrets (sessions, sign-in flows, reset and
+  verification tokens, Watch Together join codes). The dump leaves their
+  rows out, so a restore never brings back a session or token revoked
+  after the backup, and after a full restore every client signs in again.
+- Carried from the live server: long-lived credentials that clients and
+  other services present to Silo (API keys, pending invitations, invite
+  codes, autoscan webhook tokens, audiobook RSS feed links, Plex and
+  Jellyfin webhook sync secrets with their profile mappings). A restore
+  never brings back the backup's rows: one revoked after the backup would
+  work again, and one created since would stop working. They stay in the
+  dump (`marker_edit_audit` refers to API keys), and the restore replaces
+  them as below.
+- Restored with the data: what looks like a secret admits no one to this
+  server or belongs to the record it comes with (outbound provider tokens
+  and signing secrets, push registrations, URL slugs, worker leases,
+  account passwords and profile PINs with their accounts).
+
+`TestSecretTablesAreClassifiedDB` scans the schema for secret-like column
+names and fails on a table missing from the list, so a new credential
+table needs a decision before it ships.
+
+- A full restore (swap mode) keeps the live server's carried credentials as
+  they are right before the swap. After verification, in the same step
+  that clears unreadable settings, it reads them from the live database
+  (preflight has found no other client on it, so they cannot change before
+  the swap) and writes them into the restored database in one transaction,
+  before it becomes live. A restored credential identical to a live one
+  (same id, owner, and secret) is updated in place, so what refers to it
+  stays linked; the others are deleted. Accepted and revoked invitations
+  are the restored history and stay. A live credential whose account,
+  profile, access group, item, autoscan source, or connection is not in the
+  restored data is dropped, and the command lists it by id and label, never
+  key material. Identity sequences move past the ids written. Live rows are
+  encrypted with this server's key, so they stay readable after
+  `--accept-lost-credentials`.
 - Separate mode (`--into`) restores a copy, not the live server: it deletes
-  the backup's credentials and carries none.
-
-Outbound credentials and connection settings (provider tokens, notification
-webhook secrets, Plex and Jellyfin webhook connections) are configuration the
-restore brings back with the rest of the data.
+  the backup's carried credentials and carries none.
 
 ### Separate mode
 
@@ -377,8 +391,8 @@ the recorded storage identities (`artwork.storage_identity`,
 `storage.operational_identity`) from the target: they name the backed-up
 server's stores, so a server started on the copy would refuse the stores it
 is configured with. That server records its own on its first start or write. The copy
-gets no API keys, pending invitations, invite codes, or autoscan webhook
-tokens ([Credentials](#credentials)).
+gets none of the backup's long-lived credentials
+([Credentials](#credentials)).
 The target stays open for the operator to point `DATABASE_URL` and the
 artwork storage settings at. `--database-only` replaces `--blobs-into` and warns that uploaded
 artwork, avatars, and branding will be missing. Separate mode clears no

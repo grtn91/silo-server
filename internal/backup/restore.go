@@ -168,7 +168,7 @@ type DatabaseLoader interface {
 	// only deleted: a value is bound to its key name.
 	ClearUnreadableSettings(ctx context.Context, dbURL string, cipher *secret.Cipher) ([]string, error)
 	// CarryCredentials replaces the restored database's long-lived
-	// credentials (credentialTables) with liveURL's, or deletes them when
+	// credentials (secretTables, carried) with liveURL's, or deletes them when
 	// liveURL is "".
 	CarryCredentials(ctx context.Context, dbURL, liveURL string) (CarriedCredentials, error)
 }

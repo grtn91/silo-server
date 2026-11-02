@@ -147,10 +147,10 @@ func seedRoundTrip(t *testing.T, pool *pgxpool.Pool, settings *catalog.Encrypted
 	exec(`INSERT INTO users (id, role, username) VALUES ($1, 'user', $2)`, userID, "backup-test-"+suffix)
 	t.Cleanup(func() { _, _ = pool.Exec(context.Background(), `DELETE FROM users WHERE id = $1`, userID) })
 	exec(`INSERT INTO user_profiles (id, user_id, name, avatar) VALUES ($1, $2, 'Backup', $3)`, profileID, userID, "upload:"+avatarKey)
-	// A sign-in the restore must not bring back (signInTables).
+	// A sign-in the restore must not bring back (secretTables, leftOut).
 	exec(`INSERT INTO auth_sessions (id, user_id, expires_at) VALUES ($1, $2, now() + interval '1 day')`, "backup-test-"+suffix, userID)
 	// An API key, which a full restore replaces with the live ones and a
-	// separate restore leaves out (credentialTables).
+	// separate restore leaves out (secretTables, carried).
 	exec(`INSERT INTO api_keys (user_id, label, key_hash) VALUES ($1, 'in backup', encode(sha256(convert_to($2, 'UTF8')), 'hex'))`, userID, "in-backup-"+suffix)
 	seed.userID = userID
 	t.Cleanup(func() { _, _ = pool.Exec(context.Background(), `DELETE FROM user_profiles WHERE id = $1`, profileID) })
@@ -273,23 +273,16 @@ func TestBackupRestoreRoundTripDB(t *testing.T) {
 	checkAnotherKey(t, src, loader, pool, dsn, seed.secretKey)
 }
 
-// checkCredentials: a restore brings back no sign-in session, and every
-// excluded sign-in table exists, so the dump excludes something by that
-// name. A full restore keeps the live server's API keys and pending
-// invitations as they are at the swap, not the backup's, and drops a live
-// key whose account is not in the backup.
+// checkCredentials: a restore brings back no sign-in session. A full
+// restore keeps the live server's API keys and pending invitations as they
+// are at the swap, not the backup's, and drops a live key whose account is
+// not in the backup.
 func checkCredentials(t *testing.T, loader PGLoader, pool *pgxpool.Pool, dsn, into string, restored *pgxpool.Pool, userID int64) {
 	t.Helper()
 	ctx := t.Context()
 	var sessions int
 	if err := restored.QueryRow(ctx, `SELECT count(*) FROM auth_sessions`).Scan(&sessions); err != nil || sessions != 0 {
 		t.Fatalf("restored %d sign-in sessions (%v), want none", sessions, err)
-	}
-	for _, table := range signInTables {
-		var found bool
-		if err := restored.QueryRow(ctx, `SELECT to_regclass('public.' || $1) IS NOT NULL`, table).Scan(&found); err != nil || !found {
-			t.Fatalf("sign-in table %s does not exist (%v); the dump excludes nothing by that name", table, err)
-		}
 	}
 	suffix := randomHex(t, 4)
 	exec := func(sql string, args ...any) {
@@ -380,6 +373,59 @@ func checkAnotherKey(t *testing.T, src *Source, loader PGLoader, pool *pgxpool.P
 	}
 	if left != 0 || !strings.Contains(out.String(), secretKey) {
 		t.Fatalf("%d unreadable settings left; output %q does not name %s", left, out.String(), secretKey)
+	}
+}
+
+// secretColumn is a column name that can hold a bearer secret or a public
+// capability; notSecretColumn excludes names it matches that never do.
+var (
+	secretColumn    = `token|secret|slug|key_hash|password|pin_hash|ticket|api_key(_ref|_hash)?$|flow_hash|binder_hash|code_challenge|(^|_)codes?(_hash)?$`
+	notSecretColumn = `_codes$|status_code$|warning_code$|failure_code$|token_type$|token_expir|password_login_enabled$|password_change_required$`
+)
+
+// TestSecretTablesAreClassifiedDB: every table with a secret-like column is
+// in secretTables, so a new credential cannot be restored from a backup
+// without someone deciding whether it should be, and every name there is
+// a table, so the dump excludes or the restore carries something by it.
+func TestSecretTablesAreClassifiedDB(t *testing.T) {
+	pool, _ := backuptest.Database(t)
+	ctx := t.Context()
+	rows, err := pool.Query(ctx, `
+		SELECT c.relname::text, string_agg(a.attname::text, ', ' ORDER BY a.attnum)
+		FROM pg_attribute a
+		JOIN pg_class c ON c.oid = a.attrelid
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p') AND NOT c.relispartition
+		  AND a.attnum > 0 AND NOT a.attisdropped AND a.attname ~ $1 AND a.attname !~ $2
+		GROUP BY c.relname ORDER BY c.relname`, secretColumn, notSecretColumn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	classified := map[string]bool{}
+	for _, table := range secretTables {
+		if classified[table.name] {
+			t.Errorf("%s is in secretTables twice", table.name)
+		}
+		classified[table.name] = true
+		var found bool
+		if err := pool.QueryRow(ctx, `SELECT to_regclass('public.' || $1) IS NOT NULL`, table.name).Scan(&found); err != nil || !found {
+			t.Errorf("secretTables names %s, which is not a table (%v)", table.name, err)
+		}
+		if (table.handling == carried) != (table.carry != nil) || table.why == "" {
+			t.Errorf("secretTables entry %s: a carried table needs a carry spec, every entry a reason", table.name)
+		}
+	}
+	for rows.Next() {
+		var table, columns string
+		if err := rows.Scan(&table, &columns); err != nil {
+			t.Fatal(err)
+		}
+		if !classified[table] {
+			t.Errorf("%s has secret-like columns (%s) and is not in secretTables: decide whether a restore leaves it out, carries the live rows, or restores it", table, columns)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
 	}
 }
 

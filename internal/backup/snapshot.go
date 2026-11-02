@@ -21,51 +21,30 @@ const (
 // inventoryTables is the core table inventory every manifest records and
 // every full restore compares (docs/architecture/backups.md).
 var inventoryTables = []string{
-	"users", "user_profiles", "media_folders", "media_items", "media_files",
+	"users", tableUserProfiles, "media_folders", "media_items", "media_files",
 	"server_settings", "plugin_installations", tableLibraryCollections,
 	"user_watch_history", "user_watch_progress",
 }
 
-const tableLibraryCollections = "library_collections"
+const (
+	tableLibraryCollections = "library_collections"
+	tableUserProfiles       = "user_profiles"
+)
 
 // sourceLibraryPoster names what references a library poster blob.
 const sourceLibraryPoster = "library poster"
 
 // excludedTableData lists the tables whose rows a dump leaves out: logs and
-// queues that are large and rebuildable or disposable; backup_status, whose
-// row describes the backup being taken and would read as a stale run after a
-// restore; and sign-in state (signInTables). Their schema is always kept.
-// Each entry also excludes its partitions.
+// queues that are large and rebuildable or disposable, and the short-lived
+// secrets of secretTables (leftOut). Their schema is always kept. Each entry
+// also excludes its partitions.
 func excludedTableData(includeIntroFingerprints bool) []string {
-	tables := []string{"activity_log", "operational_logs", "policy_decisions", "catalog_search_index_events", "backup_status"}
-	tables = append(tables, signInTables...)
+	tables := []string{"activity_log", "operational_logs", "policy_decisions", "catalog_search_index_events"}
+	tables = append(tables, leftOutTables()...)
 	if !includeIntroFingerprints {
 		tables = append(tables, "media_intro_fingerprints")
 	}
 	return tables
-}
-
-// signInTables hold login sessions, refresh tokens, and the short-lived
-// tokens that lead to them. A restore brings none back: a session revoked
-// after the backup would otherwise be valid again, so after a full restore
-// every client signs in again. Their schema is kept. Long-lived credentials
-// stay in the dump, and a full restore replaces them with the live server's
-// (credentialTables).
-var signInTables = []string{
-	"auth_sessions",                    // web and native sign-ins and their refresh tokens
-	"device_login_requests",            // device-code sign-ins, which name auth_sessions
-	"jellycompat_sessions",             // Jellyfin-protocol access tokens
-	"jellycompat_device_profiles",      // keyed by those access tokens
-	"abs_sessions",                     // Audiobookshelf-protocol sessions
-	"oauth_sessions",                   // OIDC sign-ins in progress
-	"oauth_completions",                // OIDC sign-ins waiting to be redeemed
-	"oauth_native_starts",              // native-app OIDC sign-ins in progress
-	"oauth_link_tickets",               // account-link tickets
-	"oauth_pending_links",              // account links waiting to be confirmed
-	"password_reset_tokens",            // a token used after the backup would work again
-	"notification_email_verifications", // email-address verification tokens
-	"notification_discord_link_state",  // Discord link flows in progress
-	"watch_provider_auth_sessions",     // watch-provider device-code sign-ins in progress
 }
 
 // blobRef is one blob the snapshot references.

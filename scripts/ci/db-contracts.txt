@@ -737,3 +737,4 @@
 ./internal/backup TestStatusBelongsToTheOperationHoldingTheLockDB
 ./internal/backup TestStatusRecordsTheLastSuccessDB
 ./internal/backup TestBackupAndDeleteWithOnePoolConnectionDB
+./internal/backup TestSecretTablesAreClassifiedDB
