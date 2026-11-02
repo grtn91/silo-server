@@ -2,9 +2,6 @@ package api
 
 import (
 	"context"
-	"encoding/json"
-	"errors"
-	"fmt"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -38,7 +35,6 @@ func wireBackupRestore(deps Dependencies, admin *handlers.AdminHandler, librarie
 			_, err := jobs.Cancel(ctx, id, "Canceled: the restore was queued after the backup lock was lost", time.Now().UTC())
 			return err
 		},
-		ActiveRestore: ActiveBackupRestore(jobs),
 	}
 	if admin != nil {
 		targets.ApplySettings = func(ctx context.Context, tx pgx.Tx, values map[string]string) ([]string, func(context.Context), error) {
@@ -80,24 +76,4 @@ func wireBackupRestore(deps Dependencies, admin *handlers.AdminHandler, librarie
 		targets.CheckSection = pageSections.CheckRestoredSection
 	}
 	deps.Backups.SetRestoreTargets(targets)
-}
-
-// ActiveBackupRestore reads the request of the backup_restore job queued or
-// running now, or nil when there is none. Backup deletion and rotation keep
-// its source.
-func ActiveBackupRestore(jobs *adminjob.Repository) func(context.Context) (*backup.RestoreRequest, error) {
-	return func(ctx context.Context) (*backup.RestoreRequest, error) {
-		job, err := jobs.GetActiveByType(ctx, adminjob.JobTypeBackupRestore)
-		if errors.Is(err, adminjob.ErrJobNotFound) {
-			return nil, nil
-		}
-		if err != nil {
-			return nil, err
-		}
-		var req backup.RestoreRequest
-		if err := json.Unmarshal(job.RequestPayload, &req); err != nil {
-			return nil, fmt.Errorf("reading the active restore job: %w", err)
-		}
-		return &req, nil
-	}
 }

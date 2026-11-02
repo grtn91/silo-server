@@ -22,6 +22,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/Silo-Server/silo-server/internal/adminjob"
 	"github.com/Silo-Server/silo-server/internal/blobstore"
 	"github.com/Silo-Server/silo-server/internal/buildinfo"
 	"github.com/Silo-Server/silo-server/internal/secret"
@@ -83,6 +84,11 @@ type Options struct {
 	// Status publishes the active operation and the latest run for every
 	// API server. Nil publishes nothing.
 	Status StatusStore
+	// ActiveRestore returns the request of the restore job queued or
+	// running now, or nil when there is none. Rotation and deletes keep its
+	// source. New reads the admin jobs on Pool when it is nil; a service
+	// with neither deletes no backup.
+	ActiveRestore func(ctx context.Context) (*RestoreRequest, error)
 	// FindTools overrides tool discovery for tests.
 	FindTools func(context.Context) (Tools, error)
 	Now       func() time.Time
@@ -119,6 +125,9 @@ func New(opts Options) *Service {
 	}
 	if opts.FindTools == nil {
 		opts.FindTools = FindTools
+	}
+	if opts.ActiveRestore == nil && opts.Pool != nil {
+		opts.ActiveRestore = activeRestoreJob(adminjob.NewRepository(opts.Pool))
 	}
 	stores := blobStores{}
 	if opts.Stores.Assets != nil {

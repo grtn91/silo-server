@@ -315,8 +315,10 @@ away copies the admin meant to keep.
   run, so no other rotation, sweep, or delete runs, and the rotation of its
   own before-restore backup is told to keep the source. A queued restore is
   read from the job queue under the lock rotation holds, the lock restores
-  are queued under ([The restore job](#the-restore-job)); when the queue
-  cannot be read, rotation deletes nothing and warns.
+  are queued under ([The restore job](#the-restore-job)); the service reads
+  it from `admin_jobs` itself, wired when it is built, so nothing that
+  starts before the API router can rotate without it. When the queue cannot
+  be read, rotation deletes nothing and warns.
 - Deleting a backup takes the same lock and refuses (409) while a queued or
   running restore reads it.
 - A delete that fails leaves a warning in the task result.

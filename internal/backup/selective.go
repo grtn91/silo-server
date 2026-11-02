@@ -11,6 +11,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/Silo-Server/silo-server/internal/adminjob"
 	"github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/plugins"
@@ -119,9 +120,6 @@ type RestoreTargets struct {
 	// CancelJob cancels a restore job StartRestore queued but could not
 	// keep (it lost the lock meanwhile).
 	CancelJob func(ctx context.Context, id string) error
-	// ActiveRestore returns the request of the restore job queued or
-	// running now, or nil when there is none.
-	ActiveRestore func(ctx context.Context) (*RestoreRequest, error)
 	// TemplateCollection returns the collection a bundle apply creates from
 	// a template for a library of libraryType, with every default, and the
 	// template's title; ErrTemplateNotAvailable when this server's catalog
@@ -352,15 +350,15 @@ func (s *Service) StartRestore(ctx context.Context, userID int, req RestoreReque
 var ErrBackupInUse = errors.New("a restore from this backup is queued or running")
 
 // activeRestoreSource returns the source of the restore queued or running
-// now; zero when there is none, or when this server cannot queue restores.
-// The caller holds the subsystem lock, under which restores are queued
-// (StartRestore), so no restore is queued between this read and what the
-// caller then deletes.
+// now; zero when there is none. The caller holds the subsystem lock, under
+// which restores are queued (StartRestore), so no restore is queued between
+// this read and what the caller then deletes. It fails closed: a server
+// that cannot read its restore jobs deletes nothing a restore might read.
 func (s *Service) activeRestoreSource(ctx context.Context) (restoreSource, error) {
-	if s.targets.ActiveRestore == nil {
-		return restoreSource{}, nil
+	if s.opts.ActiveRestore == nil {
+		return restoreSource{}, errors.New("this server cannot read its queued restores")
 	}
-	active, err := s.targets.ActiveRestore(ctx)
+	active, err := s.opts.ActiveRestore(ctx)
 	if err != nil {
 		return restoreSource{}, fmt.Errorf("reading the queued restore: %w", err)
 	}
@@ -368,6 +366,25 @@ func (s *Service) activeRestoreSource(ctx context.Context) (restoreSource, error
 		return restoreSource{}, nil
 	}
 	return active.source(), nil
+}
+
+// activeRestoreJob reads the backup_restore admin job queued or running
+// now from jobs.
+func activeRestoreJob(jobs *adminjob.Repository) func(context.Context) (*RestoreRequest, error) {
+	return func(ctx context.Context) (*RestoreRequest, error) {
+		job, err := jobs.GetActiveByType(ctx, adminjob.JobTypeBackupRestore)
+		if errors.Is(err, adminjob.ErrJobNotFound) {
+			return nil, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		var req RestoreRequest
+		if err := json.Unmarshal(job.RequestPayload, &req); err != nil {
+			return nil, fmt.Errorf("reading the active restore job: %w", err)
+		}
+		return &req, nil
+	}
 }
 
 // InvalidRestoreSetError is a restore set that failed the reader's checks:
