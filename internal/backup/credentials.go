@@ -70,8 +70,11 @@ type carrySpec struct {
 // everyRow is a carrySpec.credential that selects every row.
 const everyRow = "true"
 
-// columnUserID is the owner column of several carried tables.
-const columnUserID = "user_id"
+// Columns several carried tables share.
+const (
+	columnUserID   = "user_id"
+	columnDeviceID = "device_id"
+)
 
 // ownerCarried is the SQL condition, over the live row r, that the account
 // in column may keep its live credentials (carried_owners): it exists in the
@@ -91,12 +94,19 @@ func grantCarried(table string) string {
 	return `EXISTS (SELECT 1 FROM carried_grants g WHERE g.tbl = '` + table + `' AND g.id = r.id)`
 }
 
+// profileExists is the SQL condition, over the live row r, that its
+// profile is in the restored data.
+const profileExists = `EXISTS (SELECT 1 FROM user_profiles p WHERE p.id = r.profile_id)`
+
 // Reasons shared by several secretTables entries.
 const (
 	outboundOnly  = "outbound: what Silo presents to another service, not a credential for Silo"
 	workerLease   = "a worker's lease or claim on a job, not a credential"
 	urlSlug       = "a URL name, not a secret"
 	watchTogether = "Watch Together rooms in progress and their join codes"
+	// A destination dropped by the carry takes its history with it
+	// (ON DELETE CASCADE).
+	deliveryHistory = "the delivery history of a destination, which goes with it"
 )
 
 // secretTables classifies every table holding a bearer secret or a public
@@ -171,18 +181,54 @@ var secretTables = []secretTable{
 		describe: `format('webhook sync mapping %s of connection %s', r.id, r.connection_id)`,
 	}},
 
+	// Destinations that receive notifications without a session: one removed
+	// since the backup would receive them again.
+	{name: "web_push_subscriptions", handling: secretCarried, why: "browser push subscriptions", carry: &carrySpec{
+		key: "id", same: []string{"id", columnUserID, "endpoint"}, credential: everyRow,
+		owners: []string{columnUserID}, owned: ownerCarried(columnUserID) + ` AND ` + profileExists,
+		describe: `format('browser push subscription %s %L (account %s)', r.id, r.device_name, r.user_id)`,
+	}},
+	{name: "push_devices", handling: secretCarried, why: "mobile push registrations", carry: &carrySpec{
+		key: "id", same: []string{"id", columnUserID, columnDeviceID}, credential: everyRow,
+		owners: []string{columnUserID}, owned: ownerCarried(columnUserID) + ` AND ` + profileExists,
+		describe: `format('push device %s (account %s)', r.id, r.user_id)`,
+	}},
+	{name: "apple_push_installations", handling: secretCarried, why: "Apple push installations", carry: &carrySpec{
+		key: columnDeviceID, same: []string{columnDeviceID, columnUserID, "installation_key_hash"}, credential: everyRow,
+		owners: []string{columnUserID}, owned: ownerCarried(columnUserID) + ` AND ` + profileExists,
+		describe: `format('Apple push installation %s (account %s)', r.device_id, r.user_id)`,
+	}},
+	{name: "android_push_installations", handling: secretCarried, why: "Android push installations", carry: &carrySpec{
+		key: columnDeviceID, same: []string{columnDeviceID, columnUserID, "installation_key_hash"}, credential: everyRow,
+		owners: []string{columnUserID}, owned: ownerCarried(columnUserID) + ` AND ` + profileExists,
+		describe: `format('Android push installation %s (account %s)', r.device_id, r.user_id)`,
+	}},
+	{name: "notification_webhooks", handling: secretCarried, why: "notification webhooks", carry: &carrySpec{
+		key: "id", same: []string{"id", columnUserID}, credential: everyRow,
+		owners: []string{columnUserID}, owned: ownerCarried(columnUserID) + ` AND ` + profileExists,
+		describe: `format('notification webhook %s %L (account %s)', r.id, r.name, r.user_id)`,
+	}},
+	{name: "notification_email_prefs", handling: secretCarried, why: "notification email addresses", carry: &carrySpec{
+		key: "profile_id", same: []string{"profile_id", columnUserID}, credential: everyRow,
+		owners: []string{columnUserID}, owned: ownerCarried(columnUserID) + ` AND ` + profileExists,
+		describe: `format('notification email of profile %s (account %s)', r.profile_id, r.user_id)`,
+	}},
+	{name: "notification_discord_prefs", handling: secretCarried, why: "Discord notification links", carry: &carrySpec{
+		key: columnUserID, same: []string{columnUserID, "discord_user_id", "dm_channel_id"}, credential: everyRow,
+		owners: []string{columnUserID}, owned: ownerCarried(columnUserID),
+		describe: `format('Discord notification link of account %s', r.user_id)`,
+	}},
+	{name: "notification_server_channels", handling: secretCarried, why: "server notification channels", carry: &carrySpec{
+		key: "id", same: []string{"id"}, credential: everyRow, owned: everyRow,
+		describe: `format('server notification channel %s %L', r.id, r.name)`,
+	}},
+
 	{name: "users", handling: secretRestored, why: "account passwords, restored with the accounts they sign in to"},
 	{name: tableUserProfiles, handling: secretRestored, why: "profile PINs, restored with their profiles"},
-	{name: "notification_email_prefs", handling: secretRestored, why: "an unsubscribe link and an address check, which only change the owner's email settings"},
-	{name: "apple_push_installations", handling: secretRestored, why: "a device's key for its own push registration, which admits nothing else"},
-	{name: "android_push_installations", handling: secretRestored, why: "a device's key for its own push registration, which admits nothing else"},
 	{name: "marker_edit_audit", handling: secretRestored, why: "names the API key an edit came from"},
-	{name: "push_devices", handling: secretRestored, why: outboundOnly},
 	{name: "watch_provider_connections", handling: secretRestored, why: outboundOnly},
 	{name: "history_import_sources", handling: secretRestored, why: outboundOnly},
 	{name: "subtitle_provider_config", handling: secretRestored, why: outboundOnly},
-	{name: "notification_server_channels", handling: secretRestored, why: outboundOnly},
-	{name: "notification_webhooks", handling: secretRestored, why: outboundOnly},
 	{name: "autoscan_connections", handling: secretRestored, why: outboundOnly},
 	{name: "request_integrations", handling: secretRestored, why: outboundOnly},
 	{name: tableLibraryCollections, handling: secretRestored, why: urlSlug},
@@ -196,6 +242,9 @@ var secretTables = []secretTable{
 	{name: "movie_match_queue", handling: secretRestored, why: workerLease},
 	{name: "series_root_match_queue", handling: secretRestored, why: workerLease},
 	{name: "idgen_machine_leases", handling: secretRestored, why: workerLease},
+	{name: "web_push_delivery_attempts", handling: secretRestored, why: deliveryHistory},
+	{name: "webhook_delivery_attempts", handling: secretRestored, why: deliveryHistory},
+	{name: "download_subscription_exclusions", handling: secretRestored, why: "a download subscription's rules, not a destination"},
 }
 
 // secretTablesHandled lists the secretTables handled one way, in order.
@@ -220,7 +269,7 @@ func leftOutTables() []string {
 
 // carriedKinds is what the restore output calls the carried tables.
 const carriedKinds = "API keys, pending invitations, invite codes, autoscan webhook tokens, audiobook RSS feed links, " +
-	"and Plex and Jellyfin webhook sync secrets"
+	"Plex and Jellyfin webhook sync secrets, and notification destinations (push registrations, webhooks, email addresses, Discord links, server channels)"
 
 // CarriedCredentials is what DatabaseLoader.CarryCredentials did.
 type CarriedCredentials struct {

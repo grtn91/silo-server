@@ -158,6 +158,10 @@ func seedRoundTrip(t *testing.T, pool *pgxpool.Pool, settings *catalog.Encrypted
 	// An API key, which a full restore replaces with the live ones and a
 	// separate restore leaves out (secretTables, secretCarried).
 	exec(`INSERT INTO api_keys (user_id, label, key_hash) VALUES ($1, 'in backup', encode(sha256(convert_to($2, 'UTF8')), 'hex'))`, userID, "in-backup-"+suffix)
+	// A browser push subscription, which a full restore also takes from the
+	// live server.
+	exec(`INSERT INTO web_push_subscriptions (id, user_id, profile_id, endpoint, p256dh, auth, device_name, enabled, consecutive_failures, created_at, updated_at)
+		VALUES ($1, $2, $3, 'https://push.example.test/'||$1, 'key', 'auth', 'Browser', true, 0, now(), now())`, "push-"+suffix, userID, profileID)
 	seed.userID = userID
 	t.Cleanup(func() { _, _ = pool.Exec(context.Background(), `DELETE FROM user_profiles WHERE id = $1`, profileID) })
 	// An uploaded subtitle, which the backup keeps with
@@ -333,8 +337,10 @@ func checkCredentials(t *testing.T, loader PGLoader, pool *pgxpool.Pool, dsn, in
 		}
 	}
 	// After the backup: the backed-up key is revoked, one is created for
-	// the backed-up account, and one for an account the backup lacks.
+	// the backed-up account, and one for an account the backup lacks; the
+	// browser that subscribed to push notifications is removed.
 	exec(`DELETE FROM api_keys WHERE user_id = $1`, userID)
+	exec(`DELETE FROM web_push_subscriptions WHERE user_id = $1`, userID)
 	exec(`INSERT INTO api_keys (user_id, label, key_hash) VALUES ($1, 'after backup', encode(sha256(convert_to($2, 'UTF8')), 'hex'))`, userID, "live-"+suffix)
 	var newUser, keptID int64
 	if err := pool.QueryRow(ctx, `INSERT INTO users (role, username) VALUES ('user', $1) RETURNING id`, "after-backup-"+suffix).Scan(&newUser); err != nil {
@@ -366,6 +372,10 @@ func checkCredentials(t *testing.T, loader PGLoader, pool *pgxpool.Pool, dsn, in
 	var invited int
 	if err := restored.QueryRow(ctx, `SELECT count(*) FROM invitations WHERE token_hash = $1`, "invite-"+suffix).Scan(&invited); err != nil || invited != 1 {
 		t.Fatalf("restored %d copies of the live invitation (%v), want 1", invited, err)
+	}
+	var subscriptions int
+	if err := restored.QueryRow(ctx, `SELECT count(*) FROM web_push_subscriptions WHERE user_id = $1`, userID).Scan(&subscriptions); err != nil || subscriptions != 0 {
+		t.Fatalf("restored %d push subscriptions removed since the backup (%v), want none", subscriptions, err)
 	}
 	rows, err := restored.Query(ctx, `SELECT label FROM api_keys WHERE user_id = $1`, userID)
 	if err != nil {
@@ -519,9 +529,12 @@ func checkAnotherKey(t *testing.T, src *Source, loader PGLoader, pool *pgxpool.P
 }
 
 // secretColumn is a column name that can hold a bearer secret or a public
-// capability; notSecretColumn excludes names it matches that never do.
+// capability, or name a destination that receives data without a session;
+// notSecretColumn excludes names it matches that never do.
 var (
-	secretColumn    = `token|secret|slug|key_hash|password|pin_hash|ticket|api_key(_ref|_hash)?$|flow_hash|binder_hash|code_challenge|(^|_)codes?(_hash)?$`
+	secretColumn = `token|secret|slug|key_hash|password|pin_hash|ticket|api_key(_ref|_hash)?$|flow_hash|binder_hash|code_challenge|(^|_)codes?(_hash)?$` +
+		// Destinations that receive data without a session.
+		`|endpoint|p256dh|(^|_)auth$|subscription|webhook|callback|url_ciphertext|channel_id|installation_key|_ciphertext$`
 	notSecretColumn = `_codes$|status_code$|warning_code$|failure_code$|token_type$|token_expir|password_login_enabled$|password_change_required$`
 )
 
