@@ -435,6 +435,41 @@ func checkCredentials(t *testing.T, loader PGLoader, pool *pgxpool.Pool, dsn, in
 	checkCarryAuthority(t, loader, pool, dsn, into, restored, userID, keptID, liveKeys)
 	checkCarryInvitation(t, loader, pool, dsn, into, restored, "invite-"+suffix)
 	checkStricterFlags(t, loader, pool, dsn, into, restored, userID)
+	checkStricterSettings(t, loader, pool, dsn, into, restored)
+}
+
+// checkStricterSettings: a full restore keeps the live value of each access
+// setting the backup would widen (password sign-in turned off since, a
+// narrower proxy list), and the backup's where it is as strict or stricter.
+func checkStricterSettings(t *testing.T, loader PGLoader, pool *pgxpool.Pool, dsn, into string, restored *pgxpool.Pool) {
+	t.Helper()
+	ctx := t.Context()
+	set := func(db *pgxpool.Pool, key, value string) {
+		if _, err := db.Exec(ctx, `INSERT INTO server_settings (key, value) VALUES ($1, $2)
+			ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`, key, value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	set(pool, settingLocalPasswordLogin, "false")
+	set(restored, settingLocalPasswordLogin, "true")
+	set(pool, settingTrustedProxies, "10.0.0.0/8")
+	set(restored, settingTrustedProxies, "10.0.0.0/8, 0.0.0.0/0")
+	set(pool, config.AuthRefreshTokenExpirySettingKey, "30d")
+	set(restored, config.AuthRefreshTokenExpirySettingKey, "7d")
+	kept, err := loader.KeepStricterSettings(ctx, into, dsn, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for key, want := range map[string]string{settingLocalPasswordLogin: "false", settingTrustedProxies: "10.0.0.0/8",
+		config.AuthRefreshTokenExpirySettingKey: "7d"} {
+		var got string
+		if err := restored.QueryRow(ctx, `SELECT value FROM server_settings WHERE key = $1`, key).Scan(&got); err != nil || got != want {
+			t.Fatalf("restored %s = %q (%v), want %q", key, got, err, want)
+		}
+	}
+	if !slices.Contains(kept, settingLocalPasswordLogin) || slices.Contains(kept, config.AuthRefreshTokenExpirySettingKey) {
+		t.Fatalf("kept %v", kept)
+	}
 }
 
 // checkStricterFlags: an account an admin disabled since the backup, and a
