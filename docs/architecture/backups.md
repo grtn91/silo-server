@@ -955,10 +955,14 @@ neither list.
   server's value (`stricterFlags`), so it never turns back on what an admin
   turned off since the backup: an account's `enabled`, `break_glass`, and
   `local_password_login_enabled` (off wins) and `password_change_required`
-  (on wins), and the `enabled` of a plugin installation that signs people in
-  (one with sign-in bindings or an `auth_provider.v1` capability), whose
-  carried sign-in links then cannot sign anyone in. A row is the live one
-  when its id and username (an account) or plugin id match. The command
+  (on wins), and the `enabled` of every plugin installation, plugin task
+  binding, and plugin catalog (off wins): plugins run as the server, so one
+  turned off during an incident stays off, and a sign-in provider's carried
+  links then sign no one in. A plugin installation or catalog the backup
+  has and the live server no longer does comes back off, never on. Nothing
+  a full restore does turns a plugin on; the admin does. A row is the live
+  one when its id and username (an account), plugin id, catalog URL, or
+  installation and capability (a task binding) match. The command
   lists each switch it kept. Grants through policy rather than a switch
   (`users.role`, `is_owner`, access group and per-account permissions) are
   restored as the backup has them; the credential carry above refuses

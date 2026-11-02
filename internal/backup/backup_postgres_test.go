@@ -472,10 +472,11 @@ func checkStricterSettings(t *testing.T, loader PGLoader, pool *pgxpool.Pool, ds
 	}
 }
 
-// checkStricterFlags: an account an admin disabled since the backup, and a
-// sign-in provider turned off since, stay off after a full restore, with
-// the account's required password change; each is reported. A switch the
-// live server has at the looser value takes the backup's.
+// checkStricterFlags: an account an admin disabled since the backup stays
+// disabled after a full restore, with its required password change; every
+// plugin turned off since stays off, a sign-in provider included; a plugin
+// removed since comes back off; each is reported. A plugin on here and in
+// the backup stays on.
 func checkStricterFlags(t *testing.T, loader PGLoader, pool *pgxpool.Pool, dsn, into string, restored *pgxpool.Pool, userID int64) {
 	t.Helper()
 	ctx := t.Context()
@@ -489,8 +490,8 @@ func checkStricterFlags(t *testing.T, loader PGLoader, pool *pgxpool.Pool, dsn, 
 	if _, err := restored.Exec(ctx, `UPDATE users SET enabled = true, password_change_required = false WHERE id = $1`, userID); err != nil {
 		t.Fatal(err)
 	}
-	// One sign-in provider, off here and on in the backup; another plugin,
-	// off here, that signs no one in.
+	// A sign-in provider and another plugin, off here and on in the backup;
+	// a plugin removed here since; one on in both.
 	install := func(db *pgxpool.Pool, id int64, pluginID string, enabled bool) int64 {
 		if id == 0 {
 			if err := db.QueryRow(ctx, `INSERT INTO plugin_installations (plugin_id, version, install_path, enabled) VALUES ($1, '1.0.0', '/plugins/x', $2) RETURNING id`, pluginID, enabled).Scan(&id); err != nil {
@@ -507,6 +508,9 @@ func checkStricterFlags(t *testing.T, loader PGLoader, pool *pgxpool.Pool, dsn, 
 	install(restored, provider, "sso-provider", true)
 	other := install(pool, 0, "other-plugin", false)
 	install(restored, other, "other-plugin", true)
+	removed := install(restored, other+1000, "removed-plugin", true)
+	running := install(pool, 0, "running-plugin", true)
+	install(restored, running, "running-plugin", true)
 	if _, err := pool.Exec(ctx, `INSERT INTO plugin_auth_bindings (plugin_installation_id, capability_id) VALUES ($1, 'sso')`, provider); err != nil {
 		t.Fatal(err)
 	}
@@ -514,15 +518,19 @@ func checkStricterFlags(t *testing.T, loader PGLoader, pool *pgxpool.Pool, dsn, 
 	if err != nil {
 		t.Fatal(err)
 	}
-	var enabled, mustChange, providerOn, otherOn bool
+	var enabled, mustChange, providerOn, otherOn, removedOn, runningOn bool
 	if err := restored.QueryRow(ctx, `SELECT enabled, password_change_required, (SELECT enabled FROM plugin_installations WHERE id = $2),
-		(SELECT enabled FROM plugin_installations WHERE id = $3) FROM users WHERE id = $1`, userID, provider, other).Scan(&enabled, &mustChange, &providerOn, &otherOn); err != nil {
+		(SELECT enabled FROM plugin_installations WHERE id = $3), (SELECT enabled FROM plugin_installations WHERE id = $4),
+		(SELECT enabled FROM plugin_installations WHERE id = $5) FROM users WHERE id = $1`, userID, provider, other, removed, running).Scan(
+		&enabled, &mustChange, &providerOn, &otherOn, &removedOn, &runningOn); err != nil {
 		t.Fatal(err)
 	}
-	if enabled || !mustChange || providerOn || !otherOn {
-		t.Fatalf("restored account enabled %v, must change its password %v; provider on %v, other plugin on %v", enabled, mustChange, providerOn, otherOn)
+	if enabled || !mustChange || providerOn || otherOn || removedOn || !runningOn {
+		t.Fatalf("restored account enabled %v, must change its password %v; plugins on: provider %v, other %v, removed %v, running %v",
+			enabled, mustChange, providerOn, otherOn, removedOn, runningOn)
 	}
-	for _, want := range []string{"account " + username + " kept disabled", "account " + username + " still must change its password", "sign-in provider sso-provider kept off"} {
+	for _, want := range []string{"account " + username + " kept disabled", "account " + username + " still must change its password",
+		"plugin sso-provider kept off", "plugin other-plugin kept off", "plugin removed-plugin restored off: removed after the backup"} {
 		if !slices.Contains(carried.Stricter, want) {
 			t.Fatalf("reported %v, want %q", carried.Stricter, want)
 		}
