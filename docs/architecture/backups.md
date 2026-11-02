@@ -513,6 +513,14 @@ replicas set to 0), so nothing can write blobs. The command cannot prove that,
 so it refuses while any other client is connected to the live database and
 closes the database as an extra guard.
 
+Before anything else, the restore takes the full-restore lock: a session
+advisory lock on its control connection (`PGControl.LockRestore`, keys
+`"SRST"` and the live database's name hashed, apart from the subsystem lock),
+held until the command returns or its connection drops. A second restore or
+`--recover` of the same database fails at once with `ErrRestoreRunning`,
+naming the holder's process: each control connection is on the maintenance
+database, so neither preflight would see the other.
+
 1. Validate (above).
 2. Preflight on a control connection to the maintenance database
    (`postgres`): no other client on the live database, `CREATEDB` and

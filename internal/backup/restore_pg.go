@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -302,6 +303,39 @@ func (c *PGControl) AllowConnections(ctx context.Context, name string, allow boo
 func (c *PGControl) Terminate(ctx context.Context, name string) error {
 	_, err := c.Conn.Exec(ctx, `SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()`, name)
 	return err
+}
+
+// restoreLockClass is the first key of the full-restore lock, "SRST": a
+// two-key advisory lock never collides with the subsystem's one-key lock
+// (SubsystemLockKey). The second key is the live database's name, hashed.
+const restoreLockClass = 0x53525354
+
+// LockRestore takes a session advisory lock on the control connection, held
+// until unlock or until the connection closes, so a restore that dies
+// releases it. Both restores reach the same maintenance database, which
+// scopes advisory locks.
+func (c *PGControl) LockRestore(ctx context.Context, live string) (func(context.Context), error) {
+	var acquired bool
+	if err := c.Conn.QueryRow(ctx, `SELECT pg_try_advisory_lock($1, hashtext($2))`, int32(restoreLockClass), live).Scan(&acquired); err != nil {
+		return nil, fmt.Errorf("taking the restore lock: %w", err)
+	}
+	if !acquired {
+		var holder string
+		_ = c.Conn.QueryRow(ctx, `
+			SELECT format('process %s, %s, since %s', a.pid, coalesce(nullif(a.application_name, ''), 'no application name'), a.backend_start)
+			FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid
+			WHERE l.locktype = 'advisory' AND l.granted AND l.objsubid = 2 AND l.classid = $1::int4::oid AND l.objid = hashtext($2)::oid
+			LIMIT 1`, int32(restoreLockClass), live).Scan(&holder)
+		if holder == "" {
+			holder = "holder unknown"
+		}
+		return nil, fmt.Errorf("%w (%s): wait for it to finish, or for the other command to exit, and run this again", ErrRestoreRunning, holder)
+	}
+	return func(ctx context.Context) {
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		_, _ = c.Conn.Exec(ctx, `SELECT pg_advisory_unlock($1, hashtext($2))`, int32(restoreLockClass), live)
+	}, nil
 }
 
 func (c *PGControl) Close(ctx context.Context) error { return c.Conn.Close(ctx) }

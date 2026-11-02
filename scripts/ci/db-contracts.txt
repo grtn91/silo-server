@@ -769,6 +769,7 @@
 # published status of the operation holding it, and every table classified
 # for backup and restore.
 ./internal/backup TestBackupRestoreRoundTripDB
+./internal/backup TestFullRestoresAreSerializedDB
 ./internal/backup TestBackupWritesManifestLastDB
 ./internal/backup TestSubsystemLockSerializesBackupsAndDeletesDB
 ./internal/backup TestLostLockSessionCancelsWorkDB
