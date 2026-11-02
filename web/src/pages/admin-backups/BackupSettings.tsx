@@ -102,7 +102,7 @@ export function BackupScheduleSettings({ form }: { form: SettingsForm }) {
           label="Downloaded subtitles"
           type="toggle"
           dirty={form.isDirty(BACKUP_SUBTITLES_KEY)}
-          description="Saves fetching them again. Subtitle sites limit downloads per day."
+          description="Saves fetching them again. Subtitle sites limit downloads per day. Uploaded subtitles are always backed up."
           value={form.getValue(BACKUP_SUBTITLES_KEY)}
           onChange={(value) => form.setValue(BACKUP_SUBTITLES_KEY, value)}
         />

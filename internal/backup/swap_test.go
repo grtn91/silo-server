@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -18,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Silo-Server/silo-server/internal/access"
 	"github.com/Silo-Server/silo-server/internal/blobstore"
 	"github.com/Silo-Server/silo-server/internal/secret"
 )
@@ -744,4 +746,56 @@ func TestSwapRefusesMigrationsThisBinaryDoesNotCarry(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestAuthorityWiderThan: a live credential is carried only when its
+// account has no more authority in the restored data than live, by role,
+// sign-in, account policy, or a restriction of a profile both sides have.
+func TestAuthorityWiderThan(t *testing.T) {
+	age := func(n int) *int { return &n }
+	live := accountAuthority{rank: 0, enabled: true,
+		policy: access.EffectiveUserPolicy{LibraryIDs: []int{1}},
+		profiles: map[string]profileLimits{"kid": {child: true, ceiling: "PG", advisoryAge: age(10), requireAdvisoryAge: true,
+			restricted: true, libraries: []int{1}}}}
+	cases := []struct {
+		name   string
+		change func(*accountAuthority)
+		wider  bool
+	}{
+		{"same", func(*accountAuthority) {}, false},
+		{"admin", func(a *accountAuthority) { a.rank = 1 }, true},
+		{"break glass", func(a *accountAuthority) { a.breakGlass = true }, true},
+		{"every library", func(a *accountAuthority) { a.policy.LibraryIDs = nil }, true},
+		{"a profile only the backup has", func(a *accountAuthority) { a.profiles["old"] = profileLimits{} }, false},
+		{"not a child", func(a *accountAuthority) {
+			a.profiles["kid"] = with(a.profiles["kid"], func(p *profileLimits) { p.child = false })
+		}, true},
+		{"higher rating ceiling", func(a *accountAuthority) {
+			a.profiles["kid"] = with(a.profiles["kid"], func(p *profileLimits) { p.ceiling = "R" })
+		}, true},
+		{"lower rating ceiling", func(a *accountAuthority) {
+			a.profiles["kid"] = with(a.profiles["kid"], func(p *profileLimits) { p.ceiling = "G" })
+		}, false},
+		{"no advisory limit", func(a *accountAuthority) {
+			a.profiles["kid"] = with(a.profiles["kid"], func(p *profileLimits) { p.advisoryAge = nil })
+		}, true},
+		{"another library", func(a *accountAuthority) {
+			a.profiles["kid"] = with(a.profiles["kid"], func(p *profileLimits) { p.libraries = []int{1, 2} })
+		}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			restored := live
+			restored.profiles = maps.Clone(live.profiles)
+			tc.change(&restored)
+			if got := restored.widerThan(live); got != tc.wider {
+				t.Fatalf("widerThan = %v, want %v", got, tc.wider)
+			}
+		})
+	}
+}
+
+func with(p profileLimits, change func(*profileLimits)) profileLimits {
+	change(&p)
+	return p
 }
