@@ -15,21 +15,21 @@ import (
 type secretHandling int
 
 const (
-	// leftOut tables hold short-lived secrets (sessions, sign-in flows,
+	// secretLeftOut tables hold short-lived secrets (sessions, sign-in flows,
 	// reset and verification tokens): the dump leaves their rows out, so a
 	// restore brings none back and every client signs in again.
-	leftOut secretHandling = iota + 1
-	// carried tables hold long-lived credentials that clients and other
+	secretLeftOut secretHandling = iota + 1
+	// secretCarried tables hold long-lived credentials that clients and other
 	// services present to Silo. A full restore does not bring back the
 	// backup's rows, since a credential revoked after the backup would work
 	// again and one created since would stop working: it keeps the live
 	// server's rows as they are right before the swap, less those whose
 	// owner is not in the restored data. A separate restore keeps none.
-	carried
-	// restored tables are restored with the rest of the data: what looks
+	secretCarried
+	// secretRestored tables are restored with the rest of the data: what looks
 	// like a secret admits no one to this server, or belongs to the record
 	// it is restored with (why says which).
-	restored
+	secretRestored
 )
 
 // secretTable is one table of secretTables.
@@ -99,93 +99,93 @@ const (
 // the ones its owner condition reads. TestSecretTablesAreClassifiedDB scans
 // the schema for secret-like columns and fails on a table missing here.
 var secretTables = []secretTable{
-	{name: "auth_sessions", handling: leftOut, why: "web and native sign-ins and their refresh tokens"},
-	{name: "device_login_requests", handling: leftOut, why: "device-code sign-ins, which name auth_sessions"},
-	{name: "jellycompat_sessions", handling: leftOut, why: "Jellyfin-protocol access tokens"},
-	{name: "jellycompat_device_profiles", handling: leftOut, why: "keyed by Jellyfin-protocol access tokens"},
-	{name: "jellycompat_playback_sessions", handling: leftOut, why: "Jellyfin-protocol playback sessions"},
-	{name: "abs_sessions", handling: leftOut, why: "Audiobookshelf-protocol sessions"},
-	{name: "oauth_sessions", handling: leftOut, why: "OIDC sign-ins in progress"},
-	{name: "oauth_completions", handling: leftOut, why: "OIDC sign-ins waiting to be redeemed"},
-	{name: "oauth_native_starts", handling: leftOut, why: "native-app OIDC sign-ins in progress"},
-	{name: "oauth_link_tickets", handling: leftOut, why: "account-link tickets"},
-	{name: "oauth_pending_links", handling: leftOut, why: "account links waiting to be confirmed"},
-	{name: "password_reset_tokens", handling: leftOut, why: "a token used after the backup would work again"},
-	{name: "notification_email_verifications", handling: leftOut, why: "email-address verification tokens"},
-	{name: "notification_discord_link_state", handling: leftOut, why: "Discord link flows in progress"},
-	{name: "watch_provider_auth_sessions", handling: leftOut, why: "watch-provider device-code sign-ins in progress"},
-	{name: "history_import_plex_sessions", handling: leftOut, why: "Plex sign-ins of a history import in progress"},
-	{name: "history_import_connect_sessions", handling: leftOut, why: "Jellyfin Connect sign-ins of a history import in progress"},
-	{name: "watch_together_rooms", handling: leftOut, why: watchTogether},
-	{name: "watch_together_suggestions", handling: leftOut, why: watchTogether},
-	{name: "watch_together_votes", handling: leftOut, why: watchTogether},
-	{name: "backup_status", handling: leftOut, why: "describes the backup being taken, which would read as a stale run after a restore"},
+	{name: "auth_sessions", handling: secretLeftOut, why: "web and native sign-ins and their refresh tokens"},
+	{name: "device_login_requests", handling: secretLeftOut, why: "device-code sign-ins, which name auth_sessions"},
+	{name: "jellycompat_sessions", handling: secretLeftOut, why: "Jellyfin-protocol access tokens"},
+	{name: "jellycompat_device_profiles", handling: secretLeftOut, why: "keyed by Jellyfin-protocol access tokens"},
+	{name: "jellycompat_playback_sessions", handling: secretLeftOut, why: "Jellyfin-protocol playback sessions"},
+	{name: "abs_sessions", handling: secretLeftOut, why: "Audiobookshelf-protocol sessions"},
+	{name: "oauth_sessions", handling: secretLeftOut, why: "OIDC sign-ins in progress"},
+	{name: "oauth_completions", handling: secretLeftOut, why: "OIDC sign-ins waiting to be redeemed"},
+	{name: "oauth_native_starts", handling: secretLeftOut, why: "native-app OIDC sign-ins in progress"},
+	{name: "oauth_link_tickets", handling: secretLeftOut, why: "account-link tickets"},
+	{name: "oauth_pending_links", handling: secretLeftOut, why: "account links waiting to be confirmed"},
+	{name: "password_reset_tokens", handling: secretLeftOut, why: "a token used after the backup would work again"},
+	{name: "notification_email_verifications", handling: secretLeftOut, why: "email-address verification tokens"},
+	{name: "notification_discord_link_state", handling: secretLeftOut, why: "Discord link flows in progress"},
+	{name: "watch_provider_auth_sessions", handling: secretLeftOut, why: "watch-provider device-code sign-ins in progress"},
+	{name: "history_import_plex_sessions", handling: secretLeftOut, why: "Plex sign-ins of a history import in progress"},
+	{name: "history_import_connect_sessions", handling: secretLeftOut, why: "Jellyfin Connect sign-ins of a history import in progress"},
+	{name: "watch_together_rooms", handling: secretLeftOut, why: watchTogether},
+	{name: "watch_together_suggestions", handling: secretLeftOut, why: watchTogether},
+	{name: "watch_together_votes", handling: secretLeftOut, why: watchTogether},
+	{name: "backup_status", handling: secretLeftOut, why: "describes the backup being taken, which would read as a stale run after a restore"},
 
-	{name: "api_keys", handling: carried, why: "API keys", carry: &carrySpec{
+	{name: "api_keys", handling: secretCarried, why: "API keys", carry: &carrySpec{
 		key: "id", same: []string{"id", columnUserID, "key_hash", "key_prefix"}, credential: everyRow, owned: ownerNotElevated(columnUserID),
 		describe: `format('API key %s %L (account %s)', r.id, r.label, r.user_id)`,
 	}},
-	{name: "invitations", handling: carried, why: "pending invitations", carry: &carrySpec{
+	{name: "invitations", handling: secretCarried, why: "pending invitations", carry: &carrySpec{
 		key: "id", same: []string{"id", "token_hash"}, credential: `t.accepted_at IS NULL AND t.revoked_at IS NULL`,
 		owned: `(r.invited_by IS NULL OR ` + ownerNotElevated("invited_by") + `)
 			AND (r.access_group_id IS NULL OR EXISTS (SELECT 1 FROM access_groups g WHERE g.id = r.access_group_id))`,
 		describe: `format('invitation %s', r.id)`,
 	}},
-	{name: "invite_codes", handling: carried, why: "invite codes", carry: &carrySpec{
+	{name: "invite_codes", handling: secretCarried, why: "invite codes", carry: &carrySpec{
 		key: "id", same: []string{"id", "code"}, credential: everyRow,
 		owned:    `r.created_by IS NULL OR ` + ownerNotElevated("created_by"),
 		describe: `format('invite code %s %L', r.id, r.label)`,
 	}},
-	{name: "autoscan_webhook_endpoints", handling: carried, why: "autoscan webhook tokens", carry: &carrySpec{
+	{name: "autoscan_webhook_endpoints", handling: secretCarried, why: "autoscan webhook tokens", carry: &carrySpec{
 		key: "source_id", same: []string{"source_id", "secret_hash"}, credential: everyRow,
 		owned:    `EXISTS (SELECT 1 FROM autoscan_sources s WHERE s.id = r.source_id)`,
 		describe: `format('autoscan webhook of source %s', r.source_id)`,
 	}},
-	{name: "abs_rss_feeds", handling: carried, why: "audiobook RSS feed links", carry: &carrySpec{
+	{name: "abs_rss_feeds", handling: secretCarried, why: "audiobook RSS feed links", carry: &carrySpec{
 		key: "id", same: []string{"id", columnUserID, "slug"}, credential: everyRow,
 		owned: ownerNotElevated(columnUserID) + `
 			AND EXISTS (SELECT 1 FROM media_items m WHERE m.content_id = r.library_item_id)
 			AND (r.profile_id IS NULL OR EXISTS (SELECT 1 FROM user_profiles p WHERE p.id = r.profile_id::text))`,
 		describe: `format('RSS feed %s (account %s)', r.id, r.user_id)`,
 	}},
-	{name: "webhook_sync_connections", handling: carried, why: "Plex and Jellyfin webhook sync secrets", carry: &carrySpec{
+	{name: "webhook_sync_connections", handling: secretCarried, why: "Plex and Jellyfin webhook sync secrets", carry: &carrySpec{
 		key: "id", same: []string{"id", columnUserID, "webhook_secret"}, credential: everyRow,
 		owned: ownerNotElevated(columnUserID) + `
 			AND (r.default_profile_id = '' OR EXISTS (SELECT 1 FROM user_profiles p WHERE p.id = r.default_profile_id))`,
 		describe: `format('webhook sync connection %s %L (account %s)', r.id, r.server_name, r.user_id)`,
 	}},
-	{name: "webhook_sync_profile_mappings", handling: carried, why: "the profile mappings of those connections", carry: &carrySpec{
+	{name: "webhook_sync_profile_mappings", handling: secretCarried, why: "the profile mappings of those connections", carry: &carrySpec{
 		key: "id", same: []string{"id", "connection_id", "external_user_id"}, credential: everyRow,
 		owned: `EXISTS (SELECT 1 FROM webhook_sync_connections c WHERE c.id = r.connection_id)
 			AND (r.silo_profile_id IS NULL OR EXISTS (SELECT 1 FROM user_profiles p WHERE p.id = r.silo_profile_id))`,
 		describe: `format('webhook sync mapping %s of connection %s', r.id, r.connection_id)`,
 	}},
 
-	{name: "users", handling: restored, why: "account passwords, restored with the accounts they sign in to"},
-	{name: tableUserProfiles, handling: restored, why: "profile PINs, restored with their profiles"},
-	{name: "notification_email_prefs", handling: restored, why: "an unsubscribe link and an address check, which only change the owner's email settings"},
-	{name: "apple_push_installations", handling: restored, why: "a device's key for its own push registration, which admits nothing else"},
-	{name: "android_push_installations", handling: restored, why: "a device's key for its own push registration, which admits nothing else"},
-	{name: "marker_edit_audit", handling: restored, why: "names the API key an edit came from"},
-	{name: "push_devices", handling: restored, why: outboundOnly},
-	{name: "watch_provider_connections", handling: restored, why: outboundOnly},
-	{name: "history_import_sources", handling: restored, why: outboundOnly},
-	{name: "subtitle_provider_config", handling: restored, why: outboundOnly},
-	{name: "notification_server_channels", handling: restored, why: outboundOnly},
-	{name: "notification_webhooks", handling: restored, why: outboundOnly},
-	{name: "autoscan_connections", handling: restored, why: outboundOnly},
-	{name: "request_integrations", handling: restored, why: outboundOnly},
-	{name: tableLibraryCollections, handling: restored, why: urlSlug},
-	{name: "library_collection_groups", handling: restored, why: urlSlug},
-	{name: "user_collection_groups", handling: restored, why: urlSlug},
-	{name: "audiobook_enrichment_state", handling: restored, why: workerLease},
-	{name: "ebook_enrichment_state", handling: restored, why: workerLease},
-	{name: "embedded_subtitle_track_claims", handling: restored, why: workerLease},
-	{name: "marker_contributions", handling: restored, why: workerLease},
-	{name: "marker_fetch_state", handling: restored, why: workerLease},
-	{name: "movie_match_queue", handling: restored, why: workerLease},
-	{name: "series_root_match_queue", handling: restored, why: workerLease},
-	{name: "idgen_machine_leases", handling: restored, why: workerLease},
+	{name: "users", handling: secretRestored, why: "account passwords, restored with the accounts they sign in to"},
+	{name: tableUserProfiles, handling: secretRestored, why: "profile PINs, restored with their profiles"},
+	{name: "notification_email_prefs", handling: secretRestored, why: "an unsubscribe link and an address check, which only change the owner's email settings"},
+	{name: "apple_push_installations", handling: secretRestored, why: "a device's key for its own push registration, which admits nothing else"},
+	{name: "android_push_installations", handling: secretRestored, why: "a device's key for its own push registration, which admits nothing else"},
+	{name: "marker_edit_audit", handling: secretRestored, why: "names the API key an edit came from"},
+	{name: "push_devices", handling: secretRestored, why: outboundOnly},
+	{name: "watch_provider_connections", handling: secretRestored, why: outboundOnly},
+	{name: "history_import_sources", handling: secretRestored, why: outboundOnly},
+	{name: "subtitle_provider_config", handling: secretRestored, why: outboundOnly},
+	{name: "notification_server_channels", handling: secretRestored, why: outboundOnly},
+	{name: "notification_webhooks", handling: secretRestored, why: outboundOnly},
+	{name: "autoscan_connections", handling: secretRestored, why: outboundOnly},
+	{name: "request_integrations", handling: secretRestored, why: outboundOnly},
+	{name: tableLibraryCollections, handling: secretRestored, why: urlSlug},
+	{name: "library_collection_groups", handling: secretRestored, why: urlSlug},
+	{name: "user_collection_groups", handling: secretRestored, why: urlSlug},
+	{name: "audiobook_enrichment_state", handling: secretRestored, why: workerLease},
+	{name: "ebook_enrichment_state", handling: secretRestored, why: workerLease},
+	{name: "embedded_subtitle_track_claims", handling: secretRestored, why: workerLease},
+	{name: "marker_contributions", handling: secretRestored, why: workerLease},
+	{name: "marker_fetch_state", handling: secretRestored, why: workerLease},
+	{name: "movie_match_queue", handling: secretRestored, why: workerLease},
+	{name: "series_root_match_queue", handling: secretRestored, why: workerLease},
+	{name: "idgen_machine_leases", handling: secretRestored, why: workerLease},
 }
 
 // secretTablesHandled lists the secretTables handled one way, in order.
@@ -199,10 +199,10 @@ func secretTablesHandled(h secretHandling) []secretTable {
 	return out
 }
 
-// leftOutTables names the leftOut tables, whose rows the dump leaves out.
+// leftOutTables names the secretLeftOut tables, whose rows the dump leaves out.
 func leftOutTables() []string {
 	var names []string
-	for _, t := range secretTablesHandled(leftOut) {
+	for _, t := range secretTablesHandled(secretLeftOut) {
 		names = append(names, t.name)
 	}
 	return names
@@ -235,7 +235,7 @@ func carryCredentials(ctx context.Context, loader DatabaseLoader, dbURL, liveURL
 		return nil
 	}
 	var kept []string
-	for _, t := range secretTablesHandled(carried) {
+	for _, t := range secretTablesHandled(secretCarried) {
 		if n := carriedRows.Kept[t.name]; n > 0 {
 			kept = append(kept, fmt.Sprintf("%s (%d)", t.why, n))
 		}
@@ -255,7 +255,7 @@ func carryCredentials(ctx context.Context, loader DatabaseLoader, dbURL, liveURL
 // the rows of liveURL, or deletes them when liveURL is "", in one
 // transaction.
 func (l PGLoader) CarryCredentials(ctx context.Context, dbURL, liveURL string) (CarriedCredentials, error) {
-	tables := secretTablesHandled(carried)
+	tables := secretTablesHandled(secretCarried)
 	// The live rows of each table, then the live accounts' authority.
 	live := make([]string, len(tables)+1)
 	for i := range live {

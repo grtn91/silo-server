@@ -147,10 +147,10 @@ func seedRoundTrip(t *testing.T, pool *pgxpool.Pool, settings *catalog.Encrypted
 	exec(`INSERT INTO users (id, role, username) VALUES ($1, 'user', $2)`, userID, "backup-test-"+suffix)
 	t.Cleanup(func() { _, _ = pool.Exec(context.Background(), `DELETE FROM users WHERE id = $1`, userID) })
 	exec(`INSERT INTO user_profiles (id, user_id, name, avatar) VALUES ($1, $2, 'Backup', $3)`, profileID, userID, "upload:"+avatarKey)
-	// A sign-in the restore must not bring back (secretTables, leftOut).
+	// A sign-in the restore must not bring back (secretTables, secretLeftOut).
 	exec(`INSERT INTO auth_sessions (id, user_id, expires_at) VALUES ($1, $2, now() + interval '1 day')`, "backup-test-"+suffix, userID)
 	// An API key, which a full restore replaces with the live ones and a
-	// separate restore leaves out (secretTables, carried).
+	// separate restore leaves out (secretTables, secretCarried).
 	exec(`INSERT INTO api_keys (user_id, label, key_hash) VALUES ($1, 'in backup', encode(sha256(convert_to($2, 'UTF8')), 'hex'))`, userID, "in-backup-"+suffix)
 	seed.userID = userID
 	t.Cleanup(func() { _, _ = pool.Exec(context.Background(), `DELETE FROM user_profiles WHERE id = $1`, profileID) })
@@ -428,7 +428,7 @@ func TestSecretTablesAreClassifiedDB(t *testing.T) {
 		if err := pool.QueryRow(ctx, `SELECT to_regclass('public.' || $1) IS NOT NULL`, table.name).Scan(&found); err != nil || !found {
 			t.Errorf("secretTables names %s, which is not a table (%v)", table.name, err)
 		}
-		if (table.handling == carried) != (table.carry != nil) || table.why == "" {
+		if (table.handling == secretCarried) != (table.carry != nil) || table.why == "" {
 			t.Errorf("secretTables entry %s: a carried table needs a carry spec, every entry a reason", table.name)
 		}
 	}

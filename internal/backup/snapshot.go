@@ -36,7 +36,7 @@ const sourceLibraryPoster = "library poster"
 
 // excludedTableData lists the tables whose rows a dump leaves out: logs and
 // queues that are large and rebuildable or disposable, and the short-lived
-// secrets of secretTables (leftOut). Their schema is always kept. Each entry
+// secrets of secretTables (secretLeftOut). Their schema is always kept. Each entry
 // also excludes its partitions.
 func excludedTableData(includeIntroFingerprints bool) []string {
 	tables := []string{"activity_log", "operational_logs", "policy_decisions", "catalog_search_index_events"}
