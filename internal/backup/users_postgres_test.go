@@ -1167,7 +1167,8 @@ func pendingOf(p PreviewProfile) map[string]int {
 //   - a play, a rating, and a profile preference changed since make that
 //     account and profile differ, with one pending change in each type;
 //   - a profile the backup has and this server lost makes its account
-//     differ;
+//     differ, and the profile sharing a collection with it stays
+//     selectable, since sharing is restored from the owner's collections;
 //   - after the restore, a fresh preview finds the account the same again.
 func TestMatchedAccountPendingDB(t *testing.T) {
 	f := newSelectiveFixture(t)
@@ -1190,6 +1191,10 @@ func TestMatchedAccountPendingDB(t *testing.T) {
 	bob := testAccount(t, pool, "pend-bob-"+sfx, "h", nil, nil)
 	testProfile(t, pool, bob, "pb-main-"+sfx, "Main", true, "")
 	testProfile(t, pool, bob, "pb-kids-"+sfx, "Kids", false, "")
+	// Bob's main profile shares a collection with Kids.
+	dbExec(t, pool, `INSERT INTO user_personal_collections (id, user_id, profile_id, creator_profile_id, name, native) VALUES ($1, $2, $3, $3, 'Shared', true)`,
+		"pcb-"+sfx, bob, "pb-main-"+sfx)
+	dbExec(t, pool, `INSERT INTO user_personal_collection_profiles (user_id, collection_id, profile_id) VALUES ($1, $2, $3)`, bob, "pcb-"+sfx, "pb-kids-"+sfx)
 
 	source, err := backupUnderLock(t, f.svc, KindManual)
 	if err != nil {
@@ -1239,8 +1244,16 @@ func TestMatchedAccountPendingDB(t *testing.T) {
 	if profile.Status != ItemDiffers || !profile.Selectable {
 		t.Fatalf("changed profile = %+v", profile)
 	}
-	if got := previewItem(t, p, SectionUsers, strconv.Itoa(bob)); got.Status != ItemDiffers || !got.Selectable {
+	got := previewItem(t, p, SectionUsers, strconv.Itoa(bob))
+	if got.Status != ItemDiffers || !got.Selectable {
 		t.Fatalf("account missing a profile = %+v", got)
+	}
+	// Sharing comes back from the owner's collections, so the owner whose
+	// data is otherwise the same stays selectable beside the lost profile.
+	for _, pr := range got.Account.Profiles {
+		if pr.ID == "pb-main-"+sfx && (!pr.Selectable || !strings.Contains(pr.Message, "Kids")) {
+			t.Fatalf("owner of a collection shared with a lost profile = %+v, want selectable with it", pr)
+		}
 	}
 
 	f.restoreUsers(t, source.ID, p.Digest, []UserSelection{{Account: strconv.Itoa(alice), Target: strconv.Itoa(alice),

@@ -238,6 +238,7 @@ func decodeCollections(data json.RawMessage) (collectionsDocument, userdata.Summ
 			if !userdata.ValidContentID(p) {
 				return doc, sum, fmt.Errorf("personal collection %q names an invalid profile", c.ID)
 			}
+			sum.Profiles = append(sum.Profiles, p)
 		}
 		if strings.HasPrefix(c.Poster, posterPrefix) {
 			if !uploadedPoster(c) {

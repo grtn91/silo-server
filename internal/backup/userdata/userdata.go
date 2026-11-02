@@ -71,6 +71,9 @@ type Summary struct {
 	Count int
 	Items []string
 	Blobs []Blob
+	// Profiles are the account's other profiles the data names (a personal
+	// collection shared with them), by their source ids.
+	Profiles []string
 }
 
 // Items resolves a source content id to the catalog item it is here. The
