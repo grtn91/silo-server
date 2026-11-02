@@ -173,7 +173,7 @@ func seedUsers(t *testing.T, f *selectiveFixture) userSeed {
 		s.alice, "pa-kids-"+s.suffix, s.lib1, s.lib2)
 	avatarDir := "profile-avatars/" + strconv.Itoa(s.alice) + "/pa-main-" + s.suffix + "/"
 	for name, data := range map[string]string{"original.webp": "avatar", "w256.webp": "avatar small"} {
-		if err := f.store.Put(ctx, avatarDir+name, []byte(data)); err != nil {
+		if err := f.store.Put(ctx, avatarDir+name, testImage(t, data)); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -201,7 +201,7 @@ func seedUsers(t *testing.T, f *selectiveFixture) userSeed {
 		s.collectionID, s.alice, main, poster)
 	dbExec(t, pool, `INSERT INTO user_personal_collection_items (user_id, collection_id, media_item_id, position) VALUES ($1, $2, $3, 0), ($1, $2, $4, 1)`,
 		s.alice, s.collectionID, s.movies[0], s.movies[2])
-	if err := f.store.Put(ctx, poster, []byte("collection poster")); err != nil {
+	if err := f.store.Put(ctx, poster, testImage(t, "collection poster")); err != nil {
 		t.Fatal(err)
 	}
 	seedUserAuthored(t, f, &s, main)

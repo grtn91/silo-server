@@ -71,7 +71,10 @@ type RestoreSet struct {
 	blobs map[string]string
 	// blobSizes is each blob's size in bytes, extracted or not.
 	blobSizes map[string]int64
-	dir       string
+	// accountBlobs are the blobs each account's document references
+	// (avatars, collection images), by account id.
+	accountBlobs map[string][]string
+	dir          string
 	// metadataBytes estimates what the set holds in memory: its documents
 	// and blob keys, for the preview cache's bound.
 	metadataBytes int64

@@ -592,6 +592,10 @@ func (p *restoreSetParser) decodeUsers(spec sectionSpec) (int, error) {
 				return 0, err
 			}
 		}
+		if p.rs.accountBlobs == nil {
+			p.rs.accountBlobs = map[string][]string{}
+		}
+		p.rs.accountBlobs[id] = blobs
 		p.rs.Users = append(p.rs.Users, doc)
 	}
 	return len(p.itemIDs(spec)), nil

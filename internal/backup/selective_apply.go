@@ -82,6 +82,7 @@ func (s *Service) ExecuteRestore(ctx context.Context, run RestoreRun) (any, erro
 		return fail(ErrDigestMismatch)
 	}
 	wanted := selectedBlobs(planned, req.Selection)
+	maps.Copy(wanted, selectedUserBlobs(planned, req.Users))
 	if err := checkTempSpace(os.TempDir(), planned, wanted); err != nil {
 		return fail(err)
 	}
