@@ -341,7 +341,48 @@ func writeTestBackup(t *testing.T, entries []tarEntry) *Source {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = src.Close() })
 	return src
+}
+
+// TestValidateReadsOnlyCheckedCopies: what a restore consumes is the bytes
+// Validate checked. Validation copies each object into a private directory
+// as it hashes it, and every later read goes there, so a backup folder
+// changed after the check changes nothing; one changed before fails it.
+func TestValidateReadsOnlyCheckedCopies(t *testing.T) {
+	src := writeTestBackup(t, []tarEntry{{name: "assets/" + addedKey, data: "added poster"}})
+	origin := src.Dir
+	opts := ValidateOptions{KeyCheck: testKeyCheck, ManifestKey: testManifestKey, CopyDir: t.TempDir()}
+	if err := src.Validate(t.Context(), opts); err != nil {
+		t.Fatal(err)
+	}
+	if src.Dir == origin {
+		t.Fatal("validation left the restore reading the backup folder")
+	}
+	info, err := os.Stat(src.Dir)
+	if err != nil || info.Mode().Perm() != 0o700 {
+		t.Fatalf("private copy directory %v (%v), want 0700", info, err)
+	}
+	if err := os.WriteFile(filepath.Join(origin, DumpName), []byte("swapped after the check"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(src.path(DumpName)); err != nil || string(got) != "PGDMP fake dump" {
+		t.Fatalf("the restore reads %q (%v), want the checked dump", got, err)
+	}
+	private := src.Dir
+	if err := src.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(private); !os.IsNotExist(err) {
+		t.Fatalf("private copies left behind: %v", err)
+	}
+	// Changed before the check: refused, and no copy is left.
+	if err := src.Validate(t.Context(), opts); err == nil || !strings.Contains(err.Error(), "does not match its checksum") {
+		t.Fatalf("validating a changed dump = %v", err)
+	}
+	if entries, _ := os.ReadDir(opts.CopyDir); len(entries) != 0 {
+		t.Fatalf("a failed check left %d copies", len(entries))
+	}
 }
 
 type swapFixture struct {

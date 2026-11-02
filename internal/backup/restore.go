@@ -3,8 +3,6 @@ package backup
 import (
 	"archive/tar"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -40,6 +38,9 @@ var (
 type Source struct {
 	Dir      string
 	Manifest *Manifest
+	// private is the directory of the checked copies Validate reads from
+	// (privatize); origin is the folder they came from.
+	private, origin string
 }
 
 // OpenSource reads a backup folder's manifest.
@@ -75,6 +76,9 @@ type ValidateOptions struct {
 	// environment: a backup written under that key must carry a manifest
 	// MAC that verifies. Nil checks none.
 	ManifestKey []byte
+	// CopyDir is where Validate makes the private copies a restore reads
+	// (Source.privatize); empty is os.TempDir.
+	CopyDir string
 }
 
 // checkMigrations refuses applied migrations this binary does not carry,
@@ -108,14 +112,10 @@ func (src *Source) Validate(ctx context.Context, opts ValidateOptions) error {
 	if !authenticated && !opts.AcceptLostCredentials {
 		return unauthenticatedError(m, opts.KeyCheck)
 	}
-	for _, name := range []string{DumpName, BlobsName} {
-		entry, ok := m.object(name)
-		if !ok {
-			return fmt.Errorf("the manifest lists no %s", name)
-		}
-		if err := checkFile(src.path(name), entry); err != nil {
-			return err
-		}
+	// Everything from here reads checked private copies, never the folder
+	// again.
+	if err := src.privatize(opts.CopyDir); err != nil {
+		return err
 	}
 	if err := src.checkArchive(ctx, nil); err != nil {
 		return err
@@ -159,23 +159,6 @@ func (src *Source) checkArchive(ctx context.Context, physical func(store string)
 	}
 	if n != src.Manifest.Blobs.Count {
 		return fmt.Errorf("blobs.tar holds %d files, the manifest records %d", n, src.Manifest.Blobs.Count)
-	}
-	return nil
-}
-
-func checkFile(path string, want ObjectEntry) error {
-	f, err := os.Open(path) //nolint:gosec // G304: an object of the backup folder the operator named
-	if err != nil {
-		return fmt.Errorf("opening %s: %w", filepath.Base(path), err)
-	}
-	defer func() { _ = f.Close() }()
-	h := sha256.New()
-	n, err := io.Copy(h, f)
-	if err != nil {
-		return fmt.Errorf("reading %s: %w", filepath.Base(path), err)
-	}
-	if n != want.Size || hex.EncodeToString(h.Sum(nil)) != want.SHA256 {
-		return fmt.Errorf("%s does not match its checksum in the manifest", want.Name)
 	}
 	return nil
 }
