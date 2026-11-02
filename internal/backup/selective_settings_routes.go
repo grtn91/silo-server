@@ -6,45 +6,6 @@ import (
 	"strings"
 )
 
-// settingRoute is an outside service's address with the secrets this server
-// sends there. A restore never pairs a backup's address with this server's
-// secret: the backup's address could be anyone's.
-type settingRoute struct {
-	endpoint string
-	secrets  []string
-	// enabled turns the service on; a restore that clears the secrets turns
-	// it off until they are entered again.
-	enabled string
-	// transport is the setting that protects what is sent there.
-	transport string
-}
-
-// keys are every setting of the route.
-func (r settingRoute) keys() []string {
-	keys := append([]string{r.endpoint}, r.secrets...)
-	for _, key := range []string{r.enabled, r.transport} {
-		if key != "" {
-			keys = append(keys, key)
-		}
-	}
-	return keys
-}
-
-// settingRoutes are the restorable settings that name where a service
-// connects together with the secrets it sends there. The S3 and storage
-// endpoints, the search engine, AI providers, and the push relay are
-// server-specific and never restored; Discord, TMDB, MDBList, IntroDB, and
-// the watch providers connect to fixed hosts; a plugin's configuration is
-// restored whole or not at all. TestSettingRoutesAreOnOnePage keeps each
-// route on one settings page, so one page restores it.
-var settingRoutes = []settingRoute{
-	{endpoint: "email.smtp_host", secrets: []string{"email.smtp_password"}, enabled: "email.enabled", transport: settingSMTPSecurity},
-	{endpoint: "ai.base_url", secrets: []string{"ai.api_key"}},
-	{endpoint: "ai.asr_base_url", secrets: []string{"ai.asr_api_key"}},
-	{endpoint: "subtitle_ai.base_url", secrets: []string{"subtitle_ai.api_key"}},
-	{endpoint: "recommendations.embedding_base_url", secrets: []string{"recommendations.embedding_auth_token", "recommendations.openai_api_key"}},
-}
-
 // guardRoutes applies settingRoutes to plans: when a restore changes a
 // service's address, each of its secrets must come from the backup too.
 // One the backup does not have, or that this server cannot read, is cleared
