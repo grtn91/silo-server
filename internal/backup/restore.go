@@ -174,6 +174,10 @@ type DatabaseLoader interface {
 	// (not uploads) whose object exists returns false for, or all of them
 	// when exists is nil, and returns how many it deleted.
 	DropSubtitles(ctx context.Context, dbURL string, exists func(ctx context.Context, key string) (bool, error)) (int, error)
+	// RotateSigningSecrets replaces the restored database's signing keys
+	// (rotatedSettings) with new ones encrypted with cipher, or deletes
+	// them when cipher is nil, and reports whether it wrote new ones.
+	RotateSigningSecrets(ctx context.Context, dbURL string, cipher *secret.Cipher) (bool, error)
 	// CarryCredentials replaces the restored database's long-lived
 	// credentials (secretTables, secretCarried) with liveURL's, or deletes them when
 	// liveURL is "".
@@ -333,6 +337,10 @@ func RestoreSeparate(ctx context.Context, src *Source, loader DatabaseLoader, op
 	// not where this copy's files go.
 	if err := loader.UnbindStorage(ctx, opts.Into); err != nil {
 		return RestoreReport{}, fmt.Errorf("clearing the restored storage identities: %w", err)
+	}
+	// New signing keys first, so the lost-settings pass does not list them.
+	if err := rotateSigningSecrets(ctx, loader, opts.Into, opts.Cipher, out); err != nil {
+		return RestoreReport{}, err
 	}
 	if err := clearLostSettings(ctx, loader, opts.Into, src.Manifest, opts.Validate, opts.Cipher, out); err != nil {
 		return RestoreReport{}, err
