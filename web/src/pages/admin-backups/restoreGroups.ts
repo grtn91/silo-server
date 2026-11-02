@@ -104,6 +104,7 @@ const BLOCKED_PHRASES: Record<RestoreReason, string> = {
   unreadable: "the backup's copy of them can't be read",
   files_missing_here: "their files are missing on this server",
   needs_install: "they need to be installed from a plugin catalog first",
+  kept_stricter: "they would widen access, so this server keeps its stricter values",
 };
 
 /** For an item the server gave a status but no reason. */

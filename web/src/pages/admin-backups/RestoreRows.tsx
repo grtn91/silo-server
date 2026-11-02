@@ -56,6 +56,12 @@ function settingValues(setting: RestoreSetting): { now: string; backup: string }
       backup: "Encrypted with another key",
     };
   }
+  if (setting.status === "kept_stricter") {
+    return {
+      now: `${setting.current_value || "Empty"} (kept: stricter)`,
+      backup: setting.backup_value || "Empty",
+    };
+  }
   if (setting.masked) return { now: "Set", backup: "Different, encrypted" };
   return { now: setting.current_value || "Empty", backup: setting.backup_value || "Empty" };
 }

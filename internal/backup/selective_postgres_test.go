@@ -21,6 +21,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/backup/userdata"
 	"github.com/Silo-Server/silo-server/internal/blobstore"
 	"github.com/Silo-Server/silo-server/internal/catalog"
+	"github.com/Silo-Server/silo-server/internal/config"
 	"github.com/Silo-Server/silo-server/internal/secret"
 	"github.com/Silo-Server/silo-server/internal/sections"
 	"github.com/Silo-Server/silo-server/internal/userstore"
@@ -149,6 +150,7 @@ func seedSelective(t *testing.T, pool *pgxpool.Pool, settings *catalog.Encrypted
 		}
 	}
 	setSetting(t, pool, settings, seed.settingKey, "17")
+	setSetting(t, pool, settings, config.AccessUnratedContentSettingKey, config.AccessUnratedContentAllow)
 	setSetting(t, pool, settings, seed.secretKey, "simkl-"+suffix)
 	return seed
 }
@@ -259,6 +261,9 @@ func (f *selectiveFixture) lose(t *testing.T, seed selectiveSeed) {
 	if err := f.settings.Set(ctx, seed.secretKey, "changed"); err != nil {
 		t.Fatal(err)
 	}
+	if err := f.settings.Set(ctx, config.AccessUnratedContentSettingKey, config.AccessUnratedContentHide); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func (f *selectiveFixture) restore(t *testing.T, backupID, digest string, selection map[string][]string, fence *testFence) (*SelectiveReport, error) {
@@ -282,6 +287,17 @@ func checkPreviewAfterLoss(t *testing.T, preview *RestorePreview, seed selective
 		if s.Key == seed.secretKey && (!s.Masked || s.BackupValue != "" || s.Status != ItemDiffers) {
 			t.Fatalf("encrypted setting in the preview = %+v, want masked and differing", s)
 		}
+	}
+	// Showing unrated titles to rating-capped profiles again would widen
+	// access: the stricter live value stays.
+	library := previewItem(t, preview, SectionSettings, pageLibrary)
+	for _, s := range library.Settings {
+		if s.Key == config.AccessUnratedContentSettingKey && s.Status != SettingKeptStricter {
+			t.Fatalf("unrated-content setting in the preview = %+v, want kept_stricter", s)
+		}
+	}
+	if library.Selectable || library.Reason != ReasonKeptStricter {
+		t.Fatalf("library settings page = %+v, want unselectable, kept_stricter", library)
 	}
 }
 
@@ -387,7 +403,7 @@ func (f *selectiveFixture) checkMissingFilesRestored(t *testing.T, seed selectiv
 	if _, err := f.store.Delete(ctx, []string{seed.artwork}); err != nil {
 		t.Fatal(err)
 	}
-	preview, err := f.svc.Preview(ctx, backupID)
+	preview, err := f.svc.Preview(ctx, backupID, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -407,7 +423,7 @@ func (f *selectiveFixture) checkMissingFilesRestored(t *testing.T, seed selectiv
 	if !bytes.Equal(restored, original) {
 		t.Fatal("the file written back differs from the backup's")
 	}
-	if preview, err = f.svc.Preview(ctx, backupID); err != nil {
+	if preview, err = f.svc.Preview(ctx, backupID, false); err != nil {
 		t.Fatal(err)
 	}
 	if item := previewItem(t, preview, SectionCollections, artworkRef); item.Status != ItemOnThisServer || item.Reason != ReasonSame {
@@ -486,7 +502,7 @@ func TestSelectiveRestoreDB(t *testing.T) {
 	}
 	libraryRef, library2Ref := strconv.Itoa(seed.libraryID), strconv.Itoa(seed.library2ID)
 	collectionRef, artworkRef := collectionItemID(seed.collectionID), "artwork:"+seed.items[0]+":poster"
-	preview, err := f.svc.Preview(ctx, source.ID)
+	preview, err := f.svc.Preview(ctx, source.ID, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -497,7 +513,7 @@ func TestSelectiveRestoreDB(t *testing.T) {
 	}
 	f.checkMissingFilesRestored(t, seed, source.ID, artworkRef)
 	f.lose(t, seed)
-	if preview, err = f.svc.Preview(ctx, source.ID); err != nil {
+	if preview, err = f.svc.Preview(ctx, source.ID, false); err != nil {
 		t.Fatal(err)
 	}
 	checkPreviewAfterLoss(t, preview, seed)
@@ -737,7 +753,7 @@ func TestTemplateCollectionsAndHomeSectionsDB(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.losePages(t, s)
-	preview, err := f.svc.Preview(ctx, source.ID)
+	preview, err := f.svc.Preview(ctx, source.ID, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -838,7 +854,7 @@ func TestIdentityTwinsRestoreOneToOneDB(t *testing.T) {
 	}
 	previewAll := func(want string) *RestorePreview {
 		t.Helper()
-		preview, err := f.svc.Preview(ctx, source.ID)
+		preview, err := f.svc.Preview(ctx, source.ID, false)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -952,7 +968,7 @@ func TestLayoutCollectionsMapAcrossServersDB(t *testing.T) {
 	dbExec(t, pool, `DELETE FROM library_collections WHERE id = ANY($1)`, []string{template.ID, gone.ID})
 	dbExec(t, pool, `DELETE FROM users WHERE id = $1`, account)
 	f.moveToAnotherServer(t, source.ID)
-	preview, err := f.svc.Preview(ctx, source.ID)
+	preview, err := f.svc.Preview(ctx, source.ID, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -981,7 +997,7 @@ func TestLayoutCollectionsMapAcrossServersDB(t *testing.T) {
 		configCollection(t, overrides, "Mine", userdata.UserCollectionField) != newPersonal || newPersonal == personal {
 		t.Fatalf("restored layout %s; want Popular on %s and Mine on %s, Gone left out", stored, newTemplate, newPersonal)
 	}
-	again, err := f.svc.Preview(ctx, source.ID)
+	again, err := f.svc.Preview(ctx, source.ID, false)
 	if err != nil {
 		t.Fatal(err)
 	}

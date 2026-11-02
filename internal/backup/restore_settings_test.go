@@ -2,6 +2,7 @@ package backup
 
 import (
 	"regexp"
+	"slices"
 	"testing"
 
 	"github.com/Silo-Server/silo-server/internal/branding"
@@ -60,6 +61,21 @@ func TestServerSpecificSettingsAreNeverOffered(t *testing.T) {
 // named like one (private destinations, trusted proxies, origins, TLS
 // verification, sign-up and sign-in switches) is in trustSettings, so a
 // new one cannot be restored from a backup without a decision.
+// TestAccessSettingsAreComparedOnRestore: every setting that decides who
+// can reach this server or what a viewer sees is either never restored or
+// restored only when it grants no more than the live value
+// (config.AccessSettingWider), so offering one means comparing it.
+func TestAccessSettingsAreComparedOnRestore(t *testing.T) {
+	for _, key := range config.AccessSettingKeys() {
+		if _, offered := RestorableSetting(key); !offered {
+			t.Errorf("access setting %s is not offered: drop it from config.accessSettings or classify it", key)
+		}
+		if slices.Contains(trustSettings, key) {
+			t.Errorf("access setting %s is also a trust setting a restore never writes", key)
+		}
+	}
+}
+
 func TestTrustSettingsAreServerSpecific(t *testing.T) {
 	trusted := map[string]bool{}
 	for _, key := range trustSettings {

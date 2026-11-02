@@ -43,7 +43,7 @@ func (f *fakeBackups) DownloadLinks(_ context.Context, id, scope string, _ time.
 	f.calls = append(f.calls, "links "+id+" "+scope)
 	return []backup.ObjectLink{{Name: backup.DumpName, Size: 4}}, nil
 }
-func (f *fakeBackups) Preview(_ context.Context, id string) (*backup.RestorePreview, error) {
+func (f *fakeBackups) Preview(_ context.Context, id string, _ bool) (*backup.RestorePreview, error) {
 	f.calls = append(f.calls, "preview "+id)
 	return &backup.RestorePreview{BackupID: id, Digest: testDigest, CreatedAt: time.Date(2026, 10, 31, 4, 0, 0, 0, time.UTC)}, nil
 }

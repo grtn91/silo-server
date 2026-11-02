@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -194,7 +195,11 @@ func putPlainBackup(t *testing.T, store blobstore.Store, serverID, id string) st
 	m.CreatedAt, m.Kind, _ = ParseFolderName(id)
 	m.CompletedAt = m.CreatedAt
 	m.Objects = nil
-	for name, data := range map[string][]byte{DumpName: []byte("dump"), BlobsName: {}, RestoreSetName: []byte("set " + id)} {
+	index, entries := testRestoreSet()
+	index.ServerID, index.ServerName = serverID, id
+	set := buildTar(t, index, entries)
+	indexSum := sha256.Sum256(mustJSON(index))
+	for name, data := range map[string][]byte{DumpName: []byte("dump"), BlobsName: {}, RestoreSetName: set} {
 		if err := store.Put(ctx, objectKey(serverID, id, name), data); err != nil {
 			t.Fatal(err)
 		}
@@ -202,7 +207,7 @@ func putPlainBackup(t *testing.T, store blobstore.Store, serverID, id string) st
 		_, _ = s.Write(data)
 		m.Objects = append(m.Objects, s.entry(name))
 	}
-	m.RestoreSet = &RestoreSetSummary{FormatVersion: restoreSetVersion, Sections: map[string]int{}}
+	m.RestoreSet = &RestoreSetSummary{FormatVersion: restoreSetVersion, Sections: map[string]int{}, IndexSHA256: hex.EncodeToString(indexSum[:])}
 	m.KeyCheck = testKeyCheck
 	if err := m.sign(testManifestKey); err != nil {
 		t.Fatal(err)
@@ -338,6 +343,14 @@ func TestSelectiveRestoreAuthenticatesTheManifest(t *testing.T) {
 		{name: "missing MAC", change: func(m *Manifest) { m.MAC = "" }, want: ErrManifestTampered, wantConfirmed: ErrManifestTampered},
 		{name: "missing key check", change: func(m *Manifest) { m.KeyCheck = "" }, want: ErrUnauthenticated},
 		{name: "other key", change: func(m *Manifest) { m.KeyCheck = "9999-8888-7777-6666" }, want: ErrUnauthenticated},
+		// A manifest that does not record the index's digest cannot have
+		// its restore set checked before it is parsed.
+		{name: "no index digest", change: func(m *Manifest) {
+			m.RestoreSet.IndexSHA256 = ""
+			if err := m.sign(testManifestKey); err != nil {
+				panic(err)
+			}
+		}, want: ErrUnauthenticated},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -376,9 +389,16 @@ func TestSelectiveRestoreAuthenticatesTheManifest(t *testing.T) {
 			if _, err := svc.StartRestore(ctx, 1, req); !errors.Is(err, tt.want) || (tt.want == nil) != (err == nil) {
 				t.Fatalf("StartRestore = %v, want %v", err, tt.want)
 			}
+			// A preview refuses the same way, before it reads the restore set.
+			if _, _, err := svc.previewSet(ctx, restoreSource{backupID: id}, false); !errors.Is(err, tt.want) || (tt.want == nil) != (err == nil) {
+				t.Fatalf("preview = %v, want %v", err, tt.want)
+			}
 			req.AcceptUnauthenticated = true
 			if _, err := svc.StartRestore(ctx, 1, req); !errors.Is(err, tt.wantConfirmed) || (tt.wantConfirmed == nil) != (err == nil) {
 				t.Fatalf("StartRestore confirmed = %v, want %v", err, tt.wantConfirmed)
+			}
+			if _, _, err := svc.previewSet(ctx, restoreSource{backupID: id}, true); !errors.Is(err, tt.wantConfirmed) || (tt.wantConfirmed == nil) != (err == nil) {
+				t.Fatalf("preview confirmed = %v, want %v", err, tt.wantConfirmed)
 			}
 		})
 	}

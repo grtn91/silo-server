@@ -363,7 +363,7 @@ func TestUserRestoreDB(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.loseUsers(t, &s, source.ID)
-	preview, err := f.svc.Preview(ctx, source.ID)
+	preview, err := f.svc.Preview(ctx, source.ID, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -929,7 +929,7 @@ func TestUserRestoreSameServerDB(t *testing.T) {
 	}
 	dbExec(t, f.pool, `DELETE FROM user_profiles WHERE user_id = $1 AND id = $2`, account, gone)
 	dbExec(t, f.pool, `DELETE FROM user_watch_progress WHERE user_id = $1`, account)
-	preview, err := f.svc.Preview(ctx, source.ID)
+	preview, err := f.svc.Preview(ctx, source.ID, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -986,7 +986,7 @@ func TestOmittedAccountIsReportedDB(t *testing.T) {
 	if source.Status != StatusCompleteWithWarnings || !slices.ContainsFunc(source.Omitted, isOurs) {
 		t.Fatalf("backup = %s, omitted %+v", source.Status, source.Omitted)
 	}
-	preview, err := f.svc.Preview(ctx, source.ID)
+	preview, err := f.svc.Preview(ctx, source.ID, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1041,7 +1041,7 @@ func TestEmailLessAccountRestoreDB(t *testing.T) {
 
 	// Same server: the account, which lost its progress, matches by id.
 	dbExec(t, f.pool, `DELETE FROM user_watch_progress WHERE user_id = $1`, a)
-	preview, err := f.svc.Preview(ctx, source.ID)
+	preview, err := f.svc.Preview(ctx, source.ID, false)
 	if err != nil {
 		t.Fatalf("same-server preview with email-less accounts: %v", err)
 	}
@@ -1054,7 +1054,7 @@ func TestEmailLessAccountRestoreDB(t *testing.T) {
 	dbExec(t, f.pool, `DELETE FROM users WHERE id = ANY($1)`, []int{a, b})
 	emailLessAccount(t, f.pool, "ne-here-"+sfx, "pne-here-"+sfx, movie)
 	f.moveToAnotherServer(t, source.ID)
-	preview, err = f.svc.Preview(ctx, source.ID)
+	preview, err = f.svc.Preview(ctx, source.ID, false)
 	if err != nil {
 		t.Fatalf("cross-server preview with email-less accounts: %v", err)
 	}
@@ -1218,7 +1218,7 @@ func TestMatchedAccountPendingDB(t *testing.T) {
 	}
 	preview := func() *RestorePreview {
 		t.Helper()
-		p, err := f.svc.Preview(ctx, source.ID)
+		p, err := f.svc.Preview(ctx, source.ID, false)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1307,7 +1307,7 @@ func TestFreshBackupComparesSameDB(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	preview, err := f.svc.Preview(t.Context(), source.ID)
+	preview, err := f.svc.Preview(t.Context(), source.ID, false)
 	if err != nil {
 		t.Fatal(err)
 	}

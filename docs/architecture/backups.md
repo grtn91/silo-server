@@ -114,7 +114,8 @@ path (every Silo that writes manifests signs them):
   a backup taken with another key (whose encrypted settings are lost), and
   says plainly that the backup cannot be verified; `silo backup verify`
   warns. A selective restore needs the admin's confirmation
-  (`accept_unauthenticated`), and the listing shows it as `unverified`.
+  (`accept_unauthenticated`) before it reads anything inside the restore
+  set, its preview included, and the listing shows it as `unverified`.
 - A manifest a destination read must also name the folder and server it was
   read from. A folder whose manifest names this key and does not verify is
   listed as `unverified` with no details, cannot be restored or downloaded,
@@ -457,11 +458,26 @@ prefixes and only keys the section references, or variants stored in a
 referenced artwork original's directory; avatars a user document names
 listed for the section; documents that decode strictly
 (unknown fields and trailing data refused) and match the index counts; and
-limits on entries (200,000), document size (64 MiB), plugin archive and blob
-size (256 MiB), total bytes (32 GiB), and JSON nesting (32). A plugin
-archive is never installed ([Plugins](#plugins)). Readers accept
+limits on entries (200,000), document size (64 MiB; 32 MiB for the index,
+16 MiB for `settings.json` and each `plugin.json`), the documents one read
+holds together (256 MiB, checked from the index's listed sizes before any
+document is read), plugin archive and blob size (256 MiB), total bytes
+(32 GiB), and JSON nesting (32). A plugin archive is checked against its
+digest and discarded, never installed ([Plugins](#plugins)). Readers accept
 every format version up to theirs and refuse a newer one with "This backup is
 from a newer Silo. Upgrade this server first."
+
+**Nothing inside a restore set is decoded before it is verified.** The
+manifest records the restore set's digest and the digest of its index
+(`restore_set.index_sha256`), both covered by the manifest's `mac`. For an
+authenticated manifest the reader checks the index against its digest
+before decoding it, and the whole archive against its digest
+(`ReadOptions.Verify`) before decoding any document; until then documents
+are held as bytes, each checked against its index digest. A backup whose
+manifest cannot be authenticated, or that records no index digest, is read
+only after the admin confirms (`accept_unauthenticated`), its preview
+included. Previews of one archive share a read (`restoreSetCache`); the read
+stops when every preview waiting on it has gone.
 
 Any of those failures refuses the whole set. An entry whose own values no
 restore could write is left out instead, and the rest stays readable
@@ -521,6 +537,15 @@ grouped by the admin page that edits each key: a key or prefix with its class.
   server's private network or let someone sign in, so they stay as the live
   server has them. `TestTrustSettingsAreServerSpecific` fails on a setting
   named like one that is not in the list.
+- A restore never widens access. The access settings
+  (`config.accessSettings`: `access.unrated_content`, the Jellyfin and
+  Audiobookshelf sign-in switches, access and refresh token and Jellyfin
+  session lifetimes, and the identity provider's re-check interval and
+  outage policy) are offered, but a value that grants more than the live one
+  (`config.AccessSettingWider`; a value that does not parse counts as wider)
+  is never written: the preview marks it `kept_stricter` and the report says
+  the stricter current value was kept. `TestAccessSettingsAreComparedOnRestore`
+  requires every access setting to be offered, so none is compared in vain.
 
 A key the table does not match is never offered. `TestEverySettingIsClassified`
 fails for any admin setting default, sensitive setting, or branding asset key

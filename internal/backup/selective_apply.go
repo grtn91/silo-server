@@ -74,7 +74,11 @@ func (s *Service) ExecuteRestore(ctx context.Context, run RestoreRun) (any, erro
 
 	// Only the files the selected items write are extracted, and only when
 	// the temporary directory has room for them.
-	planned, _, err := s.previewSet(work, req.source())
+	located, err := s.locateConfirmed(work, req.source(), req.AcceptUnauthenticated)
+	if err != nil {
+		return fail(err)
+	}
+	planned, err := s.cachedSet(work, located)
 	if err != nil {
 		return fail(err)
 	}
@@ -86,7 +90,7 @@ func (s *Service) ExecuteRestore(ctx context.Context, run RestoreRun) (any, erro
 	if err := checkTempSpace(os.TempDir(), planned, wanted); err != nil {
 		return fail(err)
 	}
-	rs, err := s.openRestoreSet(work, req.source(), func(key string) bool { return wanted[key] })
+	rs, err := s.openRestoreSet(work, located, func(key string) bool { return wanted[key] })
 	if err != nil {
 		return fail(err)
 	}
@@ -724,7 +728,7 @@ func (a *applier) applySettingsPage(ctx context.Context, tx pgx.Tx, id string) (
 	if err != nil {
 		return applied{}, err
 	}
-	values, needKey := map[string]string{}, 0
+	values, needKey, stricter := map[string]string{}, 0, 0
 	for _, p := range plans {
 		if p.page != id {
 			continue
@@ -734,14 +738,22 @@ func (a *applier) applySettingsPage(ctx context.Context, tx pgx.Tx, id string) (
 			values[p.preview.Key] = p.value
 		case ItemNeedsAnotherKey:
 			needKey++
+		case SettingKeptStricter:
+			stricter++
 		}
 	}
 	if needKey > 0 {
 		item.Notes = append(item.Notes, fmt.Sprintf("%d settings encrypted with another SECRET_KEY were left out.", needKey))
 	}
+	if stricter > 0 {
+		item.Notes = append(item.Notes, keptStricterNote(stricter))
+	}
 	if len(values) == 0 {
-		if needKey > 0 {
+		switch {
+		case needKey > 0:
 			return leftOut(item, ReasonNeedsAnotherKey, "Every setting that differs was encrypted with another SECRET_KEY."), nil
+		case stricter > 0:
+			return leftOut(item, ReasonKeptStricter, "Every setting that differs would widen access, so this server kept its stricter current values."), nil
 		}
 		return unchanged(item), nil
 	}

@@ -35,9 +35,19 @@ var ErrNoRestoreSet = errors.New("this backup has no restore set")
 // destination can be written by something other than this server. These
 // limits bound what reading one can cost.
 const (
-	maxRestoreSetEntries   = 200_000
-	maxRestoreSetPath      = 1024
-	maxRestoreSetDocument  = 64 << 20
+	maxRestoreSetEntries  = 200_000
+	maxRestoreSetPath     = 1024
+	maxRestoreSetDocument = 64 << 20
+	// maxRestoreSetIndex, maxSettingsDocument, and maxPluginDocument bound
+	// the documents that never need more than a few megabytes.
+	maxRestoreSetIndex  = 32 << 20
+	maxSettingsDocument = 16 << 20
+	maxPluginDocument   = 16 << 20
+	// maxRestoreSetMetadata bounds the index and documents one read holds
+	// in memory together, as the preview cache bounds what it keeps
+	// (maxCachedRestoreSetBytes). The index lists every document's size, so
+	// a set over it is refused before any document is read.
+	maxRestoreSetMetadata  = 256 << 20
 	maxRestoreSetArchive   = 256 << 20 // the admin plugin upload cap
 	maxRestoreSetBlob      = 256 << 20
 	maxRestoreSetTotal     = 32 << 30
@@ -102,6 +112,14 @@ type ReadOptions struct {
 	// Extract, when set, picks the blobs an extracting read writes to
 	// ExtractDir; the rest are checked and discarded like a preview's.
 	Extract func(key string) bool
+	// IndexSHA256, when set, is the index's digest from an authenticated
+	// manifest: the index must match it before it is decoded.
+	IndexSHA256 string
+	// Verify, when set, runs once the whole archive has been read and
+	// before any document is decoded; its error stops the read. A caller
+	// checks the archive against its manifest's digest here, so documents
+	// are decoded only from verified bytes.
+	Verify func() error
 }
 
 // ReadRestoreSet reads and validates a whole restore set:
@@ -132,7 +150,7 @@ func ReadRestoreSet(ctx context.Context, r io.Reader, opts ReadOptions) (_ *Rest
 		}()
 	}
 
-	p := &restoreSetParser{rs: rs, extract: opts.Extract, seen: map[string]bool{}, documents: map[string][]byte{}}
+	p := &restoreSetParser{rs: rs, opts: opts, seen: map[string]bool{}, documents: map[string][]byte{}}
 	for entries := 0; ; entries++ {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -165,6 +183,11 @@ func ReadRestoreSet(ctx context.Context, r io.Reader, opts ReadOptions) (_ *Rest
 	if n, _ := io.Copy(io.Discard, io.LimitReader(counted, 1)); n > 0 {
 		return nil, errors.New("restore set: unexpected data after the archive")
 	}
+	if opts.Verify != nil {
+		if err := opts.Verify(); err != nil {
+			return nil, err
+		}
+	}
 	if err := p.finish(); err != nil {
 		return nil, fmt.Errorf("restore set: %w", err)
 	}
@@ -194,10 +217,9 @@ type restoreSetParser struct {
 	// ladderDirs are the image directories of referenced artwork originals;
 	// the variants stored beside an original may ride along with it.
 	ladderDirs map[string]sectionSpec
-	// extract is ReadOptions.Extract.
-	extract   func(key string) bool
-	seen      map[string]bool
-	documents map[string][]byte
+	opts       ReadOptions
+	seen       map[string]bool
+	documents  map[string][]byte
 	// logical sums the entries' sizes as their headers state them.
 	logical int64
 }
@@ -232,11 +254,7 @@ func (p *restoreSetParser) entry(h *tar.Header, tr io.Reader, first bool) error 
 		return fmt.Errorf("%s must be the first entry", restoreSetIndexName)
 	}
 	if first {
-		data, err := readLimited(tr, h, maxRestoreSetDocument)
-		if err != nil {
-			return err
-		}
-		return p.readIndex(data)
+		return p.indexEntry(h, tr)
 	}
 	if key, ok := strings.CutPrefix(h.Name, restoreSetBlobDir); ok {
 		return p.blob(key, h, tr)
@@ -251,7 +269,7 @@ func (p *restoreSetParser) entry(h *tar.Header, tr io.Reader, first bool) error 
 	if path.Base(h.Name) == pluginArchiveName {
 		return p.archive(h, tr, want)
 	}
-	data, err := readLimited(tr, h, maxRestoreSetDocument)
+	data, err := readLimited(tr, h, documentLimit(h.Name))
 	if err != nil {
 		return err
 	}
@@ -261,6 +279,33 @@ func (p *restoreSetParser) entry(h *tar.Header, tr io.Reader, first bool) error 
 	p.documents[h.Name] = data
 	p.rs.metadataBytes += int64(len(data))
 	return nil
+}
+
+// indexEntry reads the index, checking it against the manifest's digest
+// (ReadOptions.IndexSHA256) before decoding it.
+func (p *restoreSetParser) indexEntry(h *tar.Header, tr io.Reader) error {
+	data, err := readLimited(tr, h, maxRestoreSetIndex)
+	if err != nil {
+		return err
+	}
+	if want := p.opts.IndexSHA256; want != "" {
+		if sum := sha256.Sum256(data); hex.EncodeToString(sum[:]) != want {
+			return fmt.Errorf("%s does not match the digest its manifest records", restoreSetIndexName)
+		}
+	}
+	p.rs.metadataBytes += int64(len(data))
+	return p.readIndex(data)
+}
+
+// documentLimit is the most a section document named name may hold.
+func documentLimit(name string) int64 {
+	switch {
+	case name == settingsDocumentName:
+		return maxSettingsDocument
+	case path.Base(name) == pluginDocumentName:
+		return maxPluginDocument
+	}
+	return maxRestoreSetDocument
 }
 
 func readLimited(r io.Reader, h *tar.Header, limit int64) ([]byte, error) {
@@ -315,6 +360,8 @@ func (p *restoreSetParser) readIndex(data []byte) error {
 	p.blobs = map[string]sectionSpec{}
 	p.ladderDirs = map[string]sectionSpec{}
 	sectionsSeen := map[string]bool{}
+	// documents sums the listed documents' sizes.
+	var documents int64
 	for _, si := range index.Sections {
 		spec, ok := sectionByID(si.ID)
 		if !ok {
@@ -342,6 +389,14 @@ func (p *restoreSetParser) readIndex(data []byte) error {
 			}
 			if f.Size < 0 || !sha256Hex.MatchString(f.SHA256) {
 				return fmt.Errorf("%s: %q has no valid size and digest", restoreSetIndexName, f.Path)
+			}
+			if path.Base(f.Path) != pluginArchiveName {
+				if f.Size > documentLimit(f.Path) {
+					return fmt.Errorf("%s: %q is larger than %d bytes", restoreSetIndexName, f.Path, documentLimit(f.Path))
+				}
+				if documents += f.Size; documents+int64(len(data)) > maxRestoreSetMetadata {
+					return fmt.Errorf("%s: its documents hold more than the %d bytes a restore set may", restoreSetIndexName, int64(maxRestoreSetMetadata))
+				}
 			}
 			p.files[f.Path] = f
 		}
@@ -395,7 +450,7 @@ func (p *restoreSetParser) blob(key string, h *tar.Header, tr io.Reader) error {
 		return fmt.Errorf("blob %q is larger than %d bytes", key, maxRestoreSetBlob)
 	}
 	dir := p.rs.dir
-	if p.extract != nil && !p.extract(key) {
+	if p.opts.Extract != nil && !p.opts.Extract(key) {
 		dir = ""
 	}
 	target, err := p.copyEntry(dir, "blob", h, tr, "")

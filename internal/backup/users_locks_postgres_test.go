@@ -189,7 +189,7 @@ func TestRestoreLockOrderDB(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	preview, err := f.svc.Preview(ctx, source.ID)
+	preview, err := f.svc.Preview(ctx, source.ID, false)
 	if err != nil {
 		t.Fatal(err)
 	}

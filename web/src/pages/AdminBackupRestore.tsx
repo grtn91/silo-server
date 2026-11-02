@@ -141,7 +141,8 @@ export default function AdminBackupRestore() {
   const capabilities = useAdminBackupCapabilities();
   const backups = useAdminBackups();
   const jobs = useRestoreJobs();
-  const preview = useRestoreSet(jobId ? null : id);
+  const [openUnverified, setOpenUnverified] = useState(false);
+  const preview = useRestoreSet(jobId ? null : id, openUnverified);
   const job = useRestoreJob(jobId);
   const start = useStartRestore(id);
   const cancel = useCancelRestore();
@@ -258,6 +259,30 @@ export default function AdminBackupRestore() {
       <div className="space-y-4" role="status" aria-label="Reading the backup">
         <Skeleton className="h-32 w-full rounded-xl" />
         <Skeleton className="h-32 w-full rounded-xl" />
+      </div>
+    );
+  } else if (
+    preview.error instanceof V2ProblemError &&
+    preview.error.problemType === "backup_unauthenticated"
+  ) {
+    body = (
+      <div role="alert" className="surface-panel space-y-3 rounded-2xl p-6">
+        <p className="font-medium">This server can&apos;t verify this backup.</p>
+        <p className="text-muted-foreground text-sm">
+          It was written under a different SECRET_KEY, or by a version of Silo that didn&apos;t
+          record what checking it needs. Anyone who could write to where backups are kept could have
+          changed it. Open it only if you trust where it came from.
+        </p>
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={() => {
+            setOpenUnverified(true);
+            setAcceptUnauthenticated(true);
+          }}
+        >
+          Open it anyway
+        </Button>
       </div>
     );
   } else if (preview.isError || !set) {

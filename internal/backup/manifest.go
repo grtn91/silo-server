@@ -171,6 +171,11 @@ type RestoreSetSummary struct {
 	// Omitted lists items the restore set could not carry; the backup is
 	// complete with warnings.
 	Omitted []OmittedItem `json:"omitted,omitempty"`
+	// IndexSHA256 is the digest of the restore set's index, its first
+	// entry. With the manifest authenticated, a read checks the index
+	// against it before decoding it, and the archive against its object
+	// digest before decoding any document.
+	IndexSHA256 string `json:"index_sha256,omitempty"`
 }
 
 // ObjectEntry is one stored object: its size and the SHA-256 of the bytes as
@@ -334,6 +339,9 @@ func (r *RestoreSetSummary) validate() error {
 	}
 	if r.FormatVersion < 1 {
 		return fmt.Errorf("restore set format version %d is not valid", r.FormatVersion)
+	}
+	if r.IndexSHA256 != "" && !sha256Hex.MatchString(r.IndexSHA256) {
+		return errors.New("restore set index digest is not valid")
 	}
 	for id, count := range r.Sections {
 		if _, known := sectionByID(id); !known && (r.FormatVersion <= restoreSetVersion || !validSectionID(id)) {

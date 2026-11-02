@@ -32,7 +32,7 @@ type AdminBackupService interface {
 	DownloadLinks(ctx context.Context, id, scope string, ttl time.Duration) ([]backup.ObjectLink, error)
 	OpenObject(context.Context, string, string) (io.ReadCloser, int64, error)
 	// Preview compares a backup's restore set with this server.
-	Preview(ctx context.Context, id string) (*backup.RestorePreview, error)
+	Preview(ctx context.Context, id string, acceptUnauthenticated bool) (*backup.RestorePreview, error)
 	// StartRestore queues a backup_restore job for the chosen items.
 	StartRestore(ctx context.Context, userID int, req backup.RestoreRequest) (*models.AdminJob, error)
 }
@@ -207,6 +207,8 @@ func backupProblem(err error) error {
 		return NewProblem(TypeConflict, "This backup has no restore set: it was taken before selective restore existed.")
 	case errors.Is(err, backup.ErrRestoreSetTooNew):
 		return NewProblem(TypeConflict, backup.ErrRestoreSetTooNew.Error())
+	case errors.Is(err, backup.ErrUnauthenticated):
+		return NewProblem(TypeBackupUnauthenticated, backup.ErrUnauthenticated.Message)
 	case errors.Is(err, backup.ErrDigestMismatch):
 		return NewProblem(TypeRestoreSetChanged, "The backup changed since it was previewed. Open it again.")
 	case errors.As(err, new(*backup.InvalidRestoreSetError)):
