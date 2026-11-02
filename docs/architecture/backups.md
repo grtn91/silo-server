@@ -369,8 +369,9 @@ never renamed: a value is bound to its key name.
 `secretTables` in `internal/backup/credentials.go` classifies every table
 that holds a bearer secret or a public capability, each one way:
 
-- Left out: short-lived secrets (sessions, sign-in flows, reset and
-  verification tokens, Watch Together join codes). The dump leaves their
+- Left out: short-lived secrets and capabilities (sessions, sign-in flows,
+  reset and verification tokens, Watch Together join codes, Audiobookshelf
+  playback sessions, whose id alone opens the public track route). The dump leaves their
   rows out, so a restore never brings back a session or token revoked
   after the backup, and after a full restore every client signs in again.
 - Carried from the live server: long-lived credentials that clients and

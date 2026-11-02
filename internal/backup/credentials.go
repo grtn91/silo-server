@@ -124,6 +124,7 @@ var secretTables = []secretTable{
 	{name: "jellycompat_device_profiles", handling: secretLeftOut, why: "keyed by Jellyfin-protocol access tokens"},
 	{name: "jellycompat_playback_sessions", handling: secretLeftOut, why: "Jellyfin-protocol playback sessions"},
 	{name: "abs_sessions", handling: secretLeftOut, why: "Audiobookshelf-protocol sessions"},
+	{name: "abs_playback_sessions", handling: secretLeftOut, why: "Audiobookshelf playback sessions, whose id alone opens the public track route"},
 	{name: "oauth_sessions", handling: secretLeftOut, why: "OIDC sign-ins in progress"},
 	{name: "oauth_completions", handling: secretLeftOut, why: "OIDC sign-ins waiting to be redeemed"},
 	{name: "oauth_native_starts", handling: secretLeftOut, why: "native-app OIDC sign-ins in progress"},
