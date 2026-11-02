@@ -184,19 +184,7 @@ func runBackupRestore(ctx context.Context, args []string, out io.Writer) error {
 	}
 	loader := backup.PGLoader{Tools: tools}
 	if f.into != "" {
-		opts := backup.SeparateOptions{
-			Validate: validate, Into: f.into, BlobsInto: f.blobsInto, DatabaseOnly: f.databaseOnly, Out: out,
-		}
-		if opts.Cipher, err = optionalCipher(masterKey); err != nil {
-			return err
-		}
-		if _, err := backup.RestoreSeparate(ctx, src, loader, opts); err != nil {
-			return err
-		}
-		if !f.keepRedis {
-			_, _ = fmt.Fprintln(out, separateRestoreRedisNote)
-		}
-		return nil
+		return runSeparateRestore(ctx, f, src, loader, validate, masterKey, out)
 	}
 	liveURL, err := liveDatabaseURL()
 	if err != nil {
@@ -259,6 +247,44 @@ func restoredRedisPlan(ctx context.Context, keep bool, liveURL string, cipher *s
 		return redisPlan{readErr: err}
 	}
 	return redisPlan{config: liveRedisConfig(cfg)}
+}
+
+// runSeparateRestore restores into --into and --blobs-into, aimed away
+// from the live server named by DATABASE_URL, when set.
+func runSeparateRestore(ctx context.Context, f backupRestoreFlags, src *backup.Source, loader backup.PGLoader,
+	validate backup.ValidateOptions, masterKey []byte, out io.Writer) error {
+	opts := backup.SeparateOptions{
+		Validate: validate, Into: f.into, BlobsInto: f.blobsInto, DatabaseOnly: f.databaseOnly, Out: out,
+		LiveURL: os.Getenv("DATABASE_URL"),
+	}
+	var err error
+	if opts.Cipher, err = optionalCipher(masterKey); err != nil {
+		return err
+	}
+	if opts.LiveURL != "" && !f.databaseOnly {
+		opts.LiveBlobRoots = liveBlobRoots(ctx, opts.LiveURL, opts.Cipher)
+	}
+	if _, err := backup.RestoreSeparate(ctx, src, loader, opts); err != nil {
+		return err
+	}
+	if !f.keepRedis {
+		_, _ = fmt.Fprintln(out, separateRestoreRedisNote)
+	}
+	return nil
+}
+
+// liveBlobRoots is the live server's local file storage, which a separate
+// restore must not write into, read from its settings when it can be. The
+// restore also requires an empty directory, so a failed read leaves that
+// check in force.
+func liveBlobRoots(ctx context.Context, liveURL string, cipher *secret.Cipher) []string {
+	readCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	cfg, err := liveConfigFromDatabase(readCtx, liveURL, cipher)
+	if err != nil {
+		return nil
+	}
+	return []string{cfg.Artwork.LocalPath}
 }
 
 // closeControl closes the control connection after the command's context

@@ -8,11 +8,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
+
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/Silo-Server/silo-server/internal/blobstore"
 	"github.com/Silo-Server/silo-server/internal/secret"
@@ -272,7 +275,12 @@ type SeparateOptions struct {
 	// store root. Required unless DatabaseOnly.
 	BlobsInto    string
 	DatabaseOnly bool
-	Out          io.Writer
+	// LiveURL, when known, is the live server's database, which Into must
+	// not be; LiveBlobRoots are its local store directories, which
+	// BlobsInto must not be.
+	LiveURL       string
+	LiveBlobRoots []string
+	Out           io.Writer
 }
 
 // RestoreSeparate runs §10.2 steps 1 and 3 into opts.Into, the verification
@@ -284,6 +292,9 @@ func RestoreSeparate(ctx context.Context, src *Source, loader DatabaseLoader, op
 		return RestoreReport{}, errors.New("--blobs-into is required unless --database-only")
 	}
 	if err := src.Validate(ctx, opts.Validate); err != nil {
+		return RestoreReport{}, err
+	}
+	if err := checkSeparateTargets(opts); err != nil {
 		return RestoreReport{}, err
 	}
 	// Both stores land in one directory.
@@ -322,6 +333,69 @@ func RestoreSeparate(ctx context.Context, src *Source, loader DatabaseLoader, op
 	printMissing(out, src.Manifest)
 	_, _ = fmt.Fprintln(out, "Restored. Point DATABASE_URL and the artwork storage settings at the new locations, then start Silo.")
 	return report, nil
+}
+
+// checkSeparateTargets refuses, before anything is written, a separate
+// restore aimed at the live server or at files it would overwrite: a copy
+// keeps nothing it replaces. Into must not be the live database (and must
+// be empty, which loading checks), and BlobsInto must be a new or empty
+// directory that is not one of the live server's stores.
+func checkSeparateTargets(opts SeparateOptions) error {
+	if opts.LiveURL != "" && sameDatabase(opts.Into, opts.LiveURL) {
+		return errors.New("--into is this server's own database; create a new, empty database to restore into")
+	}
+	if opts.DatabaseOnly {
+		return nil
+	}
+	dir := resolvedPath(opts.BlobsInto)
+	for _, root := range opts.LiveBlobRoots {
+		if root != "" && resolvedPath(root) == dir {
+			return fmt.Errorf("--blobs-into %s is this server's own file storage; restore files into a new, empty directory", opts.BlobsInto)
+		}
+	}
+	f, err := os.Open(opts.BlobsInto)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("checking --blobs-into: %w", err)
+	}
+	defer func() { _ = f.Close() }()
+	names, err := f.Readdirnames(1)
+	switch {
+	case errors.Is(err, io.EOF):
+		return nil
+	case err != nil:
+		return fmt.Errorf("checking --blobs-into: %w", err)
+	case len(names) > 0:
+		return fmt.Errorf("--blobs-into %s is not empty; restore files into a new, empty directory, so nothing in it is overwritten", opts.BlobsInto)
+	}
+	return nil
+}
+
+// resolvedPath is path made absolute, with symbolic links resolved when it
+// exists.
+func resolvedPath(path string) string {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return filepath.Clean(path)
+	}
+	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+		return resolved
+	}
+	return abs
+}
+
+// sameDatabase reports whether two connection strings reach the same
+// database on the same server, as pgx resolves them; one that does not
+// parse is compared as text.
+func sameDatabase(a, b string) bool {
+	ca, errA := pgconn.ParseConfig(a)
+	cb, errB := pgconn.ParseConfig(b)
+	if errA != nil || errB != nil {
+		return a == b
+	}
+	return ca.Host == cb.Host && ca.Port == cb.Port && ca.Database == cb.Database
 }
 
 // writeSeparateBlobs writes blobs.tar into the directory opts.BlobsInto;

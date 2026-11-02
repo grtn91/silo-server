@@ -383,7 +383,13 @@ table needs a decision before it ships.
 
 `silo backup restore --from <backup> --into <database URL> --blobs-into <dir>`
 restores into a pre-created empty database and a separate directory laid out
-as a local store root, changing nothing in the live deployment. It needs no
+as a local store root, changing nothing in the live deployment. Before
+anything is written it refuses a target that would overwrite something,
+since a copy keeps nothing it replaces: `--into` must not be the live
+database (`DATABASE_URL`, compared by host, port, and database as pgx
+resolves them), and `--blobs-into` must be missing or an empty directory
+and not the live server's local file storage (read from its settings when
+`DATABASE_URL` is set; symbolic links resolved). It needs no
 `CREATEDB` or rename privilege. After `pg_restore --exit-on-error
 --no-owner --no-privileges`, it verifies the schema version, the applied
 migrations, and the table inventory against the manifest. It then deletes

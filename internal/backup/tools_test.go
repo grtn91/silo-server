@@ -1,6 +1,8 @@
 package backup
 
 import (
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -123,5 +125,44 @@ func TestHasPassword(t *testing.T) {
 		if got := HasPassword(dsn); got != want {
 			t.Errorf("HasPassword(%q) = %v, want %v", dsn, got, want)
 		}
+	}
+}
+
+// TestCheckSeparateTargets: a separate restore writes only into a new or
+// empty directory that is not the live server's storage, and never into
+// the live database, however its URL is written.
+func TestCheckSeparateTargets(t *testing.T) {
+	empty, full, live := t.TempDir(), t.TempDir(), t.TempDir()
+	if err := os.WriteFile(filepath.Join(full, "kept.webp"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(t.TempDir(), "link")
+	if err := os.Symlink(live, link); err != nil {
+		t.Fatal(err)
+	}
+	const liveURL = "postgres://silo@db:5432/silo"
+	cases := []struct {
+		name string
+		opts SeparateOptions
+		want string
+	}{
+		{name: "new directory", opts: SeparateOptions{Into: "postgres://silo@db/copy", BlobsInto: filepath.Join(empty, "new")}},
+		{name: "empty directory", opts: SeparateOptions{Into: "postgres://silo@db/copy", BlobsInto: empty, LiveURL: liveURL}},
+		{name: "directory with files", opts: SeparateOptions{Into: "postgres://silo@db/copy", BlobsInto: full}, want: "not empty"},
+		{name: "live storage through a link", opts: SeparateOptions{Into: "postgres://silo@db/copy", BlobsInto: link, LiveBlobRoots: []string{live}},
+			want: "own file storage"},
+		{name: "live database", opts: SeparateOptions{Into: "host=db port=5432 user=silo dbname=silo", DatabaseOnly: true, LiveURL: liveURL},
+			want: "own database"},
+		{name: "live database by query", opts: SeparateOptions{Into: "postgres://silo@db/other?dbname=silo", DatabaseOnly: true, LiveURL: liveURL},
+			want: "own database"},
+		{name: "database only skips files", opts: SeparateOptions{Into: "postgres://silo@db/copy", BlobsInto: full, DatabaseOnly: true}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := checkSeparateTargets(tc.opts)
+			if tc.want == "" && err != nil || tc.want != "" && (err == nil || !strings.Contains(err.Error(), tc.want)) {
+				t.Fatalf("checkSeparateTargets = %v, want %q", err, tc.want)
+			}
+		})
 	}
 }
