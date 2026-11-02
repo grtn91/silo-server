@@ -127,7 +127,7 @@ func seedRoundTrip(t *testing.T, pool *pgxpool.Pool, settings *catalog.Encrypted
 	setSetting(t, pool, settings, seed.secretKey, seed.secretValue)
 	setSetting(t, pool, settings, "branding.mark_light_ref", suffix+".webp")
 	// A signing key, which no restore brings back (rotatedSettings).
-	setSetting(t, pool, settings, "auth.jwt_secret", "backup-jwt-"+suffix)
+	setSetting(t, pool, settings, settingJWTSecret, "backup-jwt-"+suffix)
 	// The source's recorded stores, which a separate restore must not keep.
 	for _, key := range storageIdentities {
 		setSetting(t, pool, settings, key, "local|/elsewhere")
@@ -512,7 +512,7 @@ func checkAnotherKey(t *testing.T, src *Source, loader PGLoader, pool *pgxpool.P
 		t.Fatalf("%d encrypted settings left, want only the new signing keys; output %q must name %s and not the signing key", left, out.String(), secretKey)
 	}
 	// The signing key is a new one, encrypted with this server's key.
-	jwt, err := catalog.NewEncryptedSettingsRepo(catalog.NewServerSettingsRepo(restored), other).Get(ctx, "auth.jwt_secret")
+	jwt, err := catalog.NewEncryptedSettingsRepo(catalog.NewServerSettingsRepo(restored), other).Get(ctx, settingJWTSecret)
 	if err != nil || jwt == "" || strings.HasPrefix(jwt, "backup-jwt-") {
 		t.Fatalf("restored signing key = %q, %v; want a new one", jwt, err)
 	}
@@ -684,14 +684,18 @@ func TestBackupAndDeleteWithOnePoolConnectionDB(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	store, err := blobstore.NewFilesystem(t.TempDir())
+	settings := catalog.NewEncryptedSettingsRepo(catalog.NewServerSettingsRepo(pool), cipher)
+	// The stores as the server opens them: the first write records the
+	// storage identity through the settings, and so through the pool.
+	stores, _, err := blobstore.Open(ctx, blobstore.Options{Backend: blobstore.BackendLocal, LocalPath: t.TempDir(), Settings: settings})
 	if err != nil {
 		t.Fatal(err)
 	}
+	store := stores.Operational
 	serverID := "one-conn-" + randomHex(t, 4)
 	svc := New(Options{
-		Pool: pool, DatabaseURL: dsn, Settings: catalog.NewEncryptedSettingsRepo(catalog.NewServerSettingsRepo(pool), cipher),
-		Stores: blobstore.Stores{Assets: store, Operational: store}, Destination: NewStoreDestination(store),
+		Pool: pool, DatabaseURL: dsn, Settings: settings,
+		Stores: stores, Destination: NewStoreDestination(store),
 		Locker: PostgresLocker{Pool: pool}, Status: PostgresStatus{Pool: pool},
 		ServerID:  func(context.Context) (string, error) { return serverID, nil },
 		FindTools: func(context.Context) (Tools, error) { return tools, nil },
