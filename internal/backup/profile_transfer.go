@@ -91,7 +91,19 @@ type ProfileTransfer struct {
 	slots        chan struct{}
 	mu           sync.Mutex
 	transferring map[int]bool
+	// itemsChanged hears, after an import commits, which items a profile's
+	// data now names (SetItemsChanged).
+	itemsChanged ItemsChanged
 }
+
+// ItemsChanged tells the rest of the server, after a commit, that a
+// profile's data about itemIDs changed outside its normal write paths: the
+// notification interest of those series is recomputed, as the user store's
+// own writes trigger it (notifications.WrapUserStoreProvider).
+type ItemsChanged func(userID int, profileID string, itemIDs []string)
+
+// SetItemsChanged sets the hook an import calls after its commit.
+func (t *ProfileTransfer) SetItemsChanged(f ItemsChanged) { t.itemsChanged = f }
 
 // maxConcurrentTransfers bounds the profile exports and imports one server
 // runs at once. Each holds a pool connection for its whole transaction and
@@ -457,9 +469,10 @@ func (t *ProfileTransfer) Import(ctx context.Context, scope ProfileImportScope, 
 		}
 		libraries = allowed
 	}
+	recorded := &userdata.RecordingItems{Inner: visible}
 	target := userdata.Target{
 		Owner:      userdata.Owner{UserID: scope.UserID, ProfileID: scope.ProfileID},
-		SameServer: result.SameServer, Items: visible, Now: t.now().UTC(),
+		SameServer: result.SameServer, Items: recorded, Now: t.now().UTC(),
 		Library:   func(id int) (int, bool) { return id, libraries[id] },
 		Untrusted: true,
 	}
@@ -477,6 +490,9 @@ func (t *ProfileTransfer) Import(ctx context.Context, scope ProfileImportScope, 
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
+	}
+	if t.itemsChanged != nil {
+		t.itemsChanged(scope.UserID, scope.ProfileID, recorded.Resolved())
 	}
 	// One list for both: telling "not here" from "here but hidden" would let
 	// a restricted profile probe which titles its hidden libraries hold.

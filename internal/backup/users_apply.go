@@ -204,7 +204,22 @@ func (a *applier) applyAccount(ctx context.Context, tx pgx.Tx, sel UserSelection
 	if len(report.Unmatched) > 0 {
 		item.Notes = append(item.Notes, fmt.Sprintf("%d items are not in this server's catalog and were left out.", len(r.items.unmatched)))
 	}
-	return applied{item: accountOutcome(item, report, r.changed)}, nil
+	return applied{item: accountOutcome(item, report, r.changed), after: r.itemsChanged()}, nil
+}
+
+// itemsChanged tells the server, after the item commits, which items each
+// profile's restored data names (RestoreTargets.ItemsChanged).
+func (r *accountRestore) itemsChanged() func(context.Context) {
+	notify := r.a.s.targets.ItemsChanged
+	if notify == nil || len(r.resolved) == 0 {
+		return nil
+	}
+	userID, resolved := r.plan.localID, r.resolved
+	return func(context.Context) {
+		for profileID, items := range resolved {
+			notify(userID, profileID, items.Resolved())
+		}
+	}
 }
 
 // accountOutcome is restored when anything changed, else left out with the
@@ -270,6 +285,9 @@ type accountRestore struct {
 	// profiles maps the account's source profile ids to profiles here.
 	profiles map[string]string
 	changed  bool
+	// resolved records, by local profile id, the items each profile's
+	// imported data names, for RestoreTargets.ItemsChanged after commit.
+	resolved map[string]*userdata.RecordingItems
 }
 
 // chosenProfile is a profile whose data the restore merges.
@@ -405,9 +423,14 @@ func (r *accountRestore) importTarget(ctx context.Context, c chosenProfile) (use
 	if err != nil {
 		return userdata.Target{}, err
 	}
+	recorded := &userdata.RecordingItems{Inner: items}
+	if r.resolved == nil {
+		r.resolved = map[string]*userdata.RecordingItems{}
+	}
+	r.resolved[c.plan.localID] = recorded
 	target := userdata.Target{
 		Owner:      userdata.Owner{UserID: r.plan.localID, ProfileID: c.plan.localID},
-		SameServer: r.sameServer, Items: items, Now: a.s.opts.Now().UTC(),
+		SameServer: r.sameServer, Items: recorded, Now: a.s.opts.Now().UTC(),
 		Library: mapIn(a.libraryMap()),
 		Profile: func(id string) (string, bool) { local, ok := r.profiles[id]; return local, ok },
 		WriteBlob: func(ctx context.Context, store, from, to string) error {

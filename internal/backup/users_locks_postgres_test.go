@@ -44,7 +44,7 @@ func blockedImporter(t *testing.T, pool *pgxpool.Pool, userID int) int {
 		var pid int
 		err := pool.QueryRow(t.Context(), `
 			SELECT l.pid FROM pg_locks l
-			WHERE l.locktype = 'advisory' AND l.granted AND l.classid = $1 AND l.objid = $2
+			WHERE l.locktype = 'advisory' AND l.granted AND l.objsubid = 2 AND l.classid = $1 AND l.objid = $2
 			  AND EXISTS (SELECT 1 FROM pg_locks w WHERE w.pid = l.pid AND NOT w.granted)
 			LIMIT 1`, preferenceLockClass, userID).Scan(&pid)
 		if err == nil {
@@ -63,8 +63,8 @@ func checkHoldsAccountLocks(t *testing.T, pool *pgxpool.Pool, pid, userID int, p
 	var section, waitsOnHistory bool
 	if err := pool.QueryRow(t.Context(), `
 		SELECT
-			EXISTS (SELECT 1 FROM pg_locks WHERE pid = $1 AND locktype = 'advisory' AND granted AND classid = $2 AND objid = $3),
-			EXISTS (SELECT 1 FROM pg_locks WHERE pid = $1 AND locktype = 'advisory' AND NOT granted AND classid = $3
+			EXISTS (SELECT 1 FROM pg_locks WHERE pid = $1 AND locktype = 'advisory' AND granted AND objsubid = 2 AND classid = $2 AND objid = $3),
+			EXISTS (SELECT 1 FROM pg_locks WHERE pid = $1 AND locktype = 'advisory' AND NOT granted AND objsubid = 2 AND classid = $3
 				AND objid = (hashtext('imported-history:' || $4::text))::oid)`,
 		pid, sectionLockClass, userID, profileID).Scan(&section, &waitsOnHistory); err != nil {
 		t.Fatal(err)
@@ -245,7 +245,7 @@ func TestProfileImportAndDeleteLockOrderDB(t *testing.T) {
 	var deleter int
 	for deadline := time.Now().Add(20 * time.Second); deleter == 0; {
 		err := pool.QueryRow(ctx, `
-			SELECT pid FROM pg_locks WHERE locktype = 'advisory' AND NOT granted AND classid = $1 AND objid = $2 AND pid <> $3 LIMIT 1`,
+			SELECT pid FROM pg_locks WHERE locktype = 'advisory' AND NOT granted AND objsubid = 2 AND classid = $1 AND objid = $2 AND pid <> $3 LIMIT 1`,
 			preferenceLockClass, user, importer).Scan(&deleter)
 		if err != nil && time.Now().After(deadline) {
 			t.Fatal("the deletion never waited on the account lock")

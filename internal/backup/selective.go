@@ -166,6 +166,9 @@ type RestoreTargets struct {
 	// entry they refuse.
 	CheckLibrary    func(catalog.CreateFolderInput) error
 	CheckCollection func(catalog.CreateLibraryCollectionInput) error
+	// ItemsChanged hears, after an account's item commits, which items each
+	// restored profile's data names (ProfileTransfer.SetItemsChanged).
+	ItemsChanged ItemsChanged
 	// SmartCollectionCreated refreshes a committed smart collection's item
 	// count, as the editor does after creating one.
 	SmartCollectionCreated func(ctx context.Context, collectionID string) error

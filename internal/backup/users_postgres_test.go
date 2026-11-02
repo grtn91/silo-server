@@ -831,9 +831,21 @@ func TestProfileTransferDB(t *testing.T) {
 		}
 	}
 
+	// After the commit the import names the profile's items, so their
+	// notification interest is recomputed as the user store's writes do.
+	var told []string
+	transfer.SetItemsChanged(func(userID int, profileID string, items []string) {
+		if userID == user && profileID == dst {
+			told = items
+		}
+	})
 	res, err := transfer.Import(ctx, ProfileImportScope{UserID: user, ProfileID: dst}, data)
 	if err != nil {
 		t.Fatal(err)
+	}
+	transfer.SetItemsChanged(nil)
+	if len(told) == 0 {
+		t.Fatal("the import named no changed items after its commit")
 	}
 	if !res.SameServer || countRows(t, pool, `SELECT count(*) FROM user_favorites WHERE user_id = $1 AND profile_id = $2`, user, dst) != 3 ||
 		countRows(t, pool, `SELECT count(*) FROM user_library_playback_preferences WHERE user_id = $1 AND profile_id = $2`, user, dst) != 2 {

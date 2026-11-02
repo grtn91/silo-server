@@ -11,6 +11,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/backup"
 	"github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/models"
+	"github.com/Silo-Server/silo-server/internal/notifications"
 )
 
 // wireBackupRestore gives selective restore the write paths it applies
@@ -82,5 +83,20 @@ func wireBackupRestore(deps Dependencies, admin *handlers.AdminHandler, librarie
 	if pageSections != nil {
 		targets.CheckSection = pageSections.CheckRestoredSection
 	}
+	targets.ItemsChanged = interestChanges(deps.Notifications)
 	deps.Backups.SetRestoreTargets(targets)
+}
+
+// interestChanges queues a notification interest recompute for each item a
+// profile's restored or imported data names, as the user store's own writes
+// do (notifications.WrapUserStoreProvider); nil without notifications.
+func interestChanges(system *notifications.System) backup.ItemsChanged {
+	if system == nil || system.Interest == nil {
+		return nil
+	}
+	return func(userID int, profileID string, itemIDs []string) {
+		for _, id := range itemIDs {
+			system.Interest.QueueItemMutation(userID, profileID, id)
+		}
+	}
 }

@@ -15,6 +15,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
+	"slices"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -80,6 +82,30 @@ type Summary struct {
 // resolver records items it could not match, by title, for the report.
 type Items interface {
 	Resolve(ctx context.Context, sourceID string) (localID string, ok bool, err error)
+}
+
+// RecordingItems is an Items that remembers each local item it resolved,
+// so a caller can tell the rest of the server, after its commit, which
+// items a profile's data now names (notification interest, for one).
+type RecordingItems struct {
+	Inner    Items
+	resolved map[string]bool
+}
+
+func (r *RecordingItems) Resolve(ctx context.Context, sourceID string) (string, bool, error) {
+	local, ok, err := r.Inner.Resolve(ctx, sourceID)
+	if err == nil && ok {
+		if r.resolved == nil {
+			r.resolved = map[string]bool{}
+		}
+		r.resolved[local] = true
+	}
+	return local, ok, err
+}
+
+// Resolved lists the local items resolved, sorted.
+func (r *RecordingItems) Resolved() []string {
+	return slices.Sorted(maps.Keys(r.resolved))
 }
 
 // Target is where an import writes, and how references in the document map

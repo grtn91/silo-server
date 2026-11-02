@@ -980,7 +980,15 @@ with no group, compared against the no-group policy, and never given the
 default group. An account with a group joins the group of that name here, if
 there is one and it grants nothing more (`group_not_on_this_server`
 otherwise); groups themselves are never restored. A new account keeps its
-password hash, so it signs in with its old password.
+password hash, so it signs in with its old password. A password or PIN hash
+in a format or cost this server does not accept is replaced, and the report
+notes that a new one must be set.
+
+After an account's item or a profile import commits, the restore tells the
+notification system which items each profile's data now names
+(`ItemsChanged`, the interest recompute the user store's own writes
+trigger), so new-episode notifications follow the restored favorites,
+watchlist, and progress without waiting for the nightly repair.
 
 **Access never loosens.** A library id with no library here is dropped from
 an account's library list and from a profile's allowed libraries; a list
