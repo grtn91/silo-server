@@ -241,7 +241,7 @@ var secretTables = []secretTable{
 		describe: `format('server notification channel %s %L', r.id, r.name)`,
 	}},
 
-	{name: "users", handling: secretRestored, why: "account passwords, restored with the accounts they sign in to"},
+	{name: tableUsers, handling: secretRestored, why: "account passwords, restored with the accounts they sign in to"},
 	{name: tableUserProfiles, handling: secretRestored, why: "profile PINs, restored with their profiles"},
 	{name: "marker_edit_audit", handling: secretRestored, why: "names the API key an edit came from"},
 	{name: "watch_provider_connections", handling: secretRestored, why: outboundOnly},
@@ -298,6 +298,9 @@ type CarriedCredentials struct {
 	// not in the restored data or has more authority there, without key
 	// material.
 	Dropped []string
+	// Stricter names the security switches kept at the live server's
+	// stricter value (stricterFlags).
+	Stricter []string
 }
 
 // carryCredentials replaces the restored database's credentials with the
@@ -325,6 +328,10 @@ func carryCredentials(ctx context.Context, loader DatabaseLoader, dbURL, liveURL
 	if len(carriedRows.Dropped) > 0 {
 		_, _ = fmt.Fprintf(out, "Dropped %d whose owner is not in the backup or has more authority there than here: %s\n",
 			len(carriedRows.Dropped), strings.Join(carriedRows.Dropped, ", "))
+	}
+	if len(carriedRows.Stricter) > 0 {
+		_, _ = fmt.Fprintf(out, "Kept %d security switches as this server has them, stricter than the backup: %s\n",
+			len(carriedRows.Stricter), strings.Join(carriedRows.Stricter, ", "))
 	}
 	return nil
 }
@@ -363,7 +370,11 @@ func (l PGLoader) CarryCredentials(ctx context.Context, dbURL, liveURL string) (
 				return fmt.Errorf("%s: %w", table.name, err)
 			}
 		}
-		return nil
+		if liveURL == "" {
+			return nil
+		}
+		result.Stricter, err = keepStricterFlags(ctx, tx, liveState.stricter)
+		return err
 	})
 	return result, err
 }
@@ -412,6 +423,9 @@ func carriedGrants(ctx context.Context, tx pgx.Tx, tables []secretTable, live []
 type liveCredentials struct {
 	authority map[int]accountAuthority
 	grants    map[grantKey]access.EffectiveUserPolicy
+	// stricter is each stricterFlags entry's live rows at its stricter
+	// value.
+	stricter []string
 }
 
 // readLiveCredentials reads each credential table of liveURL as one JSON
@@ -437,7 +451,10 @@ func readLiveCredentials(ctx context.Context, liveURL string, tables []secretTab
 		if state.authority, err = readAuthority(ctx, tx, owners); err != nil {
 			return err
 		}
-		state.grants, err = inviteePolicies(ctx, tx, tables, into)
+		if state.grants, err = inviteePolicies(ctx, tx, tables, into); err != nil {
+			return err
+		}
+		state.stricter, err = readStricterFlags(ctx, tx)
 		return err
 	})
 	return state, err
