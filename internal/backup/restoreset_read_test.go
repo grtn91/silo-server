@@ -163,6 +163,51 @@ func TestReadRestoreSetAcceptsAValidArchive(t *testing.T) {
 	}
 }
 
+// TestRestoreExtractsOnlyTheSelectedItemsFiles: a restore writes to the
+// temporary directory only the files its selected items need, and refuses
+// to start when they would not fit there.
+func TestRestoreExtractsOnlyTheSelectedItemsFiles(t *testing.T) {
+	index, entries := testRestoreSet()
+	data := buildTar(t, index, entries)
+	planned, err := ReadRestoreSet(context.Background(), bytes.NewReader(data), ReadOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const poster, collectionImage = "library-posters/3.jpg", "collection-images/c1/poster/w300.abcd.jpg"
+	for sel, want := range map[string][]string{
+		SectionLibraries:   {poster},
+		SectionCollections: {"collection-images/c1/poster/original.abcd.jpg", collectionImage},
+	} {
+		got := slices.Sorted(maps.Keys(selectedBlobs(planned, map[string][]string{sel: {"3", collectionItemID("c1")}})))
+		if !slices.Equal(got, want) {
+			t.Fatalf("selecting %s extracts %v, want %v", sel, got, want)
+		}
+	}
+
+	keep := selectedBlobs(planned, map[string][]string{SectionLibraries: {"3"}})
+	rs, err := ReadRestoreSet(context.Background(), bytes.NewReader(data), ReadOptions{ExtractDir: t.TempDir(), Extract: func(key string) bool { return keep[key] }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rs.Cleanup()
+	if f, _, err := rs.openBlob(poster); err != nil {
+		t.Fatalf("selected file not extracted: %v", err)
+	} else {
+		_ = f.Close()
+	}
+	if _, _, err := rs.openBlob(collectionImage); !errors.Is(err, ErrNotFound) || !rs.HasBlob(collectionImage) {
+		t.Fatalf("unselected file: %v, carried %v; want it read, not extracted", err, rs.HasBlob(collectionImage))
+	}
+
+	if err := checkTempSpace(t.TempDir(), planned, keep); err != nil {
+		t.Fatalf("a small restore: %v", err)
+	}
+	planned.blobSizes[poster] = 1 << 60
+	if err := checkTempSpace(t.TempDir(), planned, keep); !errors.Is(err, ErrNotEnoughTempSpace) {
+		t.Fatalf("a restore larger than the free space = %v, want ErrNotEnoughTempSpace", err)
+	}
+}
+
 // TestReadRestoreSetRefusesHostileArchives: restore sets are untrusted input,
 // uploaded or read from a destination something else can write. Each case
 // changes one thing about a valid archive.

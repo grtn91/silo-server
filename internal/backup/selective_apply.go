@@ -72,7 +72,20 @@ func (s *Service) ExecuteRestore(ctx context.Context, run RestoreRun) (any, erro
 	work, cancelWork := withLost(context.WithoutCancel(ctx), held)
 	defer cancelWork()
 
-	rs, err := s.openRestoreSet(work, req.source(), true)
+	// Only the files the selected items write are extracted, and only when
+	// the temporary directory has room for them.
+	planned, _, err := s.previewSet(work, req.source())
+	if err != nil {
+		return fail(err)
+	}
+	if planned.Digest != req.Digest {
+		return fail(ErrDigestMismatch)
+	}
+	wanted := selectedBlobs(planned, req.Selection)
+	if err := checkTempSpace(os.TempDir(), planned, wanted); err != nil {
+		return fail(err)
+	}
+	rs, err := s.openRestoreSet(work, req.source(), func(key string) bool { return wanted[key] })
 	if err != nil {
 		return fail(err)
 	}
@@ -393,7 +406,18 @@ func (a *applier) writeBlobTo(ctx context.Context, storeName, from, to string) e
 		return err
 	}
 	defer func() { _ = f.Close() }()
-	err = blobstore.CreateExclusive(ctx, store, to, f, blobstore.MediaType(to))
+	// A restored file meets the checks an upload of it would.
+	if size > maxRestoredFile {
+		return fmt.Errorf("%w: %s is %s, over the %s any upload may be", ErrRestoredFileRefused, to, formatBytes(uint64(size)), formatBytes(maxRestoredFile))
+	}
+	data, err := io.ReadAll(f)
+	if err != nil {
+		return fmt.Errorf("reading %s: %w", from, err)
+	}
+	if err := checkRestoredBlob(to, data); err != nil {
+		return err
+	}
+	err = blobstore.CreateExclusive(ctx, store, to, bytes.NewReader(data), blobstore.MediaType(to))
 	switch {
 	case err == nil:
 		return nil

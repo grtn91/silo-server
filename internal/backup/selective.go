@@ -255,9 +255,9 @@ func readStoredRestoreSet(ctx context.Context, body *storedReader, opts ReadOpti
 }
 
 // openRestoreSet reads a source's restore set and checks it against the
-// digest recorded for it. extract writes plugin archives and blobs to a
+// digest recorded for it. A non-nil extract writes the blobs it picks to a
 // temporary directory the caller removes with Cleanup.
-func (s *Service) openRestoreSet(ctx context.Context, src restoreSource, extract bool) (*RestoreSet, error) {
+func (s *Service) openRestoreSet(ctx context.Context, src restoreSource, extract func(key string) bool) (*RestoreSet, error) {
 	located, err := s.locate(ctx, src)
 	if err != nil {
 		return nil, err
@@ -268,8 +268,8 @@ func (s *Service) openRestoreSet(ctx context.Context, src restoreSource, extract
 		return nil, err
 	}
 	defer func() { _ = body.Close() }()
-	opts := ReadOptions{}
-	if extract {
+	opts := ReadOptions{Extract: extract}
+	if extract != nil {
 		opts.ExtractDir = os.TempDir()
 	}
 	rs, err := readStoredRestoreSet(ctx, body, opts)
@@ -295,7 +295,7 @@ func (s *Service) previewSet(ctx context.Context, src restoreSource) (*RestoreSe
 	}
 	digest := located.digest
 	rs, err := s.restoreSets.get(ctx, digest, func(ctx context.Context) (*RestoreSet, error) {
-		rs, err := s.openRestoreSet(ctx, src, false)
+		rs, err := s.openRestoreSet(ctx, src, nil)
 		if err != nil {
 			return nil, err
 		}

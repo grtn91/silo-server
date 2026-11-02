@@ -703,6 +703,18 @@ are written under ids the restore just took, so a legitimate restore finds
 them absent or equal; an archive naming a live asset's key cannot replace
 it, whether or not the item's transaction later commits.
 
+A restored blob meets the checks an upload of its kind meets, before it
+reaches storage (`checkRestoredBlob`): a branding asset its kind's size limit,
+the type its extension serves, and the kind's processing
+(`branding.CheckStoredAsset`); any other image at most 10 MB, a JPEG, PNG, or
+WebP by its bytes, and a source `imageutil.CheckImage` accepts. A blob that
+fails fails its item with `ErrRestoredFileRefused`; other items go on.
+
+The job extracts only the blobs its selected items write (`selectedBlobs`),
+sizing them from the preview's read of the same restore set, and refuses to
+start (`ErrNotEnoughTempSpace`) unless the temporary directory has their size
+plus 1 GB free. The rest of the archive is read, checked, and discarded.
+
 Before its first item, a restore records each store's identity
 (`blobstore.RecordIdentity`), which a store opened with settings would do on
 its first write through a pool connection; items write files inside their

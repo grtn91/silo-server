@@ -143,7 +143,7 @@ func seedSelective(t *testing.T, pool *pgxpool.Pool, settings *catalog.Encrypted
 		poster: "library poster", seed.artwork: "uploaded poster", "local/movies/" + seed.items[0] + "/abcd1234/poster/w500.r1.jpg": "uploaded w500",
 		collectionPoster: "collection poster", "collection-images/" + cid + "/poster/w300.abcd.jpg": "collection w300",
 	} {
-		if err := store.Put(ctx, key, []byte(data)); err != nil {
+		if err := store.Put(ctx, key, testImage(t, data)); err != nil {
 			t.Fatal(err)
 		}
 	}

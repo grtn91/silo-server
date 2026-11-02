@@ -1,10 +1,14 @@
 package backup
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"image"
+	"image/png"
 	"io"
 	"os"
 	"path/filepath"
@@ -18,6 +22,7 @@ import (
 
 	"github.com/Silo-Server/silo-server/internal/blobstore"
 	"github.com/Silo-Server/silo-server/internal/config"
+	"github.com/Silo-Server/silo-server/internal/imageutil"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/sections"
 )
@@ -32,37 +37,91 @@ func TestWriteBlobNeverReplacesAnExistingObject(t *testing.T) {
 		t.Fatal(err)
 	}
 	extracted := filepath.Join(t.TempDir(), "blob")
-	if err := os.WriteFile(extracted, []byte("from the backup"), 0o600); err != nil {
+	fromBackup, live := testImage(t, "from the backup"), testImage(t, "live asset")
+	if err := os.WriteFile(extracted, fromBackup, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	const key = "local/movies/m1/abcd1234/poster/original.r1.jpg"
 	a := &applier{s: New(Options{Stores: blobstore.Stores{Assets: store}}), rs: &RestoreSet{blobs: map[string]string{key: extracted}}}
-	read := func() string {
+	read := func() []byte {
 		body, _, err := store.Get(ctx, key)
 		if err != nil {
 			t.Fatal(err)
 		}
 		defer func() { _ = body.Close() }()
-		data := make([]byte, 64)
-		n, _ := body.Read(data)
-		return string(data[:n])
+		data, err := io.ReadAll(body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return data
 	}
 
-	if err := store.Put(ctx, key, []byte("live asset")); err != nil {
+	if err := store.Put(ctx, key, live); err != nil {
 		t.Fatal(err)
 	}
 	if err := a.writeBlob(ctx, key, key); !errors.Is(err, ErrBlobConflict) {
 		t.Fatalf("writing over another object = %v, want ErrBlobConflict", err)
 	}
-	if got := read(); got != "live asset" {
-		t.Fatalf("existing object became %q", got)
+	if got := read(); !bytes.Equal(got, live) {
+		t.Fatal("the existing object changed")
 	}
 
-	if err := store.Put(ctx, key, []byte("from the backup")); err != nil {
+	if err := store.Put(ctx, key, fromBackup); err != nil {
 		t.Fatal(err)
 	}
 	if err := a.writeBlob(ctx, key, key); err != nil {
 		t.Fatalf("writing over the same bytes = %v", err)
+	}
+}
+
+// testImage is a small PNG whose pixels depend on seed, so two seeds make
+// files with different bytes.
+func testImage(t *testing.T, seed string) []byte {
+	t.Helper()
+	img := image.NewNRGBA(image.Rect(0, 0, 4, 4))
+	sum := sha256.Sum256([]byte(seed))
+	for i := range img.Pix {
+		img.Pix[i] = sum[i%len(sum)] | 1
+	}
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+// TestRestoredFilesMeetTheUploadChecks: a restore writes only a file its
+// kind's upload would accept, so a backup cannot place a file of another
+// type or size where a server serves uploads.
+func TestRestoredFilesMeetTheUploadChecks(t *testing.T) {
+	img := testImage(t, "poster")
+	webp, err := imageutil.EncodeWebPWidth(img, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oversized := append(slices.Clone(img), make([]byte, maxRestoredImage)...)
+	for name, tc := range map[string]struct {
+		key  string
+		data []byte
+		ok   bool
+	}{
+		"item artwork upload":         {key: "local/movies/m1/abcd1234/poster/original.r1.jpg", data: img, ok: true},
+		"collection image":            {key: "collection-images/c1/poster/w300.abcd.webp", data: webp, ok: true},
+		"branding mark":               {key: "branding/mark/0123456789abcdef.webp", data: webp, ok: true},
+		"favicon":                     {key: "branding/favicon/0123456789abcdef.png", data: img, ok: true},
+		"page served as an image":     {key: "library-posters/3.jpg", data: []byte("<html><script>alert(1)</script></html>")},
+		"image over the upload limit": {key: "library-posters/3.jpg", data: oversized},
+		"bytes that do not decode":    {key: "library-posters/3.jpg", data: img[:len(img)/2]},
+		"branding stored unconverted": {key: "branding/mark/0123456789abcdef.png", data: img},
+		"branding of another type":    {key: "branding/login-bg/0123456789abcdef.webp", data: img},
+		"branding outside a kind":     {key: "branding/other/0123456789abcdef.webp", data: webp},
+	} {
+		t.Run(name, func(t *testing.T) {
+			err := checkRestoredBlob(tc.key, tc.data)
+			if tc.ok != (err == nil) || err != nil && !errors.Is(err, ErrRestoredFileRefused) {
+				t.Fatalf("checkRestoredBlob(%s) = %v, want ok %v", tc.key, err, tc.ok)
+			}
+		})
 	}
 }
 
