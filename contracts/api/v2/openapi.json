@@ -4222,7 +4222,8 @@
               "profile_limit",
               "user_store_unsupported",
               "template_not_available",
-              "collection_not_mapped"
+              "collection_not_mapped",
+              "unreadable"
             ],
             "type": "string"
           },
@@ -4731,7 +4732,8 @@
               "profile_limit",
               "user_store_unsupported",
               "template_not_available",
-              "collection_not_mapped"
+              "collection_not_mapped",
+              "unreadable"
             ],
             "type": "string"
           },

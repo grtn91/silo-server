@@ -32,16 +32,30 @@ const tableLibraryCollections = "library_collections"
 const sourceLibraryPoster = "library poster"
 
 // excludedTableData lists the tables whose rows a dump leaves out: logs and
-// queues that are large and rebuildable or disposable; and backup_status,
-// whose row describes the backup being taken and would read as a stale run
-// after a restore. Their schema is always kept. Each entry also excludes its
-// partitions.
+// queues that are large and rebuildable or disposable; backup_status, whose
+// row describes the backup being taken and would read as a stale run after a
+// restore; and sign-in state (signInTables). Their schema is always kept.
+// Each entry also excludes its partitions.
 func excludedTableData(includeIntroFingerprints bool) []string {
 	tables := []string{"activity_log", "operational_logs", "policy_decisions", "catalog_search_index_events", "backup_status"}
+	tables = append(tables, signInTables...)
 	if !includeIntroFingerprints {
 		tables = append(tables, "media_intro_fingerprints")
 	}
 	return tables
+}
+
+// signInTables hold login sessions, refresh tokens, and the tokens that
+// lead to them. A restore brings none back: a session revoked after the
+// backup would otherwise be valid again, so after a full restore every
+// client signs in again. Their schema is kept.
+var signInTables = []string{
+	"auth_sessions",         // web and native sign-ins and their refresh tokens
+	"device_login_requests", // device-code sign-ins, which name auth_sessions
+	"jellycompat_sessions",  // Jellyfin-protocol access tokens
+	"abs_sessions",          // Audiobookshelf-protocol sessions
+	"oauth_session",         // OIDC sign-ins in progress
+	"password_reset_tokens", // a token used after the backup would work again
 }
 
 // blobRef is one blob the snapshot references.

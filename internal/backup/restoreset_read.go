@@ -61,6 +61,10 @@ type RestoreSet struct {
 	// MissingBlobs lists keys a section references that the archive does
 	// not carry: they were gone when the backup copied them.
 	MissingBlobs []string
+	// Unusable lists entries the reader left out because a value in them is
+	// one no restore could write; the rest of the set stays readable, and a
+	// preview lists them as unreadable.
+	Unusable []UnusableEntry
 
 	// blobs maps each blob key in the archive to its extracted file, or to
 	// "" when the read did not extract.
@@ -186,11 +190,25 @@ type restoreSetParser struct {
 	ladderDirs map[string]sectionSpec
 	seen       map[string]bool
 	documents  map[string][]byte
+	// logical sums the entries' sizes as their headers state them.
+	logical int64
 }
 
 func (p *restoreSetParser) entry(h *tar.Header, tr io.Reader, first bool) error {
 	if h.Typeflag != tar.TypeReg {
 		return fmt.Errorf("%q is not a regular file", h.Name)
+	}
+	// A PAX sparse file reads as a regular one whose size is its logical
+	// size, with holes the tar reader fills from nothing: a tiny archive
+	// could expand to any size. The writer never makes one.
+	for key := range h.PAXRecords {
+		if strings.HasPrefix(key, "GNU.sparse.") {
+			return fmt.Errorf("%q is a sparse file", h.Name)
+		}
+	}
+	// What the entries say they hold is bounded as the archive's bytes are.
+	if p.logical += h.Size; p.logical > maxRestoreSetTotal {
+		return fmt.Errorf("restore set: its files hold more than %d bytes", int64(maxRestoreSetTotal))
 	}
 	if !canonicalArchivePath(h.Name) {
 		return fmt.Errorf("%q is not a canonical path", h.Name)
@@ -470,29 +488,57 @@ func (p *restoreSetParser) decodeSection(si SectionIndex) (int, error) {
 		if ok, err := p.document(spec.document, &p.rs.Settings); err != nil || !ok {
 			return 0, requireDocument(spec, ok, err)
 		}
-		return len(p.rs.Settings.Settings), validateSettingsDocument(p.rs.Settings)
+		n := len(p.rs.Settings.Settings)
+		return n, p.validateSettings()
 	case SectionLibraries:
 		if ok, err := p.document(spec.document, &p.rs.Libraries); err != nil || !ok {
 			return 0, requireDocument(spec, ok, err)
 		}
-		return len(p.rs.Libraries.Libraries), p.validateLibraries()
+		n := len(p.rs.Libraries.Libraries)
+		return n, p.validateLibraries()
 	case SectionCollections:
 		if ok, err := p.document(spec.document, &p.rs.Collections); err != nil || !ok {
 			return 0, requireDocument(spec, ok, err)
 		}
 		d := p.rs.Collections
-		return len(d.Collections) + len(d.TemplateCollections) + len(d.ItemArtwork) + len(d.Branding), p.validateCollections()
+		n := len(d.Collections) + len(d.TemplateCollections) + len(d.ItemArtwork) + len(d.Branding)
+		return n, p.validateCollections()
 	case SectionHomeSections:
 		if ok, err := p.document(spec.document, &p.rs.HomeSections); err != nil || !ok {
 			return 0, requireDocument(spec, ok, err)
 		}
-		return len(p.rs.HomeSections.Sections), validateHomeSections(p.rs.HomeSections)
+		n := len(p.rs.HomeSections.Sections)
+		return n, p.validateHomeSections()
 	case SectionPlugins:
 		return p.decodePlugins(spec)
 	case SectionUsers:
 		return p.decodeUsers(spec)
 	}
 	return 0, fmt.Errorf("no reader for section %q", si.ID)
+}
+
+// UnusableEntry is an entry of a restore set the reader left out.
+type UnusableEntry struct {
+	Section string
+	// ID is the preview item id the reader gives it; it is never one a
+	// restore request can choose.
+	ID      string
+	Kind    string
+	Label   string
+	Message string
+}
+
+// unusable records an entry left out, labeled by what the archive names it.
+func (p *restoreSetParser) unusable(section, kind, label, message string) {
+	label = strings.TrimSpace(strings.ToValidUTF8(label, ""))
+	if len(label) > 200 {
+		label = strings.ToValidUTF8(label[:200], "")
+	}
+	if label == "" {
+		label = "Unnamed entry"
+	}
+	p.rs.Unusable = append(p.rs.Unusable, UnusableEntry{Section: section, ID: fmt.Sprintf("unreadable:%d", len(p.rs.Unusable)+1),
+		Kind: kind, Label: label, Message: message})
 }
 
 func requireDocument(spec sectionSpec, ok bool, err error) error {
@@ -505,47 +551,62 @@ func requireDocument(spec sectionSpec, ok bool, err error) error {
 	return nil
 }
 
-func validateSettingsDocument(d SettingsDocument) error {
+func (p *restoreSetParser) validateSettings() error {
+	d := &p.rs.Settings
 	seen := map[string]bool{}
+	kept := d.Settings[:0]
 	for _, s := range d.Settings {
 		if s.Key == "" || len(s.Key) > 256 || !utf8.ValidString(s.Key) {
-			return fmt.Errorf("setting key %q is not valid", s.Key)
+			p.unusable(SectionSettings, KindSettingsPage, s.Key, "Its setting key is not one a server can have.")
+			continue
 		}
 		if seen[s.Key] {
 			return fmt.Errorf("setting %q is listed twice", s.Key)
 		}
 		seen[s.Key] = true
+		kept = append(kept, s)
 	}
+	d.Settings = kept
 	return nil
 }
 
 func (p *restoreSetParser) validateLibraries() error {
+	d := &p.rs.Libraries
 	seen := map[int]bool{}
-	for _, l := range p.rs.Libraries.Libraries {
-		if l.ID <= 0 {
-			return fmt.Errorf("library id %d is not valid", l.ID)
-		}
-		if seen[l.ID] {
+	kept := d.Libraries[:0]
+	for _, l := range d.Libraries {
+		if seen[l.ID] && l.ID > 0 {
 			return fmt.Errorf("library %d is listed twice", l.ID)
 		}
 		seen[l.ID] = true
-		if strings.TrimSpace(l.Name) == "" || strings.TrimSpace(l.Type) == "" || len(l.Paths) == 0 {
-			return fmt.Errorf("library %d has no name, type, or paths", l.ID)
-		}
-		for _, folder := range l.Paths {
-			if !filepath.IsAbs(folder) || filepath.Clean(folder) != folder {
-				return fmt.Errorf("library %d path %q is not a clean absolute path", l.ID, folder)
-			}
-		}
 		if err := p.requireReferenced(SectionLibraries, l.Poster); err != nil {
 			return err
 		}
+		if msg := libraryProblem(l); msg != "" {
+			p.unusable(SectionLibraries, KindLibrary, l.Name, msg)
+			continue
+		}
+		kept = append(kept, l)
 	}
+	d.Libraries = kept
 	return nil
 }
 
+// libraryProblem says why a library cannot be restored, or "".
+func libraryProblem(l LibraryEntry) string {
+	if l.ID <= 0 || strings.TrimSpace(l.Name) == "" || strings.TrimSpace(l.Type) == "" || len(l.Paths) == 0 {
+		return "It has no valid id, name, type, or folders."
+	}
+	for _, folder := range l.Paths {
+		if !filepath.IsAbs(folder) || filepath.Clean(folder) != folder {
+			return "A folder is not a clean absolute path."
+		}
+	}
+	return ""
+}
+
 func (p *restoreSetParser) validateCollections() error {
-	d := p.rs.Collections
+	d := &p.rs.Collections
 	seen := map[string]bool{}
 	claim := func(id string) error {
 		if seen[id] {
@@ -554,45 +615,58 @@ func (p *restoreSetParser) validateCollections() error {
 		seen[id] = true
 		return nil
 	}
+	collections := d.Collections[:0]
 	for _, c := range d.Collections {
+		if err := p.requireCollectionImages(c.Poster, c.Backdrop); err != nil {
+			return err
+		}
 		if !validItemSegment(c.ID) || strings.TrimSpace(c.Title) == "" || c.LibraryID <= 0 {
-			return fmt.Errorf("collection %q has no valid id, title, or library", c.ID)
+			p.unusable(SectionCollections, KindCollection, c.Title, "It has no valid id, title, or library.")
+			continue
 		}
 		if err := claim(collectionItemID(c.ID)); err != nil {
 			return err
 		}
 		if !validRawJSON(c.QueryDefinition, c.SortConfig, c.SourceConfig) {
-			return fmt.Errorf("collection %q carries invalid JSON", c.ID)
+			p.unusable(SectionCollections, KindCollection, c.Title, "Its rules or sync source are not valid JSON.")
+			continue
 		}
-		if err := p.requireCollectionImages(c.Poster, c.Backdrop); err != nil {
-			return err
-		}
+		collections = append(collections, c)
 	}
+	d.Collections = collections
 	if err := p.validateTemplateCollections(claim); err != nil {
 		return err
 	}
+	artwork := d.ItemArtwork[:0]
 	for _, a := range d.ItemArtwork {
+		if err := p.requireReferenced(SectionCollections, a.Path); err != nil {
+			return err
+		}
 		if a.ContentID == "" || a.ImageType == "" || a.TargetType == "" {
-			return fmt.Errorf("item artwork %q is incomplete", a.itemID())
+			p.unusable(SectionCollections, KindItemArtwork, a.ContentID, "It does not say which item and image it is.")
+			continue
 		}
 		if err := claim(a.itemID()); err != nil {
 			return err
 		}
-		if err := p.requireReferenced(SectionCollections, a.Path); err != nil {
+		artwork = append(artwork, a)
+	}
+	d.ItemArtwork = artwork
+	brandingEntries := d.Branding[:0]
+	for _, b := range d.Branding {
+		if err := p.requireReferenced(SectionCollections, b.Blob); err != nil {
 			return err
 		}
-	}
-	for _, b := range d.Branding {
 		if err := validBrandingEntry(b); err != nil {
-			return err
+			p.unusable(SectionCollections, KindBranding, b.Key, "It is not a branding image this server can set.")
+			continue
 		}
 		if err := claim(b.itemID()); err != nil {
 			return err
 		}
-		if err := p.requireReferenced(SectionCollections, b.Blob); err != nil {
-			return err
-		}
+		brandingEntries = append(brandingEntries, b)
 	}
+	d.Branding = brandingEntries
 	return nil
 }
 
@@ -600,64 +674,82 @@ func (p *restoreSetParser) validateCollections() error {
 // and later): a management key naming their own bundle, template, and
 // library, and images listed for the section.
 func (p *restoreSetParser) validateTemplateCollections(claim func(string) error) error {
-	d := p.rs.Collections
+	d := &p.rs.Collections
 	if len(d.TemplateCollections) > 0 && p.index.Version < 3 {
 		return errors.New("template collections are not part of this format version")
 	}
+	kept := d.TemplateCollections[:0]
 	for _, t := range d.TemplateCollections {
+		if err := p.requireCollectionImages(t.Poster, t.Backdrop); err != nil {
+			return err
+		}
 		bundle, template, library, ok := ParseTemplateManagementKey(t.ManagementKey)
 		if !validItemSegment(t.ID) || !ok || bundle != t.BundleID || template != t.TemplateID || library != t.LibraryID ||
 			len(t.ManagementKey) > 512 || strings.TrimSpace(t.Title) == "" {
-			return fmt.Errorf("template collection %q has no valid id, title, or management key", t.ID)
+			p.unusable(SectionCollections, KindTemplateCollection, t.Title, "It has no valid id, title, or template.")
+			continue
 		}
 		if err := claim(t.itemID()); err != nil {
 			return err
 		}
 		if !validRawJSON(t.SortConfig, t.SourceConfig) {
-			return fmt.Errorf("template collection %q carries invalid JSON", t.ID)
+			p.unusable(SectionCollections, KindTemplateCollection, t.Title, "Its sort or sync source is not valid JSON.")
+			continue
 		}
-		if err := p.requireCollectionImages(t.Poster, t.Backdrop); err != nil {
-			return err
-		}
+		kept = append(kept, t)
 	}
+	d.TemplateCollections = kept
 	return nil
 }
 
 // validateHomeSections checks each section's identity, scope, and JSON, and
-// that a carried collection is the one its configuration names.
-func validateHomeSections(d HomeSectionsDocument) error {
+// that a carried collection is the one its configuration names. An id
+// listed twice is fatal; any other problem leaves that section out.
+func (p *restoreSetParser) validateHomeSections() error {
+	d := &p.rs.HomeSections
 	seen := map[string]bool{}
+	kept := d.Sections[:0]
 	for _, e := range d.Sections {
-		if !validItemSegment(e.ID) || seen[e.ID] {
-			return fmt.Errorf("section %q has no valid id or is listed twice", e.ID)
+		if validItemSegment(e.ID) && seen[e.ID] {
+			return fmt.Errorf("section %q is listed twice", e.ID)
 		}
 		seen[e.ID] = true
+		if msg := homeSectionProblem(e); msg != "" {
+			p.unusable(SectionHomeSections, KindHomeSection, e.Title, msg)
+			continue
+		}
+		kept = append(kept, e)
+	}
+	d.Sections = kept
+	return nil
+}
+
+// homeSectionProblem says why a section cannot be restored, or "".
+func homeSectionProblem(e HomeSectionEntry) string {
+	homePage := e.Scope == pageScopeHome && e.LibraryID == nil
+	libraryPage := e.Scope == pageScopeLibrary && e.LibraryID != nil && *e.LibraryID > 0
+	switch {
+	case !validItemSegment(e.ID):
+		return "It has no valid id."
+	case !homePage && !libraryPage:
+		return "It has no valid page."
+	// An empty title is kept: bulk section creation persists one.
+	case !validSectionID(e.SectionType) || len(e.Title) > 512 || e.ItemLimit < 0:
+		return "It has no valid type, title, or item limit."
+	case !validRawJSON(e.Config):
+		return "Its configuration is not valid JSON."
+	}
+	if c := e.Collection; c != nil {
 		switch {
-		case e.Scope == pageScopeHome && e.LibraryID == nil:
-		case e.Scope == pageScopeLibrary && e.LibraryID != nil && *e.LibraryID > 0:
-		default:
-			return fmt.Errorf("section %q has no valid scope", e.ID)
-		}
-		// An empty title is kept: bulk section creation persists one.
-		if !validSectionID(e.SectionType) || len(e.Title) > 512 || e.ItemLimit < 0 {
-			return fmt.Errorf("section %q has no valid type or title", e.ID)
-		}
-		if !validRawJSON(e.Config) {
-			return fmt.Errorf("section %q carries invalid JSON", e.ID)
-		}
-		if c := e.Collection; c != nil {
-			if !validItemSegment(c.ID) || c.ID != sectionCollectionID(e.Config) || strings.TrimSpace(c.Title) == "" || c.LibraryID <= 0 {
-				return fmt.Errorf("section %q carries a collection its configuration does not name", e.ID)
-			}
-			if !validRawJSON(c.QueryDefinition, c.SortConfig, c.SourceConfig) {
-				return fmt.Errorf("section %q's collection carries invalid JSON", e.ID)
-			}
-			if storedKey(c.Poster) || storedKey(c.Backdrop) {
-				return fmt.Errorf("section %q's collection names an image the set cannot carry", e.ID)
-			}
+		case !validItemSegment(c.ID) || c.ID != sectionCollectionID(e.Config) || strings.TrimSpace(c.Title) == "" || c.LibraryID <= 0:
+			return "It carries a collection its configuration does not name."
+		case !validRawJSON(c.QueryDefinition, c.SortConfig, c.SourceConfig):
+			return "Its collection's rules are not valid JSON."
+		case storedKey(c.Poster) || storedKey(c.Backdrop):
+			return "Its collection names an image the backup cannot carry."
 		}
 	}
-	return nil
+	return ""
 }
 
 // validBrandingEntry admits only a branding asset setting whose reference
@@ -744,19 +836,29 @@ func (p *restoreSetParser) decodePlugins(spec sectionSpec) (int, error) {
 		if doc.Archive.Size != listed.Size || doc.Archive.SHA256 != listed.SHA256 {
 			return 0, fmt.Errorf("%s does not describe its archive", docPath)
 		}
-		keys := map[string]bool{}
-		for _, c := range doc.Configs {
-			if c.Key == "" || keys[c.Key] {
-				return 0, fmt.Errorf("%s: configuration key %q is empty or listed twice", docPath, c.Key)
-			}
-			keys[c.Key] = true
-			if !json.Valid(c.Value) {
-				return 0, fmt.Errorf("%s: configuration %q is not JSON", docPath, c.Key)
-			}
+		if msg := pluginConfigProblem(doc); msg != "" {
+			p.unusable(SectionPlugins, KindPlugin, doc.PluginID, msg)
+			continue
 		}
 		p.rs.Plugins = append(p.rs.Plugins, doc)
 	}
-	return len(p.rs.Plugins), nil
+	return len(p.itemIDs(spec)), nil
+}
+
+// pluginConfigProblem says why a plugin's configuration cannot be restored,
+// or "".
+func pluginConfigProblem(doc PluginDocument) string {
+	keys := map[string]bool{}
+	for _, c := range doc.Configs {
+		if c.Key == "" || keys[c.Key] {
+			return "A configuration key is empty or listed twice."
+		}
+		keys[c.Key] = true
+		if !json.Valid(c.Value) {
+			return "A configuration value is not valid JSON."
+		}
+	}
+	return ""
 }
 
 // canonicalArchivePath accepts a relative slash path with no empty, ".", or

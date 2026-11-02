@@ -119,7 +119,7 @@ func parseBackupRestoreFlags(args []string) (backupRestoreFlags, error) {
 	flags.StringVar(&f.into, "into", "", "empty database to restore into (separate mode)")
 	flags.StringVar(&f.blobsInto, "blobs-into", "", "directory for the restored files (separate mode)")
 	flags.BoolVar(&f.databaseOnly, "database-only", false, "skip files")
-	flags.BoolVar(&f.acceptLostCredentials, "accept-lost-credentials", false, "restore a backup taken with another SECRET_KEY")
+	flags.BoolVar(&f.acceptLostCredentials, "accept-lost-credentials", false, "restore a backup taken with another SECRET_KEY; the encrypted settings this key cannot read are cleared and listed")
 	flags.BoolVar(&f.keepRedis, "keep-redis", false, "leave Redis as it is after a replace")
 	flags.StringVar(&f.recoverTime, "recover", "", "finish an interrupted replace from its journal")
 	if err := flags.Parse(args); err != nil || flags.NArg() != 0 {
@@ -146,6 +146,14 @@ func parseBackupRestoreFlags(args []string) (backupRestoreFlags, error) {
 	return f, nil
 }
 
+// optionalCipher is the cipher of masterKey, or nil without one.
+func optionalCipher(masterKey []byte) (*secret.Cipher, error) {
+	if len(masterKey) == 0 {
+		return nil, nil
+	}
+	return secret.New(masterKey)
+}
+
 func runBackupRestore(ctx context.Context, args []string, out io.Writer) error {
 	f, err := parseBackupRestoreFlags(args)
 	if err != nil {
@@ -167,6 +175,9 @@ func runBackupRestore(ctx context.Context, args []string, out io.Writer) error {
 	if f.into != "" {
 		opts := backup.SeparateOptions{
 			Validate: validate, Into: f.into, BlobsInto: f.blobsInto, DatabaseOnly: f.databaseOnly, Out: out,
+		}
+		if opts.Cipher, err = optionalCipher(masterKey); err != nil {
+			return err
 		}
 		if _, err := backup.RestoreSeparate(ctx, src, loader, opts); err != nil {
 			return err

@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/Silo-Server/silo-server/internal/blobstore"
+	"github.com/Silo-Server/silo-server/internal/secret"
 )
 
 // PGLoader restores dumps with pg_restore and reads databases with pgx.
@@ -75,6 +76,43 @@ func (l PGLoader) UnbindStorage(ctx context.Context, dbURL string) error {
 	_, err = conn.Exec(ctx, `DELETE FROM server_settings WHERE key = ANY($1)`,
 		[]string{blobstore.IdentitySettingKey, blobstore.OperationalIdentitySettingKey})
 	return err
+}
+
+func (l PGLoader) ClearUnreadableSettings(ctx context.Context, dbURL string, cipher *secret.Cipher) ([]string, error) {
+	conn, err := pgx.Connect(ctx, dbURL)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = conn.Close(context.WithoutCancel(ctx)) }()
+	rows, err := conn.Query(ctx, `SELECT key, value FROM server_settings ORDER BY key`)
+	if err != nil {
+		return nil, err
+	}
+	var unreadable []string
+	for rows.Next() {
+		var key, value string
+		if err := rows.Scan(&key, &value); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		if !secret.IsEncrypted(value) {
+			continue
+		}
+		if cipher != nil {
+			if _, err := cipher.Decrypt(value, secret.SettingsAAD(key)); err == nil {
+				continue
+			}
+		}
+		unreadable = append(unreadable, key)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil || len(unreadable) == 0 {
+		return nil, err
+	}
+	if _, err := conn.Exec(ctx, `DELETE FROM server_settings WHERE key = ANY($1)`, unreadable); err != nil {
+		return nil, err
+	}
+	return unreadable, nil
 }
 
 // PGControl is the swap's control connection to the maintenance database.

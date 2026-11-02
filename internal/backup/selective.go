@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"time"
 
@@ -52,6 +53,9 @@ const (
 	// ReasonCollectionNotMapped: a page section naming a collection that is
 	// neither here nor restorable.
 	ReasonCollectionNotMapped = "collection_not_mapped"
+	// ReasonUnreadable marks an entry the restore-set reader left out
+	// (RestoreSet.Unusable).
+	ReasonUnreadable = "unreadable"
 )
 
 // Report outcomes.
@@ -112,6 +116,9 @@ type RestoreTargets struct {
 	CheckFolder func(ctx context.Context, path string) error
 	// CreateJob queues the backup_restore admin job.
 	CreateJob func(ctx context.Context, userID int, req RestoreRequest) (*models.AdminJob, error)
+	// CancelJob cancels a restore job StartRestore queued but could not
+	// keep (it lost the lock meanwhile).
+	CancelJob func(ctx context.Context, id string) error
 	// ActiveRestore returns the request of the restore job queued or
 	// running now, or nil when there is none.
 	ActiveRestore func(ctx context.Context) (*RestoreRequest, error)
@@ -327,7 +334,23 @@ func (s *Service) StartRestore(ctx context.Context, userID int, req RestoreReque
 	if req.Digest != digest {
 		return nil, ErrDigestMismatch
 	}
-	return s.targets.CreateJob(ctx, userID, req)
+	job, err := s.targets.CreateJob(ctx, userID, req)
+	if err != nil {
+		return nil, err
+	}
+	// The job row is written on the pool. A delete of this source checks for
+	// a queued restore under the lock, so the job must have committed while
+	// this request still held it: a statement on the lock's own session
+	// fails once the lock is gone, and the job is then canceled.
+	if _, err := held.Exec(ctx, `SELECT 1`); err != nil {
+		if s.targets.CancelJob != nil {
+			if cancelErr := s.targets.CancelJob(context.WithoutCancel(ctx), job.ID); cancelErr != nil {
+				slog.WarnContext(ctx, "canceling a restore queued without the lock failed", "component", "backup", "job_id", job.ID, "error", cancelErr)
+			}
+		}
+		return nil, fmt.Errorf("the backup lock was lost while the restore was queued; start it again: %w", err)
+	}
+	return job, nil
 }
 
 // ErrBackupInUse refuses deleting a backup a queued or running restore

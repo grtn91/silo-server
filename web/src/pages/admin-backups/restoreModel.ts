@@ -48,6 +48,7 @@ export const REASON_SENTENCES: Record<RestoreReason, string> = {
     "This server's starter packs don't have its template, or the template doesn't suit the library.",
   collection_not_mapped:
     "The collection it shows isn't on this server or in the backup, so there's nothing for it to show.",
+  unreadable: "The backup's copy of it can't be read, so it was left out.",
 };
 
 export const SECTION_TITLES: Record<RestoreSectionId, string> = {

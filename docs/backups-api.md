@@ -199,7 +199,9 @@ server would grant a new account more than the backup did),
 `template_not_available` (a template collection whose template this
 server's catalog does not have, or that does not suit the library), and
 `collection_not_mapped` (a page section showing a collection that is
-neither here nor in the backup).
+neither here nor in the backup), and `unreadable` (an entry of the backup the
+reader left out because a value in it cannot be restored; its `id` is
+`unreadable:<n>` and it can never be chosen).
 
 `requires` lists items (`libraries:<id>`, `collections:<item id>`) that must
 be restored with this one: a collection or template collection whose library

@@ -734,7 +734,12 @@ func readManifest(ctx context.Context, t target, key string) (*Manifest, error) 
 	if err != nil {
 		return nil, err
 	}
-	return ParseManifest(data)
+	m, err := ParseManifest(data)
+	if err != nil {
+		return nil, err
+	}
+	m.storedSize = int64(len(data))
+	return m, nil
 }
 
 // target is the destination one operation uses.

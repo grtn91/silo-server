@@ -145,6 +145,8 @@ func seedRoundTrip(t *testing.T, pool *pgxpool.Pool, settings *catalog.Encrypted
 	exec(`INSERT INTO users (id, role, username) VALUES ($1, 'user', $2)`, userID, "backup-test-"+suffix)
 	t.Cleanup(func() { _, _ = pool.Exec(context.Background(), `DELETE FROM users WHERE id = $1`, userID) })
 	exec(`INSERT INTO user_profiles (id, user_id, name, avatar) VALUES ($1, $2, 'Backup', $3)`, profileID, userID, "upload:"+avatarKey)
+	// A sign-in the restore must not bring back (signInTables).
+	exec(`INSERT INTO auth_sessions (id, user_id, expires_at) VALUES ($1, $2, now() + interval '1 day')`, "backup-test-"+suffix, userID)
 	t.Cleanup(func() { _, _ = pool.Exec(context.Background(), `DELETE FROM user_profiles WHERE id = $1`, profileID) })
 	seed.blobs = map[string][]byte{
 		posterKey: []byte("poster " + suffix),
@@ -250,6 +252,10 @@ func TestBackupRestoreRoundTripDB(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer restoredPool.Close()
+	var sessions int
+	if err := restoredPool.QueryRow(ctx, `SELECT count(*) FROM auth_sessions`).Scan(&sessions); err != nil || sessions != 0 {
+		t.Fatalf("restored %d sign-in sessions (%v), want none", sessions, err)
+	}
 	restoredSettings := catalog.NewEncryptedSettingsRepo(catalog.NewServerSettingsRepo(restoredPool), cipher)
 	if got, err := restoredSettings.Get(ctx, seed.secretKey); err != nil || got != seed.secretValue {
 		t.Fatalf("restored encrypted setting = %q, %v; want %q", got, err, seed.secretValue)
@@ -258,11 +264,43 @@ func TestBackupRestoreRoundTripDB(t *testing.T) {
 	if err := VerifyBackup(ctx, src, loader, into, ValidateOptions{KeyCheck: keyCheck}, io.Discard); err == nil || !strings.Contains(err.Error(), "not empty") {
 		t.Fatalf("verify into a used database = %v, want refusal", err)
 	}
-	// Another SECRET_KEY needs the operator's explicit acceptance.
+	checkAnotherKey(t, src, loader, pool, dsn, seed.secretKey)
+}
+
+// checkAnotherKey: a backup taken with another SECRET_KEY restores only
+// with the operator's explicit acceptance, and then without the encrypted
+// settings this key cannot read, which Silo could not start on.
+func checkAnotherKey(t *testing.T, src *Source, loader PGLoader, pool *pgxpool.Pool, dsn, secretKey string) {
+	t.Helper()
+	ctx := t.Context()
+	other, err := secret.New([]byte("another-test-key-0123456789abcdefgh"))
+	if err != nil {
+		t.Fatal(err)
+	}
 	if _, err := RestoreSeparate(ctx, src, loader, SeparateOptions{
 		Validate: ValidateOptions{KeyCheck: "0000-0000-0000-0000"}, Into: createDatabase(t, pool, dsn), DatabaseOnly: true,
 	}); !errors.Is(err, ErrKeyMismatch) {
 		t.Fatalf("restore with another key = %v, want ErrKeyMismatch", err)
+	}
+	into := createDatabase(t, pool, dsn)
+	var out strings.Builder
+	if _, err := RestoreSeparate(ctx, src, loader, SeparateOptions{
+		Validate: ValidateOptions{KeyCheck: "0000-0000-0000-0000", AcceptLostCredentials: true}, Cipher: other,
+		Into: into, DatabaseOnly: true, Out: &out,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := pgxpool.New(ctx, into)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restored.Close()
+	var left int
+	if err := restored.QueryRow(ctx, `SELECT count(*) FROM server_settings WHERE value LIKE 'enc:%'`).Scan(&left); err != nil {
+		t.Fatal(err)
+	}
+	if left != 0 || !strings.Contains(out.String(), secretKey) {
+		t.Fatalf("%d unreadable settings left; output %q does not name %s", left, out.String(), secretKey)
 	}
 }
 

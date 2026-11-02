@@ -22,7 +22,7 @@ type ObjectLink struct {
 // objects as they are, and the manifest that describes them.
 func downloadable(m *Manifest) []ObjectEntry {
 	out := append([]ObjectEntry(nil), m.Objects...)
-	return append(out, ObjectEntry{Name: ManifestName})
+	return append(out, ObjectEntry{Name: ManifestName, Size: m.storedSize})
 }
 
 // Download scopes.
