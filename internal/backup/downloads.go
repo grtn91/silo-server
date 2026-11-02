@@ -99,7 +99,7 @@ func (s *Service) completeBackup(ctx context.Context, id string) (storedBackup, 
 	if err != nil {
 		return storedBackup{}, err
 	}
-	m, err := readManifest(ctx, t, objectKey(serverID, id, ManifestName))
+	m, err := s.readManifest(ctx, t, serverID, id)
 	if err != nil {
 		return storedBackup{}, err
 	}

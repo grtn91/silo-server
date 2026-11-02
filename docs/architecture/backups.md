@@ -91,6 +91,22 @@ The check value is HKDF-SHA256 over `SECRET_KEY` with info
 prints the value, so an operator can tell which key a backup needs without
 showing either key.
 
+`mac` authenticates the rest of the manifest: HMAC-SHA256 under a key
+derived from `SECRET_KEY` (HKDF-SHA256, info `silo/backup-manifest/v1`,
+`secret.BackupManifestKey`) of the manifest encoded with `mac` empty, in hex.
+It covers the id, kind, server id, times, every object's name, size, and
+checksum, and every other field. Anyone who can write the destination can
+change an object and its checksum together; only a server with the key can
+write a `mac` that verifies. Every read checks it before trusting anything
+else in the manifest: the listing, downloads and download links, a
+selective restore's preview and restore, `silo backup restore`, and
+`silo backup verify`. A manifest whose check value is this server's must
+verify, and one that does not is refused (`ErrManifestTampered`), a missing
+`mac` included; a manifest a destination read must also name the folder and
+server it was read from. A backup written under another `SECRET_KEY` cannot
+be checked here: a full restore of it already needs
+`--accept-lost-credentials`, and its preview says it is not authenticated.
+
 ## Taking a backup
 
 1. Preflight: the user store is PostgreSQL, the destination exists, its id
@@ -768,14 +784,16 @@ never renamed: a value is bound to its key name.
 `secretTables` in `internal/backup/credentials.go` classifies every table
 that holds a bearer secret or a public capability, each one way:
 
-- Left out: short-lived secrets (sessions, sign-in flows, reset and
-  verification tokens, Watch Together join codes). The dump leaves their
+- Left out: short-lived secrets and capabilities (sessions, sign-in flows,
+  reset and verification tokens, Watch Together join codes, Audiobookshelf
+  playback sessions, whose id alone opens the public track route). The dump leaves their
   rows out, so a restore never brings back a session or token revoked
   after the backup, and after a full restore every client signs in again.
 - Carried from the live server: long-lived credentials that clients and
   other services present to Silo (API keys, pending invitations, invite
   codes, autoscan webhook tokens, audiobook RSS feed links, Plex and
-  Jellyfin webhook sync secrets with their profile mappings), and the
+  Jellyfin webhook sync secrets with their profile mappings, external
+  sign-in links and sign-in providers), and the
   destinations that receive notifications without a session (browser and
   mobile push registrations, notification webhooks, notification email
   addresses, Discord links, server notification channels): one removed
@@ -789,11 +807,15 @@ that holds a bearer secret or a public capability, each one way:
   URL slugs, worker leases, delivery histories, account passwords and
   profile PINs with their accounts).
 
-`TestSecretTablesAreClassifiedDB` scans the schema for secret-like column
-names (tokens, secrets, slugs, hashes, codes) and destination-like ones
-(push endpoints and keys, subscriptions, webhooks, callbacks, encrypted
-URLs, channel ids) and fails on a table missing from the list, so a new
-credential or destination table needs a decision before it ships.
+Every other table is classified too (`internal/backup/tables.go`): the
+logs and queues the dump leaves out (`loggedTables`), the server's data
+(`restoredDataTables`), and the running server's own state, restored as it
+is and rebuilt or reconciled by the server (`serverStateTables`: caches,
+queues, job, lease, and lock state, revisions, samples).
+`TestEveryTableIsClassifiedDB` reads every table after the migrations and
+fails on one in no list or in two, and on a listed name that is not a table,
+so a new table needs a decision before it ships; a layer that adds one
+classifies it.
 
 Sensitive settings (`catalog.SensitiveSettingKeys`) are classified the same
 way in `internal/backup/settings_secrets.go`. The signing keys Silo

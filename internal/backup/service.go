@@ -76,6 +76,10 @@ type Options struct {
 	ServerID    func(context.Context) (string, error)
 	// KeyCheck is secret.KeyCheckValue of this server's SECRET_KEY.
 	KeyCheck string
+	// ManifestKey is secret.BackupManifestKey of this server's SECRET_KEY:
+	// backups sign their manifests with it, and every read of one checks
+	// it. Nil writes unsigned manifests and checks none (tests).
+	ManifestKey []byte
 	// Cipher is this server's data cipher. A restore decrypts a backup's
 	// encrypted settings with it when the key check values match.
 	Cipher *secret.Cipher
@@ -462,7 +466,7 @@ func (s *Service) backup(ctx context.Context, prep backupPrep, kind Kind, starte
 		Tables:            facts.tables,
 	}
 	progress(95, "Writing the manifest")
-	if err := writeManifest(ctx, t, manifest); err != nil {
+	if err := writeManifest(ctx, t, manifest, s.opts.ManifestKey); err != nil {
 		return RunResult{}, err
 	}
 	result := RunResult{ID: id, Kind: kind, Status: manifest.Status(), SizeBytes: manifest.Size(), MissingBlobs: manifest.MissingBlobs}
@@ -477,12 +481,15 @@ func (s *Service) backup(ctx context.Context, prep backupPrep, kind Kind, starte
 
 // writeManifest writes m last of a backup's objects: its presence completes
 // the backup.
-func writeManifest(ctx context.Context, t target, m *Manifest) error {
+func writeManifest(ctx context.Context, t target, m *Manifest, key []byte) error {
 	if m.MissingBlobs == nil {
 		m.MissingBlobs = []MissingBlob{}
 	}
 	if len(m.MissingBlobs) > maxRecordedMissingBlobs {
 		m.MissingBlobsTotal, m.MissingBlobs = len(m.MissingBlobs), m.MissingBlobs[:maxRecordedMissingBlobs]
+	}
+	if err := m.sign(key); err != nil {
+		return err
 	}
 	data, err := json.MarshalIndent(m, "", "  ")
 	if err != nil {
@@ -725,7 +732,7 @@ func (s *Service) folders(ctx context.Context, t target, serverID string) ([]fol
 			f.newest = obj.ModTime
 		}
 		if name == ManifestName {
-			m, err := readManifest(ctx, t, obj.Key)
+			m, err := s.readManifest(ctx, t, serverID, id)
 			if err != nil {
 				slog.WarnContext(ctx, "unreadable backup manifest", "component", "backup", "id", id, "error", err)
 				continue
@@ -741,7 +748,24 @@ func (s *Service) folders(ctx context.Context, t target, serverID string) ([]fol
 	return out, nil
 }
 
-func readManifest(ctx context.Context, t target, key string) (*Manifest, error) {
+// readManifest reads and checks the manifest of backup id of serverID: it
+// must name that backup and server, and one written under this server's
+// SECRET_KEY must verify (checkMAC). Authenticated reports whether it did.
+func (s *Service) readManifest(ctx context.Context, t target, serverID, id string) (*Manifest, error) {
+	m, err := readManifestObject(ctx, t, objectKey(serverID, id, ManifestName))
+	if err != nil {
+		return nil, err
+	}
+	if m.ID != id || m.ServerID != serverID {
+		return nil, fmt.Errorf("the manifest of %s names backup %s of server %s", id, m.ID, m.ServerID)
+	}
+	if m.authenticated, err = m.checkMAC(s.opts.ManifestKey, s.opts.KeyCheck); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
+func readManifestObject(ctx context.Context, t target, key string) (*Manifest, error) {
 	body, _, err := t.Open(ctx, key)
 	if err != nil {
 		return nil, err

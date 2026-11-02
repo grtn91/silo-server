@@ -28,6 +28,10 @@ func newBackupService(pool *pgxpool.Pool, bc *config.BootstrapConfig, settings *
 	if err != nil {
 		log.Fatalf("backup key check value: %v", err)
 	}
+	manifestKey, err := secret.BackupManifestKey(bc.SecretKey)
+	if err != nil {
+		log.Fatalf("backup manifest key: %v", err)
+	}
 	return backup.New(backup.Options{
 		Pool:             pool,
 		DatabaseURL:      bc.DatabaseURL,
@@ -38,6 +42,7 @@ func newBackupService(pool *pgxpool.Pool, bc *config.BootstrapConfig, settings *
 		Status:           backup.PostgresStatus{Pool: pool},
 		ServerID:         serveridentity.New(settings).ServerID,
 		KeyCheck:         keyCheck,
+		ManifestKey:      manifestKey,
 		Cipher:           deps.SecretCipher,
 		UserStoreBackend: func() string { return deps.CurrentConfig().UserDB.Backend },
 	})
