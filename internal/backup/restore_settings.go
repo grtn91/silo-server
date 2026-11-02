@@ -109,14 +109,21 @@ var settingRulesByPage = []struct {
 		"policy.":          SettingPortable,
 	}},
 	{"sign-in", map[string]SettingClass{
-		settingJWTSecret:  SettingServerSpecific,
-		"auth.":           SettingPortable,
-		"signup.":         SettingPortable,
-		"password_reset.": SettingPortable,
+		settingJWTSecret: SettingServerSpecific,
+		"auth.":          SettingPortable,
+		// Who may sign in and how (trustSettings): kept as the live server
+		// has them, so a restore cannot reopen a door closed since.
+		"auth.email_auto_match":               SettingServerSpecific,
+		"auth.local_password_login":           SettingServerSpecific,
+		"signup.":                             SettingServerSpecific,
+		"password_reset.self_service_enabled": SettingServerSpecific,
+		"password_reset.":                     SettingPortable,
 	}},
 	{"security", map[string]SettingClass{
 		"ratelimit.":     SettingServerSpecific,
 		"media_servers.": SettingPortable,
+		// Reaching private networks (trustSettings).
+		"media_servers.allow_private_destinations": SettingServerSpecific,
 	}},
 	{pageLibrary, map[string]SettingClass{
 		"access.":    SettingPortable,
@@ -179,6 +186,8 @@ var settingRulesByPage = []struct {
 		"notifications.discord_enabled":        SettingExternalService,
 		"notifications.discord.":               SettingExternalService,
 		"notifications.":                       SettingPortable,
+		// Reaching private networks (trustSettings).
+		"notifications.webhooks.allow_private_destinations": SettingServerSpecific,
 	}},
 	{"compatibility", map[string]SettingClass{
 		settingABSJWTSecret:               SettingServerSpecific,
@@ -229,6 +238,20 @@ var settingRules = func() map[string]settingRule {
 	}
 	return out
 }()
+
+// trustSettings are the network-security and sign-in trust toggles: whether
+// webhooks and media-server connections may reach private networks, which
+// proxies the client address is trusted from, and who may sign in or sign
+// up and how. A restore never writes them: a backup is only as trustworthy
+// as its destination, and one of these turned on would let a profile reach
+// this server's private network or let someone sign in. They stay as the
+// live server has them. TestTrustSettingsAreServerSpecific checks the list
+// and that any setting named like one is in it.
+var trustSettings = []string{
+	"notifications.webhooks.allow_private_destinations", "media_servers.allow_private_destinations",
+	"clientip.trusted_proxies", "auth.email_auto_match", "auth.local_password_login",
+	"signup.enabled", "password_reset.self_service_enabled",
+}
 
 // classifySetting finds a key's rule: the exact key, else the longest
 // matching prefix.

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -1010,6 +1011,21 @@ func (f *selectiveFixture) moveToAnotherServer(t *testing.T, backupID string) {
 		_ = body.Close()
 		if err != nil {
 			t.Fatal(err)
+		}
+		if path.Base(obj.Key) == ManifestName {
+			// The copy is a backup of this server now: its manifest names it,
+			// signed with this server's key as a backup here writes it.
+			m, err := ParseManifest(data)
+			if err != nil {
+				t.Fatal(err)
+			}
+			m.ServerID = f.serverID
+			if err := m.sign(f.svc.opts.ManifestKey); err != nil {
+				t.Fatal(err)
+			}
+			if data, err = json.Marshal(m); err != nil {
+				t.Fatal(err)
+			}
 		}
 		if err := f.store.Put(ctx, folderPrefix(f.serverID, backupID)+strings.TrimPrefix(obj.Key, from), data); err != nil {
 			t.Fatal(err)

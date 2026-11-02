@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -255,5 +257,68 @@ func TestQueuedRestoreKeepsItsSource(t *testing.T) {
 	activeErr, queued = nil, nil
 	if err := svc.Delete(ctx, source); err != nil {
 		t.Fatalf("deleting a backup no restore reads = %v", err)
+	}
+}
+
+// TestSelectiveRestoreAuthenticatesTheManifest: a selective restore starts
+// only from a backup whose manifest verifies under this server's
+// SECRET_KEY, or, when it cannot be authenticated (no key check value or
+// another key), with the admin's confirmation. One naming this key that
+// does not verify is refused even with it.
+func TestSelectiveRestoreAuthenticatesTheManifest(t *testing.T) {
+	tests := []struct {
+		name          string
+		change        func(*Manifest)
+		want          error // without confirmation
+		wantConfirmed error
+	}{
+		{name: "matching", change: func(*Manifest) {}},
+		{name: "wrong MAC", change: func(m *Manifest) { m.MAC = strings.Repeat("ab", 32) }, want: ErrManifestTampered, wantConfirmed: ErrManifestTampered},
+		{name: "missing MAC", change: func(m *Manifest) { m.MAC = "" }, want: ErrManifestTampered, wantConfirmed: ErrManifestTampered},
+		{name: "missing key check", change: func(m *Manifest) { m.KeyCheck = "" }, want: ErrUnauthenticated},
+		{name: "other key", change: func(m *Manifest) { m.KeyCheck = "9999-8888-7777-6666" }, want: ErrUnauthenticated},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := t.Context()
+			store, err := blobstore.NewFilesystem(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			id := FolderName(time.Date(2026, 10, 21, 4, 0, 0, 0, time.UTC), KindNightly)
+			digest := putPlainBackup(t, store, "server", id)
+			key := objectKey("server", id, ManifestName)
+			body, _, err := store.Get(ctx, key)
+			if err != nil {
+				t.Fatal(err)
+			}
+			data, _ := io.ReadAll(body)
+			_ = body.Close()
+			m, err := ParseManifest(data)
+			if err != nil {
+				t.Fatal(err)
+			}
+			tt.change(m)
+			changed, _ := json.Marshal(m)
+			if err := store.Put(ctx, key, changed); err != nil {
+				t.Fatal(err)
+			}
+			svc := New(Options{Destination: NewStoreDestination(store), Locker: &memLocker{}, KeyCheck: testKeyCheck, ManifestKey: testManifestKey,
+				ServerID: func(context.Context) (string, error) { return "server", nil }})
+			queued := 0
+			svc.SetRestoreTargets(RestoreTargets{CreateJob: func(context.Context, int, RestoreRequest) (*models.AdminJob, error) {
+				queued++
+				return &models.AdminJob{ID: "job"}, nil
+			}})
+			svc.opts.ActiveRestore = func(context.Context) (*RestoreRequest, error) { return nil, nil }
+			req := RestoreRequest{BackupID: id, Digest: digest, Selection: map[string][]string{SectionSettings: {"appearance"}}}
+			if _, err := svc.StartRestore(ctx, 1, req); !errors.Is(err, tt.want) || (tt.want == nil) != (err == nil) {
+				t.Fatalf("StartRestore = %v, want %v", err, tt.want)
+			}
+			req.AcceptUnauthenticated = true
+			if _, err := svc.StartRestore(ctx, 1, req); !errors.Is(err, tt.wantConfirmed) || (tt.wantConfirmed == nil) != (err == nil) {
+				t.Fatalf("StartRestore confirmed = %v, want %v", err, tt.wantConfirmed)
+			}
+		})
 	}
 }

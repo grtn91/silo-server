@@ -496,7 +496,16 @@ grouped by the admin page that edits each key: a key or prefix with its class.
   `backup.*`, and state the server writes for itself under an admin prefix:
   sweep and cleanup checkpoints, `recommendations.embedding_lock` (the
   stored vectors' model and dimensions), and
-  `recommendations.policy_marked_generation`.
+  `recommendations.policy_marked_generation`. The network-security and
+  sign-in trust toggles are server-specific too (`trustSettings`): whether
+  webhooks and media-server connections may reach private networks
+  (`*.allow_private_destinations`), `clientip.trusted_proxies`, sign-up,
+  self-service password reset, local password sign-in, and matching
+  external sign-ins by email. A backup is only as trustworthy as its
+  destination, and one of these turned on would let a profile reach this
+  server's private network or let someone sign in, so they stay as the live
+  server has them. `TestTrustSettingsAreServerSpecific` fails on a setting
+  named like one that is not in the list.
 
 A key the table does not match is never offered. `TestEverySettingIsClassified`
 fails for any admin setting default, sensitive setting, or branding asset key

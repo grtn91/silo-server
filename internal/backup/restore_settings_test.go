@@ -1,6 +1,7 @@
 package backup
 
 import (
+	"regexp"
 	"testing"
 
 	"github.com/Silo-Server/silo-server/internal/branding"
@@ -50,6 +51,27 @@ func TestServerSpecificSettingsAreNeverOffered(t *testing.T) {
 		rule, offered := RestorableSetting(key)
 		if !offered || rule.class != want {
 			t.Errorf("%q: offered %v class %q, want %q", key, offered, rule.class, want)
+		}
+	}
+}
+
+// TestTrustSettingsAreServerSpecific: every network-security and sign-in
+// trust toggle is server-specific, never restored, and every admin setting
+// named like one (private destinations, trusted proxies, origins, TLS
+// verification, sign-up and sign-in switches) is in trustSettings, so a
+// new one cannot be restored from a backup without a decision.
+func TestTrustSettingsAreServerSpecific(t *testing.T) {
+	trusted := map[string]bool{}
+	for _, key := range trustSettings {
+		trusted[key] = true
+		if rule, ok := classifySetting(key); !ok || rule.class != SettingServerSpecific {
+			t.Errorf("%s is %+v, want server-specific", key, rule)
+		}
+	}
+	looksLikeTrust := regexp.MustCompile(`allow_private|trusted|allowed_origins|cors|insecure|skip_verify|tls_verify|signup\.enabled|local_password_login|email_auto_match|self_service`)
+	for _, key := range config.AdminSettingDefaultKeys() {
+		if looksLikeTrust.MatchString(key) && !trusted[key] {
+			t.Errorf("%s looks like a trust setting; add it to trustSettings and classify it server-specific", key)
 		}
 	}
 }
