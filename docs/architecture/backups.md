@@ -678,9 +678,13 @@ the same order, so the two wait for each other instead of deadlocking:
   library's collection order revision, then membership rows. The library
   editor's move and reorder takes every parent of the library first, in id
   order, so a restore holding one parent never holds what the editor waits
-  on. Adding items, adding libraries to a collection's scope, and putting a
-  membership back in its group all take the parent first
-  (`TestGroupingWaitsForTheEditorDB`).
+  on. Restoring onto an existing collection (admin, template, or a page
+  section's managed one) takes its parent first in the item's transaction
+  (`catalog.LockLibraryCollectionInTx`), before it creates a group, adds
+  items, or regroups a membership, any of which takes the order revision
+  (`TestGroupingWaitsForTheEditorDB`). The catalog functions take the parent
+  again themselves, which is free in the same transaction, so no caller can
+  skip it.
 - Page sections and featured sections: the section editor's order (see
   `selective_sections.go`).
 - Accounts and profiles: `userdata.Preparer`'s order, the account locks, then

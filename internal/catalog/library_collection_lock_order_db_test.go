@@ -7,15 +7,27 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // TestGroupingWaitsForTheEditorDB: a restore putting an existing
-// collection's membership back in its group waits for an editor reordering
-// the library, which holds the library's collection parents and their
-// membership rows and then needs the order revision, instead of taking the
-// order revision first and deadlocking with it.
+// collection's membership back in its group, creating the group first when
+// it is gone, waits for an editor reordering the library, which holds the
+// library's collection parents and their membership rows and then needs the
+// order revision, instead of taking the order revision first and
+// deadlocking with it.
 func TestGroupingWaitsForTheEditorDB(t *testing.T) {
+	for _, createGroup := range []bool{false, true} {
+		t.Run(fmt.Sprintf("create group %v", createGroup), func(t *testing.T) { checkGroupingWaitsForTheEditor(t, createGroup) })
+	}
+}
+
+// checkGroupingWaitsForTheEditor runs one case of
+// TestGroupingWaitsForTheEditorDB: the restore's item locks the collection
+// first (LockLibraryCollectionInTx), then, when createGroup, creates the
+// group the backup's membership names, then regroups.
+func checkGroupingWaitsForTheEditor(t *testing.T, createGroup bool) {
 	dsn := os.Getenv("SILO_TEST_DATABASE_URL")
 	if dsn == "" {
 		t.Skip("SILO_TEST_DATABASE_URL is not set")
@@ -43,9 +55,13 @@ func TestGroupingWaitsForTheEditorDB(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	group, err := CreateLibraryCollectionGroupInTx(ctx, setup, CreateLibraryCollectionGroupInput{LibraryID: library, Name: "Group", Slug: slug})
-	if err != nil {
-		t.Fatal(err)
+	groupID := ""
+	if !createGroup {
+		group, err := CreateLibraryCollectionGroupInTx(ctx, setup, CreateLibraryCollectionGroupInput{LibraryID: library, Name: "Group", Slug: slug})
+		if err != nil {
+			t.Fatal(err)
+		}
+		groupID = group.ID
 	}
 	if err := setup.Commit(ctx); err != nil {
 		t.Fatal(err)
@@ -72,15 +88,7 @@ func TestGroupingWaitsForTheEditorDB(t *testing.T) {
 	}
 	pid = restore.Conn().PgConn().PID()
 	go func() {
-		tx, err := restore.Begin(ctx)
-		if err == nil {
-			_, err = GroupUngroupedMembershipInTx(ctx, tx, collection, library, group.ID)
-			if err == nil {
-				err = tx.Commit(ctx)
-			} else {
-				_ = tx.Rollback(context.Background())
-			}
-		}
+		err := regroupAsRestore(ctx, restore, collection, library, slug, groupID, createGroup)
 		restore.Release()
 		restored <- err
 	}()
@@ -117,7 +125,27 @@ func TestGroupingWaitsForTheEditorDB(t *testing.T) {
 		t.Fatal("the restore did not finish after the editor committed")
 	}
 	var grouped string
-	if err := pool.QueryRow(ctx, `SELECT coalesce(group_id::text, '') FROM library_collection_libraries WHERE collection_id=$1 AND library_id=$2`, collection, library).Scan(&grouped); err != nil || grouped != group.ID {
-		t.Fatalf("membership group = %q, %v; want %s", grouped, err, group.ID)
+	if err := pool.QueryRow(ctx, `SELECT coalesce(g.slug, '') FROM library_collection_libraries l LEFT JOIN library_collection_groups g ON g.id = l.group_id
+		WHERE l.collection_id=$1 AND l.library_id=$2`, collection, library).Scan(&grouped); err != nil || grouped != slug {
+		t.Fatalf("membership group = %q, %v; want %s", grouped, err, slug)
 	}
+}
+
+// regroupAsRestore is a restore item's transaction: the collection's parent
+// first, then the group, created when createGroup, then the regroup.
+func regroupAsRestore(ctx context.Context, conn *pgxpool.Conn, collection string, library int, slug, groupID string, createGroup bool) error {
+	return pgx.BeginFunc(ctx, conn, func(tx pgx.Tx) error {
+		if err := LockLibraryCollectionInTx(ctx, tx, collection); err != nil {
+			return err
+		}
+		if createGroup {
+			group, err := CreateLibraryCollectionGroupInTx(ctx, tx, CreateLibraryCollectionGroupInput{LibraryID: library, Name: "Group", Slug: slug})
+			if err != nil {
+				return err
+			}
+			groupID = group.ID
+		}
+		_, err := GroupUngroupedMembershipInTx(ctx, tx, collection, library, groupID)
+		return err
+	})
 }

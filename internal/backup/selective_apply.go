@@ -705,21 +705,7 @@ func (a *applier) applyCollection(ctx context.Context, tx pgx.Tx, id string) (ap
 		item.Notes = append(item.Notes, fmt.Sprintf("%d of its items are not in this server's catalog and were left out.", unknown))
 	}
 	if plan.localID != "" {
-		added, err := catalog.AddMissingItemsInTx(ctx, tx, plan.localID, plan.missing)
-		if err != nil {
-			return applied{}, err
-		}
-		grouped, err := restoreGroups(ctx, tx, plan.localID, *c, libMap)
-		if err != nil {
-			return applied{}, err
-		}
-		a.claim(claimCollection, plan.localID, id)
-		if len(added) == 0 && grouped == 0 {
-			return unchanged(item), nil
-		}
-		item.Outcome = OutcomeRestored
-		item.Message = fmt.Sprintf("Added %d items to the collection here and put it back in %d groups.", len(added), grouped)
-		return applied{item: item}, nil
+		return a.restoreOntoCollection(ctx, tx, id, plan, *c, libMap, item)
 	}
 
 	// A smart query or a sync source names libraries too; one that would
@@ -766,6 +752,32 @@ func (a *applier) applyCollection(ctx context.Context, tx pgx.Tx, id string) (ap
 	}
 	a.claim(claimCollection, newID, id)
 	item.Outcome, item.Message = OutcomeRestored, msgCreated
+	return applied{item: item}, nil
+}
+
+// restoreOntoCollection adds the items a collection here lacks and puts its
+// memberships back in their groups. The collection's parent is locked
+// first, before anything that can take a library's order revision (a
+// group created, items added, a membership regrouped), as the library
+// editor locks.
+func (a *applier) restoreOntoCollection(ctx context.Context, tx pgx.Tx, id string, plan collectionPlan, c CollectionEntry, libMap map[int]int, item ReportItem) (applied, error) {
+	if err := catalog.LockLibraryCollectionInTx(ctx, tx, plan.localID); err != nil {
+		return applied{}, err
+	}
+	added, err := catalog.AddMissingItemsInTx(ctx, tx, plan.localID, plan.missing)
+	if err != nil {
+		return applied{}, err
+	}
+	grouped, err := restoreGroups(ctx, tx, plan.localID, c, libMap)
+	if err != nil {
+		return applied{}, err
+	}
+	a.claim(claimCollection, plan.localID, id)
+	if len(added) == 0 && grouped == 0 {
+		return unchanged(item), nil
+	}
+	item.Outcome = OutcomeRestored
+	item.Message = fmt.Sprintf("Added %d items to the collection here and put it back in %d groups.", len(added), grouped)
 	return applied{item: item}, nil
 }
 
