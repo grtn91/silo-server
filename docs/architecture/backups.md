@@ -457,6 +457,19 @@ neither list.
   never key material. Identity sequences move past the ids written. Live rows are
   encrypted with this server's key, so they stay readable after
   `--accept-lost-credentials`.
+- In the same transaction, a full restore keeps each security switch inside
+  an otherwise restored table at the stricter of the backup's and the live
+  server's value (`stricterFlags`), so it never turns back on what an admin
+  turned off since the backup: an account's `enabled`, `break_glass`, and
+  `local_password_login_enabled` (off wins) and `password_change_required`
+  (on wins), and the `enabled` of a plugin installation that signs people in
+  (one with sign-in bindings or an `auth_provider.v1` capability), whose
+  carried sign-in links then cannot sign anyone in. A row is the live one
+  when its id and username (an account) or plugin id match. The command
+  lists each switch it kept. Grants through policy rather than a switch
+  (`users.role`, `is_owner`, access group and per-account permissions) are
+  restored as the backup has them; the credential carry above refuses
+  credentials whose account gains authority that way.
 - Separate mode (`--into`) restores a copy, not the live server: it deletes
   the backup's carried credentials and carries none.
 

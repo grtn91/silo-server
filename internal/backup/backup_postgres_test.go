@@ -434,6 +434,64 @@ func checkCredentials(t *testing.T, loader PGLoader, pool *pgxpool.Pool, dsn, in
 	}
 	checkCarryAuthority(t, loader, pool, dsn, into, restored, userID, keptID, liveKeys)
 	checkCarryInvitation(t, loader, pool, dsn, into, restored, "invite-"+suffix)
+	checkStricterFlags(t, loader, pool, dsn, into, restored, userID)
+}
+
+// checkStricterFlags: an account an admin disabled since the backup, and a
+// sign-in provider turned off since, stay off after a full restore, with
+// the account's required password change; each is reported. A switch the
+// live server has at the looser value takes the backup's.
+func checkStricterFlags(t *testing.T, loader PGLoader, pool *pgxpool.Pool, dsn, into string, restored *pgxpool.Pool, userID int64) {
+	t.Helper()
+	ctx := t.Context()
+	var username string
+	if err := pool.QueryRow(ctx, `UPDATE users SET enabled = false, password_change_required = true WHERE id = $1 RETURNING username`, userID).Scan(&username); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_, _ = pool.Exec(context.Background(), `UPDATE users SET enabled = true, password_change_required = false WHERE id = $1`, userID)
+	}()
+	if _, err := restored.Exec(ctx, `UPDATE users SET enabled = true, password_change_required = false WHERE id = $1`, userID); err != nil {
+		t.Fatal(err)
+	}
+	// One sign-in provider, off here and on in the backup; another plugin,
+	// off here, that signs no one in.
+	install := func(db *pgxpool.Pool, id int64, pluginID string, enabled bool) int64 {
+		if id == 0 {
+			if err := db.QueryRow(ctx, `INSERT INTO plugin_installations (plugin_id, version, install_path, enabled) VALUES ($1, '1.0.0', '/plugins/x', $2) RETURNING id`, pluginID, enabled).Scan(&id); err != nil {
+				t.Fatal(err)
+			}
+			return id
+		}
+		if _, err := db.Exec(ctx, `INSERT INTO plugin_installations (id, plugin_id, version, install_path, enabled) VALUES ($1, $2, '1.0.0', '/plugins/x', $3)`, id, pluginID, enabled); err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	provider := install(pool, 0, "sso-provider", false)
+	install(restored, provider, "sso-provider", true)
+	other := install(pool, 0, "other-plugin", false)
+	install(restored, other, "other-plugin", true)
+	if _, err := pool.Exec(ctx, `INSERT INTO plugin_auth_bindings (plugin_installation_id, capability_id) VALUES ($1, 'sso')`, provider); err != nil {
+		t.Fatal(err)
+	}
+	carried, err := loader.CarryCredentials(ctx, into, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var enabled, mustChange, providerOn, otherOn bool
+	if err := restored.QueryRow(ctx, `SELECT enabled, password_change_required, (SELECT enabled FROM plugin_installations WHERE id = $2),
+		(SELECT enabled FROM plugin_installations WHERE id = $3) FROM users WHERE id = $1`, userID, provider, other).Scan(&enabled, &mustChange, &providerOn, &otherOn); err != nil {
+		t.Fatal(err)
+	}
+	if enabled || !mustChange || providerOn || !otherOn {
+		t.Fatalf("restored account enabled %v, must change its password %v; provider on %v, other plugin on %v", enabled, mustChange, providerOn, otherOn)
+	}
+	for _, want := range []string{"account " + username + " kept disabled", "account " + username + " still must change its password", "sign-in provider sso-provider kept off"} {
+		if !slices.Contains(carried.Stricter, want) {
+			t.Fatalf("reported %v, want %q", carried.Stricter, want)
+		}
+	}
 }
 
 // checkCarryInvitation: a pending invitation is dropped when the account it
@@ -643,6 +701,25 @@ func TestEveryTableIsClassifiedDB(t *testing.T) {
 	for name, list := range listed {
 		if !present[name] {
 			t.Errorf("%s names %s, which is not a table", list, name)
+		}
+	}
+	// A security switch kept at its stricter value is a column of a table
+	// the restore otherwise restores as the backup has it.
+	restoredAsBackedUp := map[string]bool{}
+	for _, name := range restoredDataTables {
+		restoredAsBackedUp[name] = true
+	}
+	for _, table := range secretTablesHandled(secretRestored) {
+		restoredAsBackedUp[table.name] = true
+	}
+	for _, f := range stricterFlags {
+		var boolean bool
+		if err := pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM information_schema.columns
+			WHERE table_schema = 'public' AND table_name = $1 AND column_name = $2 AND data_type = 'boolean')`, f.table, f.column).Scan(&boolean); err != nil {
+			t.Fatal(err)
+		}
+		if !restoredAsBackedUp[f.table] || !boolean {
+			t.Errorf("stricterFlags %s.%s: want a boolean column of a table restored as the backup has it, it is in %q", f.table, f.column, listed[f.table])
 		}
 	}
 }
