@@ -66,9 +66,28 @@ const everyRow = "true"
 // columnUserID is the owner column of several carried tables.
 const columnUserID = "user_id"
 
+// ownerNotElevated is the SQL condition, over the live row r, that the
+// account in column exists in the restored data with no more authority than
+// it has on the live server (liveAuthority): a higher role (the Owner over
+// admin over user), enabled where it is disabled now, break-glass access,
+// or a permission it lacks now. A live credential of an account demoted
+// since the backup would otherwise carry the snapshot's authority; changing
+// an account's role deletes its keys for the same reason.
+func ownerNotElevated(column string) string {
+	return `EXISTS (SELECT 1 FROM users u JOIN live_authority l ON l.id = u.id
+		WHERE u.id = r.` + column + `
+		  AND (CASE WHEN u.is_owner THEN 2 WHEN u.role = 'admin' THEN 1 ELSE 0 END) <= l.rank
+		  AND (NOT u.enabled OR l.enabled) AND (NOT u.break_glass OR l.break_glass)
+		  AND u.permissions <@ l.permissions)`
+}
+
+// liveAuthority reads, on the live server, what ownerNotElevated compares.
+const liveAuthority = `SELECT coalesce(json_agg(json_build_object('id', id,
+	'rank', CASE WHEN is_owner THEN 2 WHEN role = 'admin' THEN 1 ELSE 0 END,
+	'enabled', enabled, 'break_glass', break_glass, 'permissions', permissions)), '[]')::text FROM users`
+
 // SQL conditions over the live row r, shared by several carried tables.
 const (
-	userExists    = `EXISTS (SELECT 1 FROM users u WHERE u.id = r.user_id)`
 	outboundOnly  = "outbound: what Silo presents to another service, not a credential for Silo"
 	workerLease   = "a worker's lease or claim on a job, not a credential"
 	urlSlug       = "a URL name, not a secret"
@@ -103,18 +122,18 @@ var secretTables = []secretTable{
 	{name: "backup_status", handling: leftOut, why: "describes the backup being taken, which would read as a stale run after a restore"},
 
 	{name: "api_keys", handling: carried, why: "API keys", carry: &carrySpec{
-		key: "id", same: []string{"id", columnUserID, "key_hash", "key_prefix"}, credential: everyRow, owned: userExists,
+		key: "id", same: []string{"id", columnUserID, "key_hash", "key_prefix"}, credential: everyRow, owned: ownerNotElevated(columnUserID),
 		describe: `format('API key %s %L (account %s)', r.id, r.label, r.user_id)`,
 	}},
 	{name: "invitations", handling: carried, why: "pending invitations", carry: &carrySpec{
 		key: "id", same: []string{"id", "token_hash"}, credential: `t.accepted_at IS NULL AND t.revoked_at IS NULL`,
-		owned: `(r.invited_by IS NULL OR EXISTS (SELECT 1 FROM users u WHERE u.id = r.invited_by))
+		owned: `(r.invited_by IS NULL OR ` + ownerNotElevated("invited_by") + `)
 			AND (r.access_group_id IS NULL OR EXISTS (SELECT 1 FROM access_groups g WHERE g.id = r.access_group_id))`,
 		describe: `format('invitation %s', r.id)`,
 	}},
 	{name: "invite_codes", handling: carried, why: "invite codes", carry: &carrySpec{
 		key: "id", same: []string{"id", "code"}, credential: everyRow,
-		owned:    `r.created_by IS NULL OR EXISTS (SELECT 1 FROM users u WHERE u.id = r.created_by)`,
+		owned:    `r.created_by IS NULL OR ` + ownerNotElevated("created_by"),
 		describe: `format('invite code %s %L', r.id, r.label)`,
 	}},
 	{name: "autoscan_webhook_endpoints", handling: carried, why: "autoscan webhook tokens", carry: &carrySpec{
@@ -124,14 +143,14 @@ var secretTables = []secretTable{
 	}},
 	{name: "abs_rss_feeds", handling: carried, why: "audiobook RSS feed links", carry: &carrySpec{
 		key: "id", same: []string{"id", columnUserID, "slug"}, credential: everyRow,
-		owned: userExists + `
+		owned: ownerNotElevated(columnUserID) + `
 			AND EXISTS (SELECT 1 FROM media_items m WHERE m.content_id = r.library_item_id)
 			AND (r.profile_id IS NULL OR EXISTS (SELECT 1 FROM user_profiles p WHERE p.id = r.profile_id::text))`,
 		describe: `format('RSS feed %s (account %s)', r.id, r.user_id)`,
 	}},
 	{name: "webhook_sync_connections", handling: carried, why: "Plex and Jellyfin webhook sync secrets", carry: &carrySpec{
 		key: "id", same: []string{"id", columnUserID, "webhook_secret"}, credential: everyRow,
-		owned: userExists + `
+		owned: ownerNotElevated(columnUserID) + `
 			AND (r.default_profile_id = '' OR EXISTS (SELECT 1 FROM user_profiles p WHERE p.id = r.default_profile_id))`,
 		describe: `format('webhook sync connection %s %L (account %s)', r.id, r.server_name, r.user_id)`,
 	}},
@@ -195,9 +214,11 @@ const carriedKinds = "API keys, pending invitations, invite codes, autoscan webh
 
 // CarriedCredentials is what DatabaseLoader.CarryCredentials did.
 type CarriedCredentials struct {
-	Kept int
+	// Kept counts the live rows kept, by table.
+	Kept map[string]int
 	// Dropped names the live credentials left out because their owner is
-	// not in the restored data, without key material.
+	// not in the restored data or has more authority there, without key
+	// material.
 	Dropped []string
 }
 
@@ -205,7 +226,7 @@ type CarriedCredentials struct {
 // live server's (liveURL), or with none when liveURL is "", and prints
 // what it kept and dropped.
 func carryCredentials(ctx context.Context, loader DatabaseLoader, dbURL, liveURL string, out io.Writer) error {
-	carried, err := loader.CarryCredentials(ctx, dbURL, liveURL)
+	carriedRows, err := loader.CarryCredentials(ctx, dbURL, liveURL)
 	if err != nil {
 		return fmt.Errorf("replacing the restored %s: %w", carriedKinds, err)
 	}
@@ -213,10 +234,19 @@ func carryCredentials(ctx context.Context, loader DatabaseLoader, dbURL, liveURL
 		_, _ = fmt.Fprintf(out, "Left out the backup's %s; create new ones after Silo starts.\n", carriedKinds)
 		return nil
 	}
-	_, _ = fmt.Fprintf(out, "Kept %d of this server's %s in place of the backup's.\n", carried.Kept, carriedKinds)
-	if len(carried.Dropped) > 0 {
-		_, _ = fmt.Fprintf(out, "Dropped %d whose account, access group, or source is not in the backup: %s\n",
-			len(carried.Dropped), strings.Join(carried.Dropped, ", "))
+	var kept []string
+	for _, t := range secretTablesHandled(carried) {
+		if n := carriedRows.Kept[t.name]; n > 0 {
+			kept = append(kept, fmt.Sprintf("%s (%d)", t.why, n))
+		}
+	}
+	if len(kept) == 0 {
+		kept = append(kept, "none")
+	}
+	_, _ = fmt.Fprintf(out, "Kept this server's %s in place of the backup's: %s.\n", carriedKinds, strings.Join(kept, ", "))
+	if len(carriedRows.Dropped) > 0 {
+		_, _ = fmt.Fprintf(out, "Dropped %d whose owner is not in the backup or has more authority there than here: %s\n",
+			len(carriedRows.Dropped), strings.Join(carriedRows.Dropped, ", "))
 	}
 	return nil
 }
@@ -226,7 +256,8 @@ func carryCredentials(ctx context.Context, loader DatabaseLoader, dbURL, liveURL
 // transaction.
 func (l PGLoader) CarryCredentials(ctx context.Context, dbURL, liveURL string) (CarriedCredentials, error) {
 	tables := secretTablesHandled(carried)
-	live := make([]string, len(tables))
+	// The live rows of each table, then the live accounts' authority.
+	live := make([]string, len(tables)+1)
 	for i := range live {
 		live[i] = "[]"
 	}
@@ -240,8 +271,14 @@ func (l PGLoader) CarryCredentials(ctx context.Context, dbURL, liveURL string) (
 		return CarriedCredentials{}, err
 	}
 	defer func() { _ = conn.Close(context.WithoutCancel(ctx)) }()
-	var result CarriedCredentials
+	result := CarriedCredentials{Kept: map[string]int{}}
 	err = pgx.BeginFunc(ctx, conn, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `
+			CREATE TEMP TABLE live_authority ON COMMIT DROP AS
+			SELECT * FROM json_to_recordset($1::json) AS a(id bigint, rank int, enabled boolean, break_glass boolean, permissions text[])`,
+			live[len(tables)]); err != nil {
+			return fmt.Errorf("reading the live accounts' authority: %w", err)
+		}
 		for i, table := range tables {
 			if err := table.carryInto(ctx, tx, live[i], &result); err != nil {
 				return fmt.Errorf("%s: %w", table.name, err)
@@ -253,7 +290,7 @@ func (l PGLoader) CarryCredentials(ctx context.Context, dbURL, liveURL string) (
 }
 
 // readLiveCredentials reads each credential table of liveURL as one JSON
-// array, in one snapshot.
+// array, and last the accounts' authority (liveAuthority), in one snapshot.
 func readLiveCredentials(ctx context.Context, liveURL string, tables []secretTable, into []string) error {
 	conn, err := pgx.Connect(ctx, liveURL)
 	if err != nil {
@@ -267,7 +304,7 @@ func readLiveCredentials(ctx context.Context, liveURL string, tables []secretTab
 				return fmt.Errorf("%s: %w", table.name, err)
 			}
 		}
-		return nil
+		return tx.QueryRow(ctx, liveAuthority).Scan(&into[len(tables)])
 	})
 }
 
@@ -276,14 +313,14 @@ func readLiveCredentials(ctx context.Context, liveURL string, tables []secretTab
 // owner exists, and moves an identity sequence past the ids it wrote. Only
 // the columns the restored schema has are written, so a backup taken
 // before a column was added still restores.
-func (t secretTable) carryInto(ctx context.Context, tx pgx.Tx, live string, carried *CarriedCredentials) error {
+func (t secretTable) carryInto(ctx context.Context, tx pgx.Tx, live string, result *CarriedCredentials) error {
 	c := t.carry
 	rows := fmt.Sprintf(`json_populate_recordset(NULL::%s, $1::json) r`, t.name)
 	dropped, err := collectStrings(ctx, tx, fmt.Sprintf(`SELECT %s FROM %s WHERE NOT (%s)`, c.describe, rows, c.owned), live)
 	if err != nil {
 		return err
 	}
-	carried.Dropped = append(carried.Dropped, dropped...)
+	result.Dropped = append(result.Dropped, dropped...)
 	columns, err := collectStrings(ctx, tx, `
 		SELECT attname::text FROM pg_attribute
 		WHERE attrelid = $1::regclass AND attnum > 0 AND NOT attisdropped AND attgenerated = ''
@@ -310,7 +347,7 @@ func (t secretTable) carryInto(ctx context.Context, tx pgx.Tx, live string, carr
 	if err != nil {
 		return err
 	}
-	carried.Kept += int(tag.RowsAffected())
+	result.Kept[t.name] += int(tag.RowsAffected())
 	// An identity sequence restored from the backup can be behind the live
 	// ids just written; the next credential must not collide with them.
 	var seq *string

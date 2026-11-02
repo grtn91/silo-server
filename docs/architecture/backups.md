@@ -110,8 +110,12 @@ showing either key.
    back a session or token revoked after the backup: after a full restore
    every client, Jellyfin-protocol ones included, signs in again. Long-lived
    credentials stay in the dump, and a restore replaces them (see
-   [Credentials](#credentials)). The password moves from the URL into `PGPASSWORD` so it
-   never appears in a process listing.
+   [Credentials](#credentials)). No secret from the URL appears in a
+   process listing: the password moves into `PGPASSWORD`, and an
+   `sslpassword` (the client key's passphrase, which libpq reads from no
+   environment variable) into a service file readable only by this user,
+   named by `PGSERVICEFILE` and removed when the command exits. pgx's
+   `sslinline`, which puts key material in the URL, is refused.
 4. Stream `pg_dump`'s stdout straight into the destination with no local
    spool, hashing the stored bytes. `pg_restore --list` reads a tee of the
    stream. `pg_restore` reads a custom-format archive's table of contents
@@ -372,8 +376,13 @@ table needs a decision before it ships.
   stays linked; the others are deleted. Accepted and revoked invitations
   are the restored history and stay. A live credential whose account,
   profile, access group, item, autoscan source, or connection is not in the
-  restored data is dropped, and the command lists it by id and label, never
-  key material. Identity sequences move past the ids written. Live rows are
+  restored data is dropped, and so is one whose account (owner, inviter, or
+  creator) has more authority in the restored data than on the live server:
+  a higher role (the Owner over admin over user), enabled where it is
+  disabled now, break-glass access, or a permission it lacks now. Changing
+  an account's role deletes its keys for the same reason. The command
+  counts what it kept per kind and lists what it dropped by id and label,
+  never key material. Identity sequences move past the ids written. Live rows are
   encrypted with this server's key, so they stay readable after
   `--accept-lost-credentials`.
 - Separate mode (`--into`) restores a copy, not the live server: it deletes
@@ -408,10 +417,11 @@ says to run `FLUSHDB` on that Redis database, or use an empty one, before
 starting Silo on the restored database.
 
 A database URL given on the command line (`--into`, `silo backup verify
---scratch`) must not carry a password: any account on the host can read a
-running command's arguments. The command refuses one and points to
-`PGPASSWORD` or a password file (`~/.pgpass`, `PGPASSFILE`), which both the
-command and `pg_restore` read.
+--scratch`) must not carry a password, an `sslpassword`, or inline key
+material: any account on the host can read a running command's arguments.
+The command refuses one and points to `PGPASSWORD` or a password file
+(`~/.pgpass`, `PGPASSFILE`), and to a service file (`PGSERVICEFILE`) for an
+`sslpassword`, which both the command and `pg_restore` read.
 
 A swap reaches the maintenance database and the databases it creates through
 URLs derived from `DATABASE_URL` with only the database changed. The

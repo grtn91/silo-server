@@ -304,8 +304,9 @@ func checkCredentials(t *testing.T, loader PGLoader, pool *pgxpool.Pool, dsn, in
 	// A pending invitation, carried too.
 	exec(`INSERT INTO invitations (token_hash, invited_by, expires_at, delivery, library_ids)
 		VALUES ($1, $2, now() + interval '1 day', 'link', '{}')`, "invite-"+suffix, userID)
-	var liveKeys int
-	if err := pool.QueryRow(ctx, `SELECT count(*), max(id) FILTER (WHERE user_id = $1) FROM api_keys`, userID).Scan(&liveKeys, &keptID); err != nil {
+	var liveKeys, liveInvitations int
+	if err := pool.QueryRow(ctx, `SELECT count(*), max(id) FILTER (WHERE user_id = $1),
+		(SELECT count(*) FROM invitations WHERE accepted_at IS NULL AND revoked_at IS NULL) FROM api_keys`, userID).Scan(&liveKeys, &keptID, &liveInvitations); err != nil {
 		t.Fatal(err)
 	}
 
@@ -318,8 +319,8 @@ func checkCredentials(t *testing.T, loader PGLoader, pool *pgxpool.Pool, dsn, in
 		t.Fatal(err)
 	}
 	wantDropped := []string{fmt.Sprintf("API key %d 'new account' (account %d)", orphan, newUser)}
-	if carried.Kept != liveKeys || !slices.Equal(carried.Dropped, wantDropped) {
-		t.Fatalf("carried %+v, want %d kept and dropped %q", carried, liveKeys, wantDropped)
+	if carried.Kept["api_keys"] != liveKeys-1 || carried.Kept["invitations"] != liveInvitations || !slices.Equal(carried.Dropped, wantDropped) {
+		t.Fatalf("carried %+v, want %d keys and %d invitations kept and dropped %q", carried, liveKeys-1, liveInvitations, wantDropped)
 	}
 	var invited int
 	if err := restored.QueryRow(ctx, `SELECT count(*) FROM invitations WHERE token_hash = $1`, "invite-"+suffix).Scan(&invited); err != nil || invited != 1 {
@@ -336,6 +337,22 @@ func checkCredentials(t *testing.T, loader PGLoader, pool *pgxpool.Pool, dsn, in
 	var next int64
 	if err := restored.QueryRow(ctx, `INSERT INTO api_keys (user_id, label, key_hash) VALUES ($1, 'next', encode(sha256(convert_to($2, 'UTF8')), 'hex')) RETURNING id`, userID, "next-"+suffix).Scan(&next); err != nil || next <= keptID {
 		t.Fatalf("next restored key id %d (%v), want above %d", next, err, keptID)
+	}
+	// An account that was an admin in the backup and is a user here: its
+	// live key would carry admin authority, so it is dropped.
+	if _, err := restored.Exec(ctx, `UPDATE users SET role = 'admin' WHERE id = $1`, userID); err != nil {
+		t.Fatal(err)
+	}
+	if carried, err = loader.CarryCredentials(ctx, into, dsn); err != nil {
+		t.Fatal(err)
+	}
+	demoted := fmt.Sprintf("API key %d 'after backup' (account %d)", keptID, userID)
+	var left int
+	if err := restored.QueryRow(ctx, `SELECT count(*) FROM api_keys WHERE user_id = $1`, userID).Scan(&left); err != nil {
+		t.Fatal(err)
+	}
+	if carried.Kept["api_keys"] != liveKeys-2 || !slices.Contains(carried.Dropped, demoted) || left != 0 {
+		t.Fatalf("carried %+v with %d keys left for the demoted account, want its key %q dropped", carried, left, demoted)
 	}
 }
 
