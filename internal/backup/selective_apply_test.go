@@ -120,8 +120,15 @@ func (h *memHeld) Exec(context.Context, string, ...any) (pgconn.CommandTag, erro
 	return pgconn.CommandTag{}, nil
 }
 
-// putPlainBackup stores a complete unencrypted backup with a restore set
-// and returns the restore set's digest.
+// testManifestKey and testKeyCheck are the SECRET_KEY a test service and
+// its test backups share, so the manifests putPlainBackup writes verify.
+var testManifestKey = []byte("0123456789abcdef0123456789abcdef")
+
+const testKeyCheck = "0000-1111-2222-3333"
+
+// putPlainBackup stores a complete unencrypted backup with a restore set,
+// its manifest signed with testManifestKey, and returns the restore set's
+// digest.
 func putPlainBackup(t *testing.T, store blobstore.Store, serverID, id string) string {
 	t.Helper()
 	ctx := t.Context()
@@ -139,6 +146,10 @@ func putPlainBackup(t *testing.T, store blobstore.Store, serverID, id string) st
 		m.Objects = append(m.Objects, s.entry(name))
 	}
 	m.RestoreSet = &RestoreSetSummary{FormatVersion: restoreSetVersion, Sections: map[string]int{}}
+	m.KeyCheck = testKeyCheck
+	if err := m.sign(testManifestKey); err != nil {
+		t.Fatal(err)
+	}
 	data, err := json.Marshal(m)
 	if err != nil {
 		t.Fatal(err)
@@ -174,7 +185,7 @@ func TestQueuedRestoreKeepsItsSource(t *testing.T) {
 		activeErr error
 		raced     error
 	)
-	svc := New(Options{Destination: NewStoreDestination(store), Locker: locker,
+	svc := New(Options{Destination: NewStoreDestination(store), Locker: locker, KeyCheck: testKeyCheck, ManifestKey: testManifestKey,
 		Settings: &mapSettings{values: map[string]string{config.BackupKeepSettingKey: "1"}},
 		ServerID: func(context.Context) (string, error) { return "server", nil }, Now: func() time.Time { return day(3) }})
 	svc.SetRestoreTargets(RestoreTargets{

@@ -143,6 +143,7 @@ export default function AdminBackupRestore() {
   const [reviewing, setReviewing] = useState(false);
   const [chosen, setChosen] = useState<Set<string>>(new Set());
   const [refusal, setRefusal] = useState<RestoreRefusal | null>(null);
+  const [acceptUnauthenticated, setAcceptUnauthenticated] = useState(false);
 
   const set = preview.data;
   const index = useMemo(() => (set ? indexItems(set) : new Map<string, IndexEntry>()), [set]);
@@ -187,7 +188,11 @@ export default function AdminBackupRestore() {
     if (!set) return;
     setRefusal(null);
     start.mutate(
-      { digest: set.digest, selection: selectionRequest(set, selection) },
+      {
+        digest: set.digest,
+        selection: selectionRequest(set, selection),
+        acceptUnauthenticated: !set.authenticated && acceptUnauthenticated,
+      },
       {
         onSuccess: (started) => {
           setReviewing(false);
@@ -265,6 +270,8 @@ export default function AdminBackupRestore() {
         selection={selection}
         onBack={leaveReview}
         onRestore={restore}
+        acceptUnauthenticated={acceptUnauthenticated}
+        onAcceptUnauthenticated={setAcceptUnauthenticated}
         pending={start.isPending}
         refusal={refusal}
         onOpenRunning={(running) => {

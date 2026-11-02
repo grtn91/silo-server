@@ -29,6 +29,7 @@ const SET = {
   created_at: "2026-10-31T04:00:00Z",
   same_server: true,
   key_matches: true,
+  authenticated: true,
   missing_blobs: [],
   library_map: [],
   never_restored_settings: [],

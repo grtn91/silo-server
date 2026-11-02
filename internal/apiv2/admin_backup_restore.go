@@ -102,6 +102,7 @@ type AdminBackupRestoreSet struct {
 	CreatedAt     Instant  `json:"created_at"`
 	SameServer    bool     `json:"same_server"`
 	KeyMatches    bool     `json:"key_matches" doc:"Whether the backup was taken with this server's SECRET_KEY; when false, encrypted settings and plugin configuration cannot be restored"`
+	Authenticated bool     `json:"authenticated" doc:"Whether the backup's manifest verified under this server's SECRET_KEY. When false the server cannot tell whether the backup was changed after it was written, and a restore needs accept_unauthenticated"`
 	MissingBlobs  []string `json:"missing_blobs"`
 	// NeverRestoredSettings lets a client name what a restore leaves alone
 	// without keeping its own list.
@@ -124,6 +125,9 @@ type AdminBackupRestoreSelection struct {
 type AdminBackupRestoreBody struct {
 	Digest    string                      `json:"digest" pattern:"^[0-9a-f]{64}$" doc:"The digest the preview returned"`
 	Selection AdminBackupRestoreSelection `json:"selection"`
+	// AcceptUnauthenticated confirms restoring from a backup the preview
+	// reported as not authenticated.
+	AcceptUnauthenticated bool `json:"accept_unauthenticated,omitempty" doc:"Confirms restoring from a backup whose manifest this server cannot authenticate (authenticated false in the preview); refused without it"`
 }
 
 type AdminBackupRestoreInput struct {
@@ -219,7 +223,7 @@ func registerAdminBackupRestore(reg *Registry, op func(method, path, id, summary
 // caller names the source.
 func restoreRequestOf(body AdminBackupRestoreBody) backup.RestoreRequest {
 	sel := body.Selection
-	req := backup.RestoreRequest{Digest: body.Digest, Selection: map[string][]string{}}
+	req := backup.RestoreRequest{Digest: body.Digest, Selection: map[string][]string{}, AcceptUnauthenticated: body.AcceptUnauthenticated}
 	for section, ids := range map[string][]string{
 		backup.SectionLibraries: sel.Libraries, backup.SectionPlugins: sel.Plugins,
 		backup.SectionSettings: sel.Settings, backup.SectionCollections: sel.Collections,
@@ -252,7 +256,7 @@ func adminBackupRestoreSetOf(p *backup.RestorePreview) AdminBackupRestoreSet {
 	out := AdminBackupRestoreSet{
 		BackupID: p.BackupID, Digest: p.Digest, FormatVersion: p.FormatVersion, ServerID: p.ServerID, ServerName: p.ServerName,
 		SiloVersion: p.SiloVersion, CreatedAt: NewInstant(p.CreatedAt), SameServer: p.SameServer, KeyMatches: p.KeyMatches,
-		MissingBlobs: nonNilStrings(p.MissingBlobs), NeverRestoredSettings: nonNilStrings(p.NeverRestoredSettings),
+		Authenticated: p.Authenticated, MissingBlobs: nonNilStrings(p.MissingBlobs), NeverRestoredSettings: nonNilStrings(p.NeverRestoredSettings),
 		LibraryMap: []AdminBackupLibraryMapping{}, Sections: []AdminBackupRestoreSection{},
 	}
 	for _, l := range p.Libraries {

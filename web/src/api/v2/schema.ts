@@ -14345,6 +14345,8 @@ export interface components {
       size_bytes: number;
     };
     AdminBackupRestoreBody: {
+      /** @description Confirms restoring from a backup whose manifest this server cannot authenticate (authenticated false in the preview); refused without it */
+      accept_unauthenticated?: boolean;
       /** @description The digest the preview returned */
       digest: string;
       selection: components["schemas"]["AdminBackupRestoreSelection"];
@@ -14571,6 +14573,8 @@ export interface components {
       settings?: string[];
     };
     AdminBackupRestoreSet: {
+      /** @description Whether the backup's manifest verified under this server's SECRET_KEY. When false the server cannot tell whether the backup was changed after it was written, and a restore needs accept_unauthenticated */
+      authenticated: boolean;
       /** @description The backup previewed */
       backup_id?: string;
       /**

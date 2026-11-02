@@ -3835,6 +3835,10 @@
       "AdminBackupRestoreBody": {
         "additionalProperties": false,
         "properties": {
+          "accept_unauthenticated": {
+            "description": "Confirms restoring from a backup whose manifest this server cannot authenticate (authenticated false in the preview); refused without it",
+            "type": "boolean"
+          },
           "digest": {
             "description": "The digest the preview returned",
             "pattern": "^[0-9a-f]{64}$",
@@ -4400,6 +4404,10 @@
       "AdminBackupRestoreSet": {
         "additionalProperties": false,
         "properties": {
+          "authenticated": {
+            "description": "Whether the backup's manifest verified under this server's SECRET_KEY. When false the server cannot tell whether the backup was changed after it was written, and a restore needs accept_unauthenticated",
+            "type": "boolean"
+          },
           "backup_id": {
             "description": "The backup previewed",
             "type": "string"
@@ -4471,6 +4479,7 @@
           "created_at",
           "same_server",
           "key_matches",
+          "authenticated",
           "missing_blobs",
           "never_restored_settings",
           "library_map",
