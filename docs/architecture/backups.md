@@ -105,19 +105,23 @@ showing either key.
    versions, the table inventory, and the referenced blob keys.
 3. Run `pg_dump --format=custom --compress=zstd:3 --snapshot=<id>` with
    `--exclude-table-data-and-children` for `activity_log`, `operational_logs`,
-   `policy_decisions`, `catalog_search_index_events`, `backup_status` (its row
-   describes the backup being taken), the sign-in tables (login sessions and
-   refresh tokens, Jellyfin and Audiobookshelf sessions, device-code, OIDC,
-   account-link, password-reset, email-verification, Discord-link, and
-   watch-provider sign-in flows; `signInTables` in
-   `internal/backup/snapshot.go` lists them), and, unless
+   `policy_decisions`, `catalog_search_index_events`, the short-lived
+   secrets of [Credentials](#credentials) (login sessions and refresh
+   tokens, Jellyfin and Audiobookshelf sessions, device-code, OIDC,
+   account-link, password-reset, email-verification, Discord-link,
+   watch-provider, and history-import sign-in flows, Watch Together rooms),
+   `backup_status` (its row describes the backup being taken), and, unless
    `backup.include_intro_fingerprints`, `media_intro_fingerprints`. The schema
    is always dumped. Leaving sign-in state out means a restore never brings
    back a session or token revoked after the backup: after a full restore
    every client, Jellyfin-protocol ones included, signs in again. Long-lived
    credentials stay in the dump, and a restore replaces them (see
-   [Credentials](#credentials)). The password moves from the URL into `PGPASSWORD` so it
-   never appears in a process listing.
+   [Credentials](#credentials)). No secret from the URL appears in a
+   process listing: the password moves into `PGPASSWORD`, and an
+   `sslpassword` (the client key's passphrase, which libpq reads from no
+   environment variable) into a service file readable only by this user,
+   named by `PGSERVICEFILE` and removed when the command exits. pgx's
+   `sslinline`, which puts key material in the URL, is refused.
 4. Stream `pg_dump`'s stdout straight into the destination with no local
    spool, hashing the stored bytes. `pg_restore --list` reads a tee of the
    stream. `pg_restore` reads a custom-format archive's table of contents
@@ -981,38 +985,63 @@ never renamed: a value is bound to its key name.
 
 ### Credentials
 
-A restore never brings back the backup's long-lived credentials: API keys,
-pending invitations, invite codes, and autoscan webhook tokens
-(`credentialTables` in `internal/backup/credentials.go`). A key revoked
-after the backup would otherwise work again, and one created since would
-stop working. API keys stay in the dump because `marker_edit_audit` refers
-to them.
+`secretTables` in `internal/backup/credentials.go` classifies every table
+that holds a bearer secret or a public capability, each one way:
 
-- A full restore (swap mode) keeps the live server's credentials as they are
-  right before the swap. After verification, in the same step that clears
-  unreadable settings, it reads them from the live database (preflight has
-  found no other client on it, so they cannot change before the swap) and
-  writes them into the restored database in one transaction, before it
-  becomes live. A restored credential identical to a live one (same id,
-  owner, and hash) is updated in place, so what refers to it stays linked;
-  the others are deleted. Accepted and revoked invitations are the restored
-  history and stay. A live credential whose account, access group, or
-  autoscan source is not in the restored data is dropped, and the command
-  lists it by id and label, never key material. Identity sequences move past
-  the ids written. Live rows are encrypted with this server's key, so they
-  stay readable after `--accept-lost-credentials`.
+- Left out: short-lived secrets (sessions, sign-in flows, reset and
+  verification tokens, Watch Together join codes). The dump leaves their
+  rows out, so a restore never brings back a session or token revoked
+  after the backup, and after a full restore every client signs in again.
+- Carried from the live server: long-lived credentials that clients and
+  other services present to Silo (API keys, pending invitations, invite
+  codes, autoscan webhook tokens, audiobook RSS feed links, Plex and
+  Jellyfin webhook sync secrets with their profile mappings). A restore
+  never brings back the backup's rows: one revoked after the backup would
+  work again, and one created since would stop working. They stay in the
+  dump (`marker_edit_audit` refers to API keys), and the restore replaces
+  them as below.
+- Restored with the data: what looks like a secret admits no one to this
+  server or belongs to the record it comes with (outbound provider tokens
+  and signing secrets, push registrations, URL slugs, worker leases,
+  account passwords and profile PINs with their accounts).
+
+`TestSecretTablesAreClassifiedDB` scans the schema for secret-like column
+names and fails on a table missing from the list, so a new credential
+table needs a decision before it ships.
+
+- A full restore (swap mode) keeps the live server's carried credentials as
+  they are right before the swap. After verification, in the same step
+  that clears unreadable settings, it reads them from the live database
+  (preflight has found no other client on it, so they cannot change before
+  the swap) and writes them into the restored database in one transaction,
+  before it becomes live. A restored credential identical to a live one
+  (same id, owner, and secret) is updated in place, so what refers to it
+  stays linked; the others are deleted. Accepted and revoked invitations
+  are the restored history and stay. A live credential whose account,
+  profile, access group, item, autoscan source, or connection is not in the
+  restored data is dropped, and so is one whose account (owner, inviter, or
+  creator) has more authority in the restored data than on the live server:
+  a higher role (the Owner over admin over user), enabled where it is
+  disabled now, break-glass access, or a permission it lacks now. Changing
+  an account's role deletes its keys for the same reason. The command
+  counts what it kept per kind and lists what it dropped by id and label,
+  never key material. Identity sequences move past the ids written. Live rows are
+  encrypted with this server's key, so they stay readable after
+  `--accept-lost-credentials`.
 - Separate mode (`--into`) restores a copy, not the live server: it deletes
-  the backup's credentials and carries none.
-
-Outbound credentials and connection settings (provider tokens, notification
-webhook secrets, Plex and Jellyfin webhook connections) are configuration the
-restore brings back with the rest of the data.
+  the backup's carried credentials and carries none.
 
 ### Separate mode
 
 `silo backup restore --from <backup> --into <database URL> --blobs-into <dir>`
 restores into a pre-created empty database and a separate directory laid out
-as a local store root, changing nothing in the live deployment. It needs no
+as a local store root, changing nothing in the live deployment. Before
+anything is written it refuses a target that would overwrite something,
+since a copy keeps nothing it replaces: `--into` must not be the live
+database (`DATABASE_URL`, compared by host, port, and database as pgx
+resolves them), and `--blobs-into` must be missing or an empty directory
+and not the live server's local file storage (read from its settings when
+`DATABASE_URL` is set; symbolic links resolved). It needs no
 `CREATEDB` or rename privilege. After `pg_restore --exit-on-error
 --no-owner --no-privileges`, it verifies the schema version, the applied
 migrations, and the table inventory against the manifest. It then deletes
@@ -1020,8 +1049,8 @@ the recorded storage identities (`artwork.storage_identity`,
 `storage.operational_identity`) from the target: they name the backed-up
 server's stores, so a server started on the copy would refuse the stores it
 is configured with. That server records its own on its first start or write. The copy
-gets no API keys, pending invitations, invite codes, or autoscan webhook
-tokens ([Credentials](#credentials)).
+gets none of the backup's long-lived credentials
+([Credentials](#credentials)).
 The target stays open for the operator to point `DATABASE_URL` and the
 artwork storage settings at. `--database-only` replaces `--blobs-into` and warns that uploaded
 artwork, avatars, and branding will be missing. Separate mode clears no
@@ -1031,10 +1060,20 @@ says to run `FLUSHDB` on that Redis database, or use an empty one, before
 starting Silo on the restored database.
 
 A database URL given on the command line (`--into`, `silo backup verify
---scratch`) must not carry a password: any account on the host can read a
-running command's arguments. The command refuses one and points to
-`PGPASSWORD` or a password file (`~/.pgpass`, `PGPASSFILE`), which both the
-command and `pg_restore` read.
+--scratch`) must not carry a password, an `sslpassword`, or inline key
+material: any account on the host can read a running command's arguments.
+The command refuses one and points to `PGPASSWORD` or a password file
+(`~/.pgpass`, `PGPASSFILE`), and to a service file (`PGSERVICEFILE`) for an
+`sslpassword`, which both the command and `pg_restore` read.
+
+A swap reaches the maintenance database and the databases it creates through
+URLs derived from `DATABASE_URL` with only the database changed. The
+database is replaced wherever the URL can name it: the path and a `dbname`
+query parameter (which overrides the path in libpq and pgx), or every
+`dbname` of a key=value string. The live database's name is read the same
+way. A URL using a connection service (`service`, `servicefile`) is refused,
+since the service file can name the database; host and port overrides are
+kept, because they pick the server, which stays the same.
 
 ### Swap mode: never destroy first
 

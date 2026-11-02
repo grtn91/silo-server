@@ -39,12 +39,13 @@ func (l PGLoader) Empty(ctx context.Context, dbURL string) (bool, error) {
 // Load restores without owners or grants: the restoring role owns everything,
 // which is the role Silo then connects as.
 func (l PGLoader) Load(ctx context.Context, dbURL, dumpPath string) error {
-	target, env, err := libpqTarget(dbURL, "")
+	conn, err := newLibpqConn(dbURL)
 	if err != nil {
 		return err
 	}
-	cmd := exec.CommandContext(ctx, l.Tools.PgRestore, "--exit-on-error", "--no-owner", "--no-privileges", "--no-password", "--dbname="+target, dumpPath) //nolint:gosec // G204: the discovered pg_restore with arguments built here, no shell
-	cmd.Env = append(os.Environ(), env...)
+	defer conn.Close()
+	cmd := exec.CommandContext(ctx, l.Tools.PgRestore, "--exit-on-error", "--no-owner", "--no-privileges", "--no-password", "--dbname="+conn.Conn, dumpPath) //nolint:gosec // G204: the discovered pg_restore with arguments built here, no shell
+	cmd.Env = append(os.Environ(), conn.Env...)
 	stderr := &limitedBuffer{limit: stderrLimit}
 	cmd.Stderr = stderr
 	if err := cmd.Run(); err != nil {

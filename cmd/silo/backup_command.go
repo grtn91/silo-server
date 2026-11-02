@@ -143,18 +143,19 @@ func parseBackupRestoreFlags(args []string) (backupRestoreFlags, error) {
 		return f, errors.New("--blobs-into and --database-only exclude each other")
 	case strings.Contains(f.blobsInto, "://"):
 		return f, errors.New("--blobs-into must be a directory on this computer")
-	case f.into != "" && backup.HasPassword(f.into):
+	case f.into != "" && backup.HasSecret(f.into):
 		return f, passwordOnCommandLine("--into")
 	}
 	return f, nil
 }
 
-// passwordOnCommandLine refuses a database URL that carries its password in
-// a flag: any account on the host can read a running command's arguments.
-// PostgreSQL reads the password from PGPASSWORD or a password file instead.
+// passwordOnCommandLine refuses a database URL that carries a secret in a
+// flag: any account on the host can read a running command's arguments.
+// PostgreSQL reads the password from PGPASSWORD or a password file, and a
+// client key's passphrase from a service file, instead.
 func passwordOnCommandLine(flagName string) error {
-	return fmt.Errorf("%s carries a database password, which other accounts on this computer can read from the process list; "+
-		"leave it out of the URL and set PGPASSWORD, or put it in ~/.pgpass (PGPASSFILE)", flagName)
+	return fmt.Errorf("%s carries a database password or key passphrase, which other accounts on this computer can read from the process list; "+
+		"leave it out of the URL and set PGPASSWORD or put it in ~/.pgpass (PGPASSFILE), and put an sslpassword in a service file (PGSERVICEFILE)", flagName)
 }
 
 // optionalCipher is the cipher of masterKey, or nil without one.
@@ -184,19 +185,7 @@ func runBackupRestore(ctx context.Context, args []string, out io.Writer) error {
 	}
 	loader := backup.PGLoader{Tools: tools}
 	if f.into != "" {
-		opts := backup.SeparateOptions{
-			Validate: validate, Into: f.into, BlobsInto: f.blobsInto, DatabaseOnly: f.databaseOnly, Out: out,
-		}
-		if opts.Cipher, err = optionalCipher(masterKey); err != nil {
-			return err
-		}
-		if _, err := backup.RestoreSeparate(ctx, src, loader, opts); err != nil {
-			return err
-		}
-		if !f.keepRedis {
-			_, _ = fmt.Fprintln(out, separateRestoreRedisNote)
-		}
-		return nil
+		return runSeparateRestore(ctx, f, src, loader, validate, masterKey, out)
 	}
 	liveURL, err := liveDatabaseURL()
 	if err != nil {
@@ -261,6 +250,44 @@ func restoredRedisPlan(ctx context.Context, keep bool, liveURL string, cipher *s
 	return redisPlan{config: liveRedisConfig(cfg)}
 }
 
+// runSeparateRestore restores into --into and --blobs-into, aimed away
+// from the live server named by DATABASE_URL, when set.
+func runSeparateRestore(ctx context.Context, f backupRestoreFlags, src *backup.Source, loader backup.PGLoader,
+	validate backup.ValidateOptions, masterKey []byte, out io.Writer) error {
+	opts := backup.SeparateOptions{
+		Validate: validate, Into: f.into, BlobsInto: f.blobsInto, DatabaseOnly: f.databaseOnly, Out: out,
+		LiveURL: os.Getenv("DATABASE_URL"),
+	}
+	var err error
+	if opts.Cipher, err = optionalCipher(masterKey); err != nil {
+		return err
+	}
+	if opts.LiveURL != "" && !f.databaseOnly {
+		opts.LiveBlobRoots = liveBlobRoots(ctx, opts.LiveURL, opts.Cipher)
+	}
+	if _, err := backup.RestoreSeparate(ctx, src, loader, opts); err != nil {
+		return err
+	}
+	if !f.keepRedis {
+		_, _ = fmt.Fprintln(out, separateRestoreRedisNote)
+	}
+	return nil
+}
+
+// liveBlobRoots is the live server's local file storage, which a separate
+// restore must not write into, read from its settings when it can be. The
+// restore also requires an empty directory, so a failed read leaves that
+// check in force.
+func liveBlobRoots(ctx context.Context, liveURL string, cipher *secret.Cipher) []string {
+	readCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	cfg, err := liveConfigFromDatabase(readCtx, liveURL, cipher)
+	if err != nil {
+		return nil
+	}
+	return []string{cfg.Artwork.LocalPath}
+}
+
 // closeControl closes the control connection after the command's context
 // may have been canceled, with a bound so a stalled close cannot keep the
 // command from exiting.
@@ -312,7 +339,7 @@ func runBackupVerify(ctx context.Context, args []string, out io.Writer) error {
 	if err := flags.Parse(args); err != nil || flags.NArg() != 0 || *from == "" || *scratch == "" {
 		return errors.New(backupCommandUsage)
 	}
-	if backup.HasPassword(*scratch) {
+	if backup.HasSecret(*scratch) {
 		return passwordOnCommandLine("--scratch")
 	}
 	_ = godotenv.Load(*envFile)
