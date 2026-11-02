@@ -2,8 +2,10 @@ package backup
 
 import (
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
+	"time"
 )
 
 func validTestManifest() Manifest {
@@ -57,5 +59,48 @@ func TestParseManifestRefusesWhatARestoreCouldNotCheck(t *testing.T) {
 	data, _ := json.Marshal(good)
 	if _, err := ParseManifest(data); err != nil {
 		t.Fatalf("a valid manifest with an absent table was refused: %v", err)
+	}
+}
+
+// TestManifestMAC: a manifest written under this server's SECRET_KEY is
+// authenticated after it is written out and read back, and refused when
+// anything in it changed, its MAC included; one written under another key
+// cannot be checked and is reported as not authenticated.
+func TestManifestMAC(t *testing.T) {
+	key := []byte("0123456789abcdef0123456789abcdef")
+	signed := func() *Manifest {
+		m := validTestManifest()
+		m.KeyCheck = "aaaa-bbbb-cccc-dddd"
+		if err := m.sign(key); err != nil {
+			t.Fatal(err)
+		}
+		data, err := json.MarshalIndent(&m, "", "  ")
+		if err != nil {
+			t.Fatal(err)
+		}
+		read, err := ParseManifest(data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return read
+	}
+	if ok, err := signed().checkMAC(key, "aaaa-bbbb-cccc-dddd"); !ok || err != nil {
+		t.Fatalf("a signed manifest = %v, %v; want authenticated", ok, err)
+	}
+	for name, change := range map[string]func(*Manifest){
+		"object checksum": func(m *Manifest) { m.Objects[0].SHA256 = strings.Repeat("0", 64) },
+		"object size":     func(m *Manifest) { m.Objects[0].Size++ },
+		"created time":    func(m *Manifest) { m.CreatedAt = m.CreatedAt.Add(time.Second) },
+		"MAC removed":     func(m *Manifest) { m.MAC = "" },
+		"MAC changed":     func(m *Manifest) { m.MAC = strings.Repeat("ab", 32) },
+	} {
+		m := signed()
+		change(m)
+		if _, err := m.checkMAC(key, "aaaa-bbbb-cccc-dddd"); !errors.Is(err, ErrManifestTampered) {
+			t.Errorf("%s: checkMAC = %v, want ErrManifestTampered", name, err)
+		}
+	}
+	if ok, err := signed().checkMAC(key, "1111-2222-3333-4444"); ok || err != nil {
+		t.Fatalf("another key's manifest = %v, %v; want not authenticated, no error", ok, err)
 	}
 }

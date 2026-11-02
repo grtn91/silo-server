@@ -71,6 +71,10 @@ type ValidateOptions struct {
 	// applied migrations against it.
 	BinaryMigrations      []int64
 	AcceptLostCredentials bool
+	// ManifestKey is secret.BackupManifestKey of the SECRET_KEY in the
+	// environment: a backup written under that key must carry a manifest
+	// MAC that verifies. Nil checks none.
+	ManifestKey []byte
 }
 
 // checkMigrations refuses applied migrations this binary does not carry,
@@ -95,6 +99,11 @@ func (opts ValidateOptions) checkMigrations(applied []int64, where string) error
 // archive's entries, the schema version, and the key.
 func (src *Source) Validate(ctx context.Context, opts ValidateOptions) error {
 	m := src.Manifest
+	// First, so nothing below trusts a checksum anyone with write access to
+	// the backup could have changed with its object.
+	if _, err := m.checkMAC(opts.ManifestKey, opts.KeyCheck); err != nil {
+		return err
+	}
 	for _, name := range []string{DumpName, BlobsName} {
 		entry, ok := m.object(name)
 		if !ok {
@@ -117,7 +126,7 @@ func (src *Source) Validate(ctx context.Context, opts ValidateOptions) error {
 	}
 	if m.KeyCheck != "" && m.KeyCheck != opts.KeyCheck {
 		if !opts.AcceptLostCredentials {
-			return fmt.Errorf("%w (backup %s, this key %s); encrypted settings and credentials in it cannot be read with this key. Pass --accept-lost-credentials to restore anyway", ErrKeyMismatch, m.KeyCheck, opts.KeyCheck)
+			return fmt.Errorf("%w (backup %s, this key %s); encrypted settings and credentials in it cannot be read with this key, and its manifest cannot be authenticated. Pass --accept-lost-credentials to restore anyway", ErrKeyMismatch, m.KeyCheck, opts.KeyCheck)
 		}
 	}
 	return nil
@@ -456,7 +465,7 @@ func VerifyBackup(ctx context.Context, src *Source, loader DatabaseLoader, scrat
 		return err
 	}
 	if src.Manifest.KeyCheck != "" && src.Manifest.KeyCheck != validate.KeyCheck {
-		_, _ = fmt.Fprintln(out, "Warning: this backup was taken with a different SECRET_KEY; its encrypted settings and credentials cannot be read with this one.")
+		_, _ = fmt.Fprintln(out, "Warning: this backup was taken with a different SECRET_KEY; its encrypted settings and credentials cannot be read with this one, and its manifest cannot be authenticated.")
 	}
 	if err := loadAndVerify(ctx, src, loader, scratch, validate, out); err != nil {
 		return err

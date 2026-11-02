@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -214,6 +215,10 @@ func TestBackupRestoreRoundTripDB(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	manifestKey, err := secret.BackupManifestKey(masterKey)
+	if err != nil {
+		t.Fatal(err)
+	}
 	settings := catalog.NewEncryptedSettingsRepo(catalog.NewServerSettingsRepo(pool), cipher)
 	root := t.TempDir()
 	store, err := blobstore.NewFilesystem(root)
@@ -226,10 +231,11 @@ func TestBackupRestoreRoundTripDB(t *testing.T) {
 	svc := New(Options{
 		Pool: pool, DatabaseURL: dsn, Settings: settings,
 		Stores: blobstore.Stores{Assets: store, Operational: store}, Destination: NewStoreDestination(store),
-		Locker:    PostgresLocker{Pool: pool},
-		ServerID:  func(context.Context) (string, error) { return serverID, nil },
-		KeyCheck:  keyCheck,
-		FindTools: func(context.Context) (Tools, error) { return tools, nil },
+		Locker:      PostgresLocker{Pool: pool},
+		ServerID:    func(context.Context) (string, error) { return serverID, nil },
+		KeyCheck:    keyCheck,
+		ManifestKey: manifestKey,
+		FindTools:   func(context.Context) (Tools, error) { return tools, nil },
 	})
 	held, err := svc.opts.Locker.TryLock(ctx)
 	if err != nil {
@@ -252,10 +258,11 @@ func TestBackupRestoreRoundTripDB(t *testing.T) {
 	blobsInto := t.TempDir()
 	loader := PGLoader{Tools: tools}
 	if _, err := RestoreSeparate(ctx, src, loader, SeparateOptions{
-		Validate: ValidateOptions{KeyCheck: keyCheck}, Into: into, BlobsInto: blobsInto,
+		Validate: ValidateOptions{KeyCheck: keyCheck, ManifestKey: manifestKey}, Into: into, BlobsInto: blobsInto,
 	}); err != nil {
 		t.Fatal(err)
 	}
+	checkManifestTampering(t, src, manifestKey, keyCheck)
 
 	in, err := loader.Inspect(ctx, into)
 	if err != nil {
@@ -298,6 +305,41 @@ func TestBackupRestoreRoundTripDB(t *testing.T) {
 		t.Fatalf("verify into a used database = %v, want refusal", err)
 	}
 	checkAnotherKey(t, src, loader, pool, dsn, seed.secretKey)
+}
+
+// checkManifestTampering: a backup whose manifest was changed after it was
+// written, here an object's checksum rewritten to match other bytes, is
+// refused before anything reads its objects.
+func checkManifestTampering(t *testing.T, src *Source, manifestKey []byte, keyCheck string) {
+	t.Helper()
+	path := filepath.Join(src.Dir, ManifestName)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.WriteFile(path, data, 0o600) })
+	m, err := ParseManifest(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Objects[0].SHA256 = strings.Repeat("0", 64)
+	changed, err := json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, changed, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	tampered, err := OpenSource(src.Dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tampered.Validate(t.Context(), ValidateOptions{KeyCheck: keyCheck, ManifestKey: manifestKey}); !errors.Is(err, ErrManifestTampered) {
+		t.Fatalf("validating a changed manifest = %v, want ErrManifestTampered", err)
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // checkRestoredFiles: every blob the backup holds is restored, and a

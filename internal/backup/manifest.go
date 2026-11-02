@@ -1,6 +1,9 @@
 package backup
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -38,6 +41,9 @@ type Manifest struct {
 	// storedSize is the manifest object's own size, when it was read from a
 	// destination (readManifest).
 	storedSize int64
+	// authenticated is set when a read verified the MAC under this
+	// server's SECRET_KEY (checkMAC).
+	authenticated bool
 
 	Format      string    `json:"format"`
 	Version     int       `json:"version"`
@@ -76,6 +82,69 @@ type Manifest struct {
 	// Tables is the core table inventory from the backup's snapshot. Full
 	// restore compares the restored database with it, presence and counts.
 	Tables []TableCount `json:"tables"`
+	// MAC authenticates every other field: HMAC-SHA256, under the key
+	// secret.BackupManifestKey derives from SECRET_KEY, of the manifest
+	// encoded with MAC empty, in hex. Anyone who can write the destination
+	// can change objects and their checksums together; only a server with
+	// SECRET_KEY can write a MAC that verifies (checkMAC).
+	MAC string `json:"mac,omitempty"`
+}
+
+// Errors of a manifest's MAC.
+var (
+	// ErrManifestTampered refuses a manifest written under this server's
+	// SECRET_KEY whose MAC is missing or does not verify: it, or an object
+	// it describes, was changed since the backup wrote it.
+	ErrManifestTampered = errors.New("the backup's manifest does not verify under this server's SECRET_KEY: it was changed after the backup was written")
+)
+
+// macInput is what a manifest's MAC covers: the manifest encoded with MAC
+// empty. Encoding the decoded manifest again is stable: every field
+// round-trips, and a manifest from a newer format is refused before.
+func (m *Manifest) macInput() ([]byte, error) {
+	c := *m
+	c.MAC = ""
+	return json.Marshal(&c)
+}
+
+// sign sets m.MAC under key; a nil key leaves m unsigned.
+func (m *Manifest) sign(key []byte) error {
+	if key == nil {
+		return nil
+	}
+	data, err := m.macInput()
+	if err != nil {
+		return err
+	}
+	mac := hmac.New(sha256.New, key)
+	mac.Write(data)
+	m.MAC = hex.EncodeToString(mac.Sum(nil))
+	return nil
+}
+
+// checkMAC authenticates m for a server whose SECRET_KEY has check value
+// keyCheck and manifest key key. A manifest written under another key
+// cannot be checked here: authenticated is false, and the caller decides
+// (a full restore needs --accept-lost-credentials for it anyway). One
+// written under this key must carry a MAC that verifies.
+func (m *Manifest) checkMAC(key []byte, keyCheck string) (authenticated bool, err error) {
+	if key == nil || m.KeyCheck != keyCheck {
+		return false, nil
+	}
+	want, err := hex.DecodeString(m.MAC)
+	if err != nil || len(want) != sha256.Size {
+		return false, ErrManifestTampered
+	}
+	data, err := m.macInput()
+	if err != nil {
+		return false, err
+	}
+	mac := hmac.New(sha256.New, key)
+	mac.Write(data)
+	if !hmac.Equal(mac.Sum(nil), want) {
+		return false, ErrManifestTampered
+	}
+	return true, nil
 }
 
 // ObjectEntry is one stored object: its size and the SHA-256 of the bytes as

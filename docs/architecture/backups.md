@@ -87,6 +87,22 @@ The check value is HKDF-SHA256 over `SECRET_KEY` with info
 prints the value, so an operator can tell which key a backup needs without
 showing either key.
 
+`mac` authenticates the rest of the manifest: HMAC-SHA256 under a key
+derived from `SECRET_KEY` (HKDF-SHA256, info `silo/backup-manifest/v1`,
+`secret.BackupManifestKey`) of the manifest encoded with `mac` empty, in hex.
+It covers the id, kind, server id, times, every object's name, size, and
+checksum, and every other field. Anyone who can write the destination can
+change an object and its checksum together; only a server with the key can
+write a `mac` that verifies. Every read checks it before trusting anything
+else in the manifest: the listing, downloads and download links, a
+selective restore's preview and restore, `silo backup restore`, and
+`silo backup verify`. A manifest whose check value is this server's must
+verify, and one that does not is refused (`ErrManifestTampered`), a missing
+`mac` included; a manifest a destination read must also name the folder and
+server it was read from. A backup written under another `SECRET_KEY` cannot
+be checked here: a full restore of it already needs
+`--accept-lost-credentials`, and its preview says it is not authenticated.
+
 ## Taking a backup
 
 1. Preflight: the user store is PostgreSQL, the destination exists, its id
