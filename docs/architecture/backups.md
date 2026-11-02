@@ -434,8 +434,7 @@ neither list.
 - A full restore (swap mode) keeps the live server's carried credentials as
   they are right before the swap. After verification, in the same step
   that clears unreadable settings, it reads them from the live database
-  (preflight has found no other client on it, so they cannot change before
-  the swap) and writes them into the restored database in one transaction,
+  and writes them into the restored database in one transaction,
   before it becomes live. A restored credential identical to a live one
   (same id, owner, and secret) is updated in place, so what refers to it
   stays linked; the others are deleted. Accepted and revoked invitations
@@ -527,8 +526,12 @@ closes the database as an extra guard.
    restored settings record the storage location the live stores are. Then
    replace its credentials with the live ones ([Credentials](#credentials)),
    close it to connections, and end the command's sessions on it.
-5. Quiesce the live database: `ALLOW_CONNECTIONS false`, then end any session
-   that appeared since step 2. The journal starts just before this, in
+5. Quiesce the live database: `ALLOW_CONNECTIONS false`. The carried
+   credentials are the live ones only while no other client is on the live
+   database, so a client that connected since step 2 stops the restore
+   (`ErrLiveInUse`), both just before the credentials are read and here,
+   once the database is closed; its session is never ended, which would lose
+   what it changed. The live database is reopened and left unchanged. The journal starts just before this, in
    `silo-restore-<time>.journal` in the working directory (each record
    synced, and the directory synced once the file exists, so its name
    survives a host crash; if that cannot be done the swap stops before
