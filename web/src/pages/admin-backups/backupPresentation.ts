@@ -174,7 +174,9 @@ export function retentionPlan(items: readonly AdminBackup[], keep: number): Rete
     .filter((item) => (item.kind === "nightly" || item.kind === "manual") && isFinished(item))
     .sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at));
   const room = Math.max(1, Math.floor(keep)) - 1;
-  const newestClean = newestFirst.find((item) => item.status === "complete")?.id ?? null;
+  // The server decides what a clean copy is (complete, every file,
+  // verified), as rotation does.
+  const newestClean = newestFirst.find((item) => item.clean)?.id ?? null;
   const past = newestFirst.slice(room).map((item) => item.id);
   return {
     kept: [...newestFirst].reverse(),

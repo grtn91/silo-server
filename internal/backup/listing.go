@@ -71,6 +71,9 @@ type Summary struct {
 	// with, and KeyMatches whether it is this server's.
 	KeyCheck   string `json:"key_check,omitempty"`
 	KeyMatches bool   `json:"key_matches"`
+	// Clean is whether rotation protects this copy as its newest clean one
+	// may be: complete, every blob, verified (folder.cleanCopy).
+	Clean bool `json:"clean"`
 }
 
 // Warning is one condition the dashboard shows about backups.
@@ -170,6 +173,7 @@ func (s *Service) list(ctx context.Context) (Listing, error) {
 	for _, f := range folders {
 		summary := Summary{ID: f.id, Kind: f.kind, CreatedAt: f.at, SizeBytes: f.size, MissingBlobs: []MissingBlob{}, Objects: []ObjectEntry{},
 			Location: t.Location(folderPrefix(serverID, f.id))}
+		summary.Clean = f.cleanCopy()
 		switch {
 		case f.manifest != nil:
 			s.fromManifest(&summary, f.manifest)

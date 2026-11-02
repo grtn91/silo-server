@@ -26,9 +26,19 @@ type folder struct {
 	// SECRET_KEY and did not verify: nothing in it is trusted, and the
 	// sweep leaves the folder for the admin to look at.
 	tampered bool
+	// verified is set when the manifest verified under this server's
+	// SECRET_KEY, or the service checks none (tests).
+	verified bool
 	size     int64
 	// newest is the latest modification time of any object in the folder.
 	newest time.Time
+}
+
+// cleanCopy reports whether f is a copy rotation protects: complete, with
+// every blob, and verified, so this server can restore it without extra
+// flags. An unverified backup never stands in for a verified clean one.
+func (f folder) cleanCopy() bool {
+	return f.manifest != nil && f.verified && f.manifest.Status() == StatusComplete
 }
 
 // planRotation returns the ids rotation deletes. Only folders with a manifest
@@ -36,9 +46,10 @@ type folder struct {
 // deleted. Rules:
 //
 //   - nightly and manual copies beyond keep are deleted oldest first, except
-//     that the newest copy without warnings is always kept, even when that
-//     keeps one more than keep, so repeated runs with missing blobs cannot
-//     rotate away the last copy that has every blob;
+//     that the newest clean copy (cleanCopy) is always kept, even when that
+//     keeps one more than keep, so repeated runs with missing blobs, or
+//     backups this server cannot verify, cannot rotate away the last copy it
+//     can restore with every blob;
 //   - before-restore copies are deleted once older than seven days, and do
 //     not count toward keep.
 func planRotation(folders []folder, keep int, now time.Time, pinned map[string]bool) []string {
@@ -68,7 +79,7 @@ func planRotation(folders []folder, keep int, now time.Time, pinned map[string]b
 	regular := byKind[KindNightly]
 	newestClean := ""
 	for _, f := range regular {
-		if f.manifest.Status() == StatusComplete {
+		if f.cleanCopy() {
 			newestClean = f.id
 			break
 		}

@@ -14163,6 +14163,8 @@ export interface components {
        * @description Files copied into blobs.tar
        */
       blob_count: number;
+      /** @description Whether this copy counts as a clean copy for rotation: complete, with every file, and verified under this server's SECRET_KEY. Rotation always keeps the newest clean copy, even beyond backup.keep */
+      clean: boolean;
       /**
        * Format: date-time
        * @description RFC 3339 instant in UTC with millisecond precision
