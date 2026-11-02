@@ -150,7 +150,8 @@ Blob keys come from the snapshot's references, never from listing the store:
 | Library posters (`media_folders.poster_path`) | assets |
 | Branding assets (`branding.*_ref` settings, `branding.AssetObjectKey`) | assets |
 | Uploaded profile avatars (`user_profiles.avatar` starting `upload:`) | operational |
-| Downloaded subtitles (`downloaded_subtitles.s3_key`), unless `backup.include_subtitles` is off | assets |
+| Uploaded subtitles (`downloaded_subtitles.s3_key` with provider `upload`), always: they cannot be fetched again | assets |
+| Downloaded subtitles (`downloaded_subtitles.s3_key` from a provider), unless `backup.include_subtitles` is off | assets |
 
 For an artwork original (`.../original[.<revision>].<ext>`) the copy also
 takes the stored variants of the same revision in its directory. Only the
@@ -756,8 +757,13 @@ table needs a decision before it ships.
   restored data is dropped, and so is one whose account (owner, inviter, or
   creator) has more authority in the restored data than on the live server:
   a higher role (the Owner over admin over user), enabled where it is
-  disabled now, break-glass access, or a permission it lacks now. Changing
-  an account's role deletes its keys for the same reason. The command
+  disabled now, break-glass access, an effective account policy wider in
+  any field (`access.WiderThan`: libraries, quality, stream and transcode
+  caps, profiles, downloads, requests, permissions, with access groups
+  applied), or, for a profile both sides have, a restriction lifted or
+  loosened (child profile, rating or advisory-age ceiling, library
+  restriction). Changing an account's role deletes its keys for the same
+  reason. The command
   counts what it kept per kind and lists what it dropped by id and label,
   never key material. Identity sequences move past the ids written. Live rows are
   encrypted with this server's key, so they stay readable after
