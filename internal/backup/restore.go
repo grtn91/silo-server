@@ -15,6 +15,7 @@ import (
 	"strings"
 
 	"github.com/Silo-Server/silo-server/internal/blobstore"
+	"github.com/Silo-Server/silo-server/internal/secret"
 )
 
 var (
@@ -162,6 +163,29 @@ type DatabaseLoader interface {
 	// from a restored database, so the server started on it binds the stores
 	// it is configured with instead of refusing them.
 	UnbindStorage(ctx context.Context, dbURL string) error
+	// ClearUnreadableSettings deletes the encrypted server_settings rows
+	// cipher cannot open (nil opens none) and returns their keys. Rows are
+	// only deleted: a value is bound to its key name.
+	ClearUnreadableSettings(ctx context.Context, dbURL string, cipher *secret.Cipher) ([]string, error)
+}
+
+// clearLostSettings removes, from a restored database taken with another
+// SECRET_KEY and restored with --accept-lost-credentials, the encrypted
+// settings this key cannot read: Silo refuses to start on a setting it
+// cannot decrypt, so they are deleted and listed for the admin to enter
+// again. A backup taken with this key changes nothing.
+func clearLostSettings(ctx context.Context, loader DatabaseLoader, dbURL string, m *Manifest, validate ValidateOptions, cipher *secret.Cipher, out io.Writer) error {
+	if !validate.AcceptLostCredentials || m.KeyCheck == "" || m.KeyCheck == validate.KeyCheck {
+		return nil
+	}
+	keys, err := loader.ClearUnreadableSettings(ctx, dbURL, cipher)
+	if err != nil {
+		return fmt.Errorf("clearing the settings this SECRET_KEY cannot read: %w", err)
+	}
+	if len(keys) > 0 {
+		_, _ = fmt.Fprintf(out, "Cleared %d encrypted settings this SECRET_KEY cannot read; enter them again after Silo starts: %s\n", len(keys), strings.Join(keys, ", "))
+	}
+	return nil
 }
 
 // Inspection is what DatabaseLoader.Inspect reads from a database.
@@ -235,6 +259,9 @@ func printMissing(out io.Writer, m *Manifest) {
 // SeparateOptions restores into a new location, touching nothing live.
 type SeparateOptions struct {
 	Validate ValidateOptions
+	// Cipher is this server's SECRET_KEY, which decides the encrypted
+	// settings a restore with another key clears; nil clears them all.
+	Cipher *secret.Cipher
 	// Into is the pre-created empty database to restore into.
 	Into string
 	// BlobsInto is a directory that receives the blobs, laid out as a local
@@ -268,6 +295,9 @@ func RestoreSeparate(ctx context.Context, src *Source, loader DatabaseLoader, op
 	// not where this copy's files go.
 	if err := loader.UnbindStorage(ctx, opts.Into); err != nil {
 		return RestoreReport{}, fmt.Errorf("clearing the restored storage identities: %w", err)
+	}
+	if err := clearLostSettings(ctx, loader, opts.Into, src.Manifest, opts.Validate, opts.Cipher, out); err != nil {
+		return RestoreReport{}, err
 	}
 	report := RestoreReport{Database: opts.Into, MissingBlobs: src.Manifest.MissingBlobs}
 	if opts.DatabaseOnly {

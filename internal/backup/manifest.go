@@ -35,6 +35,10 @@ const (
 // Manifest is manifest.json, written after every other object. Readers accept
 // every version up to manifestVersion and refuse a newer one.
 type Manifest struct {
+	// storedSize is the manifest object's own size, when it was read from a
+	// destination (readManifest).
+	storedSize int64
+
 	Format      string    `json:"format"`
 	Version     int       `json:"version"`
 	ID          string    `json:"id"`

@@ -101,9 +101,14 @@ showing either key.
 3. Run `pg_dump --format=custom --compress=zstd:3 --snapshot=<id>` with
    `--exclude-table-data-and-children` for `activity_log`, `operational_logs`,
    `policy_decisions`, `catalog_search_index_events`, `backup_status` (its row
-   describes the backup being taken), and, unless
+   describes the backup being taken), the sign-in tables (`auth_sessions`,
+   `device_login_requests`, `jellycompat_sessions`, `abs_sessions`,
+   `oauth_session`, `password_reset_tokens`), and, unless
    `backup.include_intro_fingerprints`, `media_intro_fingerprints`. The schema
-   is always dumped. The password moves from the URL into `PGPASSWORD` so it
+   is always dumped. Leaving sign-in state out means a restore never brings
+   back a session or token revoked after the backup: after a full restore
+   every client, Jellyfin-protocol ones included, signs in again. API keys
+   are kept. The password moves from the URL into `PGPASSWORD` so it
    never appears in a process listing.
 4. Stream `pg_dump`'s stdout straight into the destination with no local
    spool, hashing the stored bytes. `pg_restore --list` reads a tee of the
@@ -690,7 +695,11 @@ through. A manifest written before `applied_migrations` existed is checked
 by its goose version alone, and the restored database's applied versions are
 checked against the binary in the verification step instead. A backup taken
 with another key needs `--accept-lost-credentials`: its encrypted settings and credentials cannot be
-read with this key.
+read with this key. Silo refuses to start on a setting it cannot decrypt, so
+after verification such a restore deletes, in the restored database, every
+encrypted `server_settings` row this key cannot open and prints their key
+names (never values) for the admin to enter again. Rows are only deleted,
+never renamed: a value is bound to its key name.
 
 ### Separate mode
 
