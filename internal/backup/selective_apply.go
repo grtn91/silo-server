@@ -148,6 +148,9 @@ func (s *Service) ExecuteRestore(ctx context.Context, run RestoreRun) (any, erro
 			op.progress(work, float64(a.current)*100/float64(a.total), "Restoring "+spec.id)
 		}
 	}
+	// Default sections of the libraries this restore created, where it
+	// wrote none of their saved ones.
+	s.CompleteFollowUps(work)
 	finished := s.opts.Now().UTC()
 	report.FinishedAt = &finished
 	return report, nil
@@ -471,6 +474,12 @@ func sameObject(ctx context.Context, store blobstore.Store, key string, f *os.Fi
 const (
 	followUpLibraryCreated  = "library_created"
 	followUpPluginInstalled = "plugin_installed"
+	// followUpLibrarySections seeds a restored library's default and home
+	// sections where the restore wrote none. It runs once the restore's
+	// items are done (CompleteFollowUps), never after the library's own
+	// item: a saved section the restore writes later, renamed from its
+	// default, would otherwise sit beside a fresh default.
+	followUpLibrarySections = "library_sections"
 	// followUpCollectionCreated stores a restored template collection's
 	// template poster and syncs it; target_id is the collection id.
 	followUpCollectionCreated = "collection_created"
@@ -491,11 +500,18 @@ func recordFollowUp(ctx context.Context, tx pgx.Tx, kind string, id int) error {
 // other reason is never set up again. A follow-up whose target is gone is
 // dropped; one that fails stays for the next run. A restore job calls it
 // before its first item and after each item that recorded one.
-func (s *Service) CompleteFollowUps(ctx context.Context) {
+func (s *Service) CompleteFollowUps(ctx context.Context) { s.completeFollowUps(ctx, true) }
+
+// completeFollowUpsNow is CompleteFollowUps after one item: the follow-ups
+// that wait for the end of the restore wait.
+func (s *Service) completeFollowUpsNow(ctx context.Context) { s.completeFollowUps(ctx, false) }
+
+func (s *Service) completeFollowUps(ctx context.Context, final bool) {
 	rows, err := s.opts.Pool.Query(ctx, `
 		SELECT f.kind, f.target_id,
 			CASE f.kind
 				WHEN 'library_created' THEN EXISTS (SELECT 1 FROM media_folders m WHERE m.id = f.target_id)
+				WHEN 'library_sections' THEN EXISTS (SELECT 1 FROM media_folders m WHERE m.id = f.target_id)
 				WHEN 'collection_created' THEN EXISTS (SELECT 1 FROM library_collections c WHERE c.id = f.target_id::text)
 				ELSE EXISTS (SELECT 1 FROM plugin_installations p WHERE p.id = f.target_id)
 			END
@@ -525,11 +541,16 @@ func (s *Service) CompleteFollowUps(ctx context.Context) {
 		return
 	}
 	for _, f := range pending {
+		if f.kind == followUpLibrarySections && !final {
+			continue
+		}
 		if f.exists {
 			var err error
 			switch f.kind {
 			case followUpLibraryCreated:
 				err = callFollowUp(ctx, s.targets.LibraryCreated, f.id)
+			case followUpLibrarySections:
+				err = callFollowUp(ctx, s.targets.LibrarySectionsCreated, f.id)
 			case followUpPluginInstalled:
 				err = callFollowUp(ctx, s.targets.PluginInstalled, f.id)
 			case followUpCollectionCreated:
@@ -604,12 +625,16 @@ func (a *applier) applyLibrary(ctx context.Context, tx pgx.Tx, id string) (appli
 	}
 	item.Outcome = OutcomeRestored
 	item.Message = "Created; its first scan is queued."
-	// The editor's follow-ups run after commit; the row records that they
+	// The editor's follow-ups run after commit; the rows record that they
 	// are owed, so a crash before they finish leaves them for the next run.
-	if err := recordFollowUp(ctx, tx, followUpLibraryCreated, folder.ID); err != nil {
-		return applied{}, err
+	// Its default sections wait for the end of the restore, which may
+	// write the library's saved ones (followUpLibrarySections).
+	for _, kind := range []string{followUpLibraryCreated, followUpLibrarySections} {
+		if err := recordFollowUp(ctx, tx, kind, folder.ID); err != nil {
+			return applied{}, err
+		}
 	}
-	return applied{item: item, mapLibrary: [2]int{e.ID, folder.ID}, after: a.s.CompleteFollowUps}, nil
+	return applied{item: item, mapLibrary: [2]int{e.ID, folder.ID}, after: a.s.completeFollowUpsNow}, nil
 }
 
 // libraryInput is the library e creates, before its id and poster.

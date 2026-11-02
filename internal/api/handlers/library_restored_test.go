@@ -67,9 +67,9 @@ func TestLibraryRestoredReportsFailedSetupDB(t *testing.T) {
 	if err := h.LibraryRestored(ctx, folder.ID); err == nil {
 		t.Fatal("a failed first scan was reported as success")
 	}
-	seeded := countSections()
-	if seeded == 0 {
-		t.Fatal("the other steps did not run")
+	// Sections wait for the restore's own (LibrarySectionsRestored).
+	if n := countSections(); n != 0 {
+		t.Fatalf("the library's set-up seeded %d sections before the restore wrote its own", n)
 	}
 	if err := h.LibraryRestored(ctx, folder.ID); err != nil {
 		t.Fatalf("retry = %v", err)
@@ -77,8 +77,18 @@ func TestLibraryRestoredReportsFailedSetupDB(t *testing.T) {
 	if len(queue.queued) != 1 || queue.queued[0] != folder.ID {
 		t.Fatalf("queued scans = %v", queue.queued)
 	}
+	if err := h.LibrarySectionsRestored(ctx, folder.ID); err != nil {
+		t.Fatal(err)
+	}
+	seeded := countSections()
+	if seeded == 0 {
+		t.Fatal("no default sections were seeded")
+	}
+	if err := h.LibrarySectionsRestored(ctx, folder.ID); err != nil {
+		t.Fatal(err)
+	}
 	if n := countSections(); n != seeded {
-		t.Fatalf("retry seeded sections again: %d, then %d", seeded, n)
+		t.Fatalf("seeding again added sections: %d, then %d", seeded, n)
 	}
 }
 

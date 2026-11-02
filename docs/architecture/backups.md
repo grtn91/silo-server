@@ -816,6 +816,11 @@ a fallback placement, on any path, and the restore's retry places it from
 the manifest. A
 crash or failure between the commit and the work leaves the row; every
 restore job runs the owed rows before its own items, and after each item.
+A restored library's default and home sections are their own follow-up
+(`library_sections`), which runs only at the end of the restore, once the
+saved sections it carries are written, and seeds only where none exist: a
+default renamed before the backup comes back once, not beside a fresh
+default. Template and section-managed collections seed no sections.
 Only rows a restore recorded run, so a library or plugin that exists for any
 other reason is never set up again. A library's follow-ups seed sections only
 where none exist and leave a provider chain an admin already set; a target
