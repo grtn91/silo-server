@@ -27,15 +27,20 @@ function restoreRootKey() {
   return [...backupsRootKey(), "restore"] as const;
 }
 
-/** The preview of a source's restore set against this server; none while `source` is null. */
-export function useRestoreSet(source: RestoreSource | null) {
+/**
+ * The preview of a source's restore set against this server; none while
+ * `source` is null. `acceptUnauthenticated` opens a source this server can't
+ * verify (an upload, or a backup under another key), which the admin has
+ * confirmed.
+ */
+export function useRestoreSet(source: RestoreSource | null, acceptUnauthenticated = false) {
   const context = captureProfileRequestContext();
   return useQuery({
-    queryKey: [...restoreRootKey(), "set", source?.kind, source?.id],
+    queryKey: [...restoreRootKey(), "set", source?.kind, source?.id, acceptUnauthenticated],
     queryFn: () =>
       source?.kind === "upload"
-        ? getUploadRestoreSet(captureAdminAuthority(), source.id)
-        : getRestoreSet(captureAdminAuthority(), source?.id ?? ""),
+        ? getUploadRestoreSet(captureAdminAuthority(), source.id, acceptUnauthenticated)
+        : getRestoreSet(captureAdminAuthority(), source?.id ?? "", acceptUnauthenticated),
     enabled: context !== null && source !== null && source.id !== "",
     // A preview is compared against the server as it is now; read it fresh
     // each time the page opens rather than restoring from a stale cache.
@@ -75,10 +80,30 @@ export function useRestoreJobs() {
 export function useStartRestore(source: RestoreSource) {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: ({ digest, selection }: { digest: string; selection: RestoreSelection }) =>
+    mutationFn: ({
+      digest,
+      selection,
+      acceptUnauthenticated,
+    }: {
+      digest: string;
+      selection: RestoreSelection;
+      acceptUnauthenticated?: boolean;
+    }) =>
       source.kind === "upload"
-        ? startUploadRestore(captureAdminAuthority(), source.id, digest, selection)
-        : startRestore(captureAdminAuthority(), source.id, digest, selection),
+        ? startUploadRestore(
+            captureAdminAuthority(),
+            source.id,
+            digest,
+            selection,
+            acceptUnauthenticated,
+          )
+        : startRestore(
+            captureAdminAuthority(),
+            source.id,
+            digest,
+            selection,
+            acceptUnauthenticated,
+          ),
     retry: false,
     onSettled: () => queryClient.invalidateQueries({ queryKey: adminKeys.backups() }),
   });

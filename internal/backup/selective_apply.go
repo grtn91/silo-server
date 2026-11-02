@@ -17,12 +17,14 @@ import (
 	"strings"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/Silo-Server/silo-server/internal/backup/userdata"
 	"github.com/Silo-Server/silo-server/internal/blobstore"
 	"github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/plugins"
+	"github.com/Silo-Server/silo-server/internal/sections"
 )
 
 // ExecuteRestore runs one backup_restore job:
@@ -70,16 +72,42 @@ func (s *Service) ExecuteRestore(ctx context.Context, run RestoreRun) (any, erro
 	work, cancelWork := withLost(context.WithoutCancel(ctx), held)
 	defer cancelWork()
 
-	rs, err := s.openRestoreSet(work, req.source(), true)
+	// Only the files the selected items write are extracted, and only when
+	// the temporary directory has room for them.
+	located, err := s.locateConfirmed(work, req.source(), req.AcceptUnauthenticated)
 	if err != nil {
 		return fail(err)
 	}
+	planned, err := s.cachedSet(work, located)
+	if err != nil {
+		return fail(err)
+	}
+	if planned.Digest != req.Digest {
+		return fail(ErrDigestMismatch)
+	}
+	wanted := selectedBlobs(planned, req.Selection)
+	maps.Copy(wanted, selectedUserBlobs(planned, req.Users))
+	if err := checkTempSpace(os.TempDir(), planned, wanted); err != nil {
+		return fail(err)
+	}
+	rs, err := s.openRestoreSet(work, located, func(key string) bool { return wanted[key] })
+	if err != nil {
+		return fail(err)
+	}
+	rs.unverified = !located.authenticated
 	defer rs.Cleanup()
 	if rs.Digest != req.Digest {
 		return fail(ErrDigestMismatch)
 	}
 
-	a := &applier{s: s, rs: rs, run: run, report: report, total: 1 + len(req.Users), users: map[string]UserSelection{}, staged: map[string]error{}}
+	// Items write files inside their transactions; a store recording its
+	// identity on that first write would need a second pool connection.
+	for _, store := range s.stores {
+		if err := blobstore.RecordIdentity(work, store); err != nil {
+			return fail(fmt.Errorf("recording the storage: %w", err))
+		}
+	}
+	a := &applier{s: s, rs: rs, run: run, report: report, total: 1 + len(req.Users), users: map[string]UserSelection{}, staged: map[string]error{}, filesWritten: map[string]bool{}}
 	for _, ids := range req.Selection {
 		a.total += len(ids)
 	}
@@ -136,6 +164,9 @@ func (s *Service) ExecuteRestore(ctx context.Context, run RestoreRun) (any, erro
 			op.progress(work, float64(a.current)*100/float64(a.total), "Restoring "+spec.id)
 		}
 	}
+	// Default sections of the libraries this restore created, where it
+	// wrote none of their saved ones.
+	s.CompleteFollowUps(work)
 	finished := s.opts.Now().UTC()
 	report.FinishedAt = &finished
 	return report, nil
@@ -169,6 +200,10 @@ type applier struct {
 	// objects, or why it could not; an item it did not write is absent,
 	// and applyArtwork never publishes one.
 	staged map[string]error
+	// filesWritten marks the artwork items stageArtwork wrote missing files
+	// back for: the catalog already showed them, so their transaction
+	// finds them the same and has nothing more to do.
+	filesWritten map[string]bool
 }
 
 // applied is one item's outcome before its transaction commits.
@@ -222,17 +257,9 @@ func (a *applier) apply(ctx context.Context, section, id string) error {
 	var result applied
 	next := a.clone()
 	err := a.commit(ctx, next, "Restoring "+section, func(tx pgx.Tx) error {
-		sp, err := tx.Begin(ctx)
+		var err error
+		result, err = a.applyWithRetry(ctx, tx, section, id)
 		if err != nil {
-			return err
-		}
-		result, err = a.applyItem(ctx, sp, section, id)
-		result.item.Section, result.item.ID = section, id
-		if err != nil {
-			_ = sp.Rollback(ctx)
-			result.after, result.mapLibrary = nil, [2]int{}
-			result.item.Outcome, result.item.Error = OutcomeFailed, err.Error()
-		} else if err := sp.Commit(ctx); err != nil {
 			return err
 		}
 		next.Items = append(next.Items, result.item)
@@ -249,6 +276,54 @@ func (a *applier) apply(ctx context.Context, section, id string) error {
 		result.after(ctx)
 	}
 	return nil
+}
+
+// itemAttempts bounds how often an item starts again from its read after
+// a retryable failure (retryableItemError).
+const itemAttempts = 3
+
+// applyWithRetry runs one item in a savepoint of tx. A deadlock, a
+// serialization failure, or a section whose references changed between
+// its read and its lock rolls the savepoint back and starts the item again
+// from its read; after itemAttempts it is left out as changed during the
+// restore. Any other failure records the item as failed.
+func (a *applier) applyWithRetry(ctx context.Context, tx pgx.Tx, section, id string) (applied, error) {
+	for attempt := 1; ; attempt++ {
+		sp, err := tx.Begin(ctx)
+		if err != nil {
+			return applied{}, err
+		}
+		result, err := a.applyItem(ctx, sp, section, id)
+		result.item.Section, result.item.ID = section, id
+		if err == nil {
+			return result, sp.Commit(ctx)
+		}
+		_ = sp.Rollback(ctx)
+		if retryableItemError(err) && attempt < itemAttempts && ctx.Err() == nil {
+			continue
+		}
+		item := ReportItem{Section: section, ID: id, Kind: result.item.Kind, Label: result.item.Label}
+		if retryableItemError(err) {
+			item = leftOut(item, ReasonChanged, "It changed on this server while the restore ran. Restore it again.").item
+		} else {
+			item.Outcome, item.Error = OutcomeFailed, err.Error()
+		}
+		if item.Label == "" {
+			item.Label = id
+		}
+		return applied{item: item}, nil
+	}
+}
+
+// retryableItemError reports a failure an item survives by starting again
+// from its read: a deadlock or serialization failure, or a section whose
+// references changed under it.
+func retryableItemError(err error) bool {
+	if errors.Is(err, sections.ErrReferencesChanged) || errors.Is(err, errSettingsChanged) {
+		return true
+	}
+	pgErr, ok := errors.AsType[*pgconn.PgError](err)
+	return ok && (pgErr.Code == "40P01" || pgErr.Code == "40001")
 }
 
 func (a *applier) applyItem(ctx context.Context, tx pgx.Tx, section, id string) (applied, error) {
@@ -369,7 +444,18 @@ func (a *applier) writeBlobTo(ctx context.Context, storeName, from, to string) e
 		return err
 	}
 	defer func() { _ = f.Close() }()
-	err = blobstore.CreateExclusive(ctx, store, to, f, blobstore.MediaType(to))
+	// A restored file meets the checks an upload of it would.
+	if size > maxRestoredFile {
+		return fmt.Errorf("%w: %s is %s, over the %s any upload may be", ErrRestoredFileRefused, to, formatBytes(uint64(size)), formatBytes(maxRestoredFile))
+	}
+	data, err := io.ReadAll(f)
+	if err != nil {
+		return fmt.Errorf("reading %s: %w", from, err)
+	}
+	if err := checkRestoredBlob(to, data); err != nil {
+		return err
+	}
+	err = blobstore.CreateExclusive(ctx, store, to, bytes.NewReader(data), blobstore.MediaType(to))
 	switch {
 	case err == nil:
 		return nil
@@ -418,6 +504,12 @@ func sameObject(ctx context.Context, store blobstore.Store, key string, f *os.Fi
 const (
 	followUpLibraryCreated  = "library_created"
 	followUpPluginInstalled = "plugin_installed"
+	// followUpLibrarySections seeds a restored library's default and home
+	// sections where the restore wrote none. It runs once the restore's
+	// items are done (CompleteFollowUps), never after the library's own
+	// item: a saved section the restore writes later, renamed from its
+	// default, would otherwise sit beside a fresh default.
+	followUpLibrarySections = "library_sections"
 	// followUpCollectionCreated stores a restored template collection's
 	// template poster and syncs it; target_id is the collection id.
 	followUpCollectionCreated = "collection_created"
@@ -438,11 +530,18 @@ func recordFollowUp(ctx context.Context, tx pgx.Tx, kind string, id int) error {
 // other reason is never set up again. A follow-up whose target is gone is
 // dropped; one that fails stays for the next run. A restore job calls it
 // before its first item and after each item that recorded one.
-func (s *Service) CompleteFollowUps(ctx context.Context) {
+func (s *Service) CompleteFollowUps(ctx context.Context) { s.completeFollowUps(ctx, true) }
+
+// completeFollowUpsNow is CompleteFollowUps after one item: the follow-ups
+// that wait for the end of the restore wait.
+func (s *Service) completeFollowUpsNow(ctx context.Context) { s.completeFollowUps(ctx, false) }
+
+func (s *Service) completeFollowUps(ctx context.Context, final bool) {
 	rows, err := s.opts.Pool.Query(ctx, `
 		SELECT f.kind, f.target_id,
 			CASE f.kind
 				WHEN 'library_created' THEN EXISTS (SELECT 1 FROM media_folders m WHERE m.id = f.target_id)
+				WHEN 'library_sections' THEN EXISTS (SELECT 1 FROM media_folders m WHERE m.id = f.target_id)
 				WHEN 'collection_created' THEN EXISTS (SELECT 1 FROM library_collections c WHERE c.id = f.target_id::text)
 				ELSE EXISTS (SELECT 1 FROM plugin_installations p WHERE p.id = f.target_id)
 			END
@@ -472,11 +571,16 @@ func (s *Service) CompleteFollowUps(ctx context.Context) {
 		return
 	}
 	for _, f := range pending {
+		if f.kind == followUpLibrarySections && !final {
+			continue
+		}
 		if f.exists {
 			var err error
 			switch f.kind {
 			case followUpLibraryCreated:
 				err = callFollowUp(ctx, s.targets.LibraryCreated, f.id)
+			case followUpLibrarySections:
+				err = callFollowUp(ctx, s.targets.LibrarySectionsCreated, f.id)
 			case followUpPluginInstalled:
 				err = callFollowUp(ctx, s.targets.PluginInstalled, f.id)
 			case followUpCollectionCreated:
@@ -542,25 +646,36 @@ func (a *applier) applyLibrary(ctx context.Context, tx pgx.Tx, id string) (appli
 		return applied{}, err
 	}
 	realtime, ungrouped := e.RealtimeMonitoring, e.CollectionUngroupedSortOrder
-	folder, err := catalog.CreateFolderInTx(ctx, tx, catalog.CreateFolderInput{
-		ID: newID, Paths: e.Paths, Type: e.Type, Name: e.Name, MetadataLanguage: e.MetadataLanguage,
-		ChapterThumbnailsEnabled: e.ChapterThumbnailsEnabled, IntroDetectionEnabled: e.IntroDetectionEnabled,
-		TrickplayEnabled: e.TrickplayEnabled, TrailerKinds: e.TrailerKinds, RealtimeMonitoring: &realtime,
-		Disabled: !e.Enabled, AutoTranslateMetadata: e.AutoTranslateMetadata, PosterPath: poster,
-		CollectionUngroupedSortOrder: &ungrouped,
-		BoxSetsEnabled:               e.BoxSetsEnabled, BoxSetMinMovies: e.BoxSetMinMovies, BoxSetsInSearch: e.BoxSetsInSearch,
-	})
+	input := libraryInput(e)
+	input.ID, input.PosterPath = newID, poster
+	input.RealtimeMonitoring, input.CollectionUngroupedSortOrder = &realtime, &ungrouped
+	folder, err := catalog.CreateFolderInTx(ctx, tx, input)
 	if err != nil {
 		return applied{}, err
 	}
 	item.Outcome = OutcomeRestored
 	item.Message = "Created; its first scan is queued."
-	// The editor's follow-ups run after commit; the row records that they
+	// The editor's follow-ups run after commit; the rows record that they
 	// are owed, so a crash before they finish leaves them for the next run.
-	if err := recordFollowUp(ctx, tx, followUpLibraryCreated, folder.ID); err != nil {
-		return applied{}, err
+	// Its default sections wait for the end of the restore, which may
+	// write the library's saved ones (followUpLibrarySections).
+	for _, kind := range []string{followUpLibraryCreated, followUpLibrarySections} {
+		if err := recordFollowUp(ctx, tx, kind, folder.ID); err != nil {
+			return applied{}, err
+		}
 	}
-	return applied{item: item, mapLibrary: [2]int{e.ID, folder.ID}, after: a.s.CompleteFollowUps}, nil
+	return applied{item: item, mapLibrary: [2]int{e.ID, folder.ID}, after: a.s.completeFollowUpsNow}, nil
+}
+
+// libraryInput is the library e creates, before its id and poster.
+func libraryInput(e LibraryEntry) catalog.CreateFolderInput {
+	return catalog.CreateFolderInput{
+		Paths: e.Paths, Type: e.Type, Name: e.Name, MetadataLanguage: e.MetadataLanguage,
+		ChapterThumbnailsEnabled: e.ChapterThumbnailsEnabled, IntroDetectionEnabled: e.IntroDetectionEnabled,
+		TrickplayEnabled: e.TrickplayEnabled, TrailerKinds: e.TrailerKinds, Disabled: !e.Enabled,
+		AutoTranslateMetadata: e.AutoTranslateMetadata,
+		BoxSetsEnabled:        e.BoxSetsEnabled, BoxSetMinMovies: e.BoxSetMinMovies, BoxSetsInSearch: e.BoxSetsInSearch,
+	}
 }
 
 // restoreLibraryPoster writes the poster under the new library's key before
@@ -596,42 +711,28 @@ func (a *applier) applyPlugin(ctx context.Context, tx pgx.Tx, id string) (applie
 		return leftOut(item, ReasonNotInBackup, "The backup has no such plugin."), nil
 	}
 	item.Label = doc.PluginID + " " + doc.Version
+	if a.rs.unverified {
+		return leftOut(item, ReasonUnverifiedBackup, "Its configuration can connect to outside services, so it is not restored from a backup this server cannot verify."), nil
+	}
 	if a.s.targets.Plugins == nil {
 		return applied{}, plugins.ErrRestoreUnavailable
 	}
-	archive, err := a.rs.pluginArchive(doc.PluginID)
-	if err != nil {
-		return applied{}, fmt.Errorf("reading the plugin archive: %w", err)
-	}
-	in := plugins.RestoreInstallationInput{PluginID: doc.PluginID, Version: doc.Version, Enabled: doc.Enabled, Archive: archive,
+	in := plugins.RestoreInstallationInput{PluginID: doc.PluginID, Version: doc.Version,
 		SourceInstallationID: doc.InstallationID, ConfigUnreadable: !a.s.keyMatches(a.rs)}
 	for _, c := range doc.Configs {
 		in.Configs = append(in.Configs, plugins.RestoreConfig{Key: c.Key, Stored: c.Value})
 	}
 	res, after, err := a.s.targets.Plugins.RestorePlugin(ctx, tx, in)
+	if errors.Is(err, plugins.ErrPluginNotInstalled) {
+		return leftOut(item, ReasonNeedsInstall, needsInstallMessage(*doc)), nil
+	}
 	if err != nil {
 		return applied{}, err
-	}
-	// A new installation's lifecycle event and provider-chain sync are
-	// owed durably, like a new library's follow-ups. Reconfiguring an
-	// installed plugin advanced its runtime generation in this transaction,
-	// which replaces stale processes even if the event after commit is lost.
-	if res.Installed {
-		if err := recordFollowUp(ctx, tx, followUpPluginInstalled, res.InstallationID); err != nil {
-			return applied{}, err
-		}
 	}
 	for _, r := range res.Rejected {
 		item.Notes = append(item.Notes, fmt.Sprintf("Configuration %q was not restored: %s.", r.Key, r.Reason))
 	}
 	switch {
-	case res.Installed && !res.Enabled && doc.Enabled:
-		item.Outcome = OutcomeRestored
-		item.Message = "Installed and left disabled, because its configuration could not be restored."
-		after = a.s.CompleteFollowUps
-	case res.Installed:
-		item.Outcome, item.Message = OutcomeRestored, "Installed."
-		after = a.s.CompleteFollowUps
 	case len(res.Written) > 0 && res.SettingsOnly:
 		item.Outcome = OutcomeRestored
 		item.Message = fmt.Sprintf("Settings only: version %s is installed here.", res.InstalledHere)
@@ -645,53 +746,14 @@ func (a *applier) applyPlugin(ctx context.Context, tx pgx.Tx, id string) (applie
 	return applied{item: item, after: after}, nil
 }
 
-// ---- Settings ----
-
-func (a *applier) applySettingsPage(ctx context.Context, tx pgx.Tx, id string) (applied, error) {
-	page, known := settingsPageByID(id)
-	item := ReportItem{Kind: KindSettingsPage, Label: id}
-	if !known {
-		return leftOut(item, ReasonNotInBackup, "There is no such settings page."), nil
+// needsInstallMessage says how to restore a plugin this server does not
+// have: a restore never installs one from a backup.
+func needsInstallMessage(doc PluginDocument) string {
+	msg := fmt.Sprintf("Install %s %s from a plugin catalog, then restore it again", doc.PluginID, doc.Version)
+	if len(doc.Configs) > 0 {
+		return msg + " to apply its settings. A restore never installs a plugin from a backup."
 	}
-	item.Label = page.Title
-	plans, err := a.s.newPlanner(a.rs, tx).planSettings(ctx)
-	if err != nil {
-		return applied{}, err
-	}
-	values, needKey := map[string]string{}, 0
-	for _, p := range plans {
-		if p.page != id {
-			continue
-		}
-		switch p.preview.Status {
-		case ItemDiffers:
-			values[p.preview.Key] = p.value
-		case ItemNeedsAnotherKey:
-			needKey++
-		}
-	}
-	if needKey > 0 {
-		item.Notes = append(item.Notes, fmt.Sprintf("%d settings encrypted with another SECRET_KEY were left out.", needKey))
-	}
-	if len(values) == 0 {
-		if needKey > 0 {
-			return leftOut(item, ReasonNeedsAnotherKey, "Every setting that differs was encrypted with another SECRET_KEY."), nil
-		}
-		return unchanged(item), nil
-	}
-	if a.s.targets.ApplySettings == nil {
-		return applied{}, errors.New("settings restore is not available on this server")
-	}
-	restartKeys, after, err := a.s.targets.ApplySettings(ctx, tx, values)
-	if err != nil {
-		return applied{}, err
-	}
-	keys := slices.Sorted(maps.Keys(values))
-	item.Outcome = OutcomeRestored
-	item.Message = "Restored " + strings.Join(keys, ", ") + "."
-	item.RestartKeys = restartKeys
-	item.RestartRequired = len(restartKeys) > 0
-	return applied{item: item, after: after}, nil
+	return msg + ". A restore never installs a plugin from a backup."
 }
 
 // ---- Collections and artwork ----
@@ -723,21 +785,7 @@ func (a *applier) applyCollection(ctx context.Context, tx pgx.Tx, id string) (ap
 		item.Notes = append(item.Notes, fmt.Sprintf("%d of its items are not in this server's catalog and were left out.", unknown))
 	}
 	if plan.localID != "" {
-		added, err := catalog.AddMissingItemsInTx(ctx, tx, plan.localID, plan.missing)
-		if err != nil {
-			return applied{}, err
-		}
-		grouped, err := restoreGroups(ctx, tx, plan.localID, *c, libMap)
-		if err != nil {
-			return applied{}, err
-		}
-		a.claim(claimCollection, plan.localID, id)
-		if len(added) == 0 && grouped == 0 {
-			return unchanged(item), nil
-		}
-		item.Outcome = OutcomeRestored
-		item.Message = fmt.Sprintf("Added %d items to the collection here and put it back in %d groups.", len(added), grouped)
-		return applied{item: item}, nil
+		return a.restoreOntoCollection(ctx, tx, id, plan, *c, libMap, item)
 	}
 
 	// A smart query or a sync source names libraries too; one that would
@@ -784,6 +832,50 @@ func (a *applier) applyCollection(ctx context.Context, tx pgx.Tx, id string) (ap
 	}
 	a.claim(claimCollection, newID, id)
 	item.Outcome, item.Message = OutcomeRestored, msgCreated
+	return applied{item: item, after: a.smartCollectionCreated(c.CollectionType, newID)}, nil
+}
+
+// smartCollectionCreated is the after-commit refresh of a smart collection
+// the restore created (RestoreTargets.SmartCollectionCreated), or nil. The
+// count is derived; a failed refresh waits for the periodic one.
+func (a *applier) smartCollectionCreated(collectionType, id string) func(context.Context) {
+	refresh := a.s.targets.SmartCollectionCreated
+	if refresh == nil || collectionType != collectionTypeSmart {
+		return nil
+	}
+	return func(ctx context.Context) {
+		if err := refresh(ctx, id); err != nil {
+			slog.WarnContext(ctx, "refreshing a restored smart collection's count failed", "component", "backup", "collection_id", id, "error", err)
+		}
+	}
+}
+
+// collectionTypeSmart is a collection whose items its rules choose.
+const collectionTypeSmart = "smart"
+
+// restoreOntoCollection adds the items a collection here lacks and puts its
+// memberships back in their groups. The collection's parent is locked
+// first, before anything that can take a library's order revision (a
+// group created, items added, a membership regrouped), as the library
+// editor locks.
+func (a *applier) restoreOntoCollection(ctx context.Context, tx pgx.Tx, id string, plan collectionPlan, c CollectionEntry, libMap map[int]int, item ReportItem) (applied, error) {
+	if err := catalog.LockLibraryCollectionInTx(ctx, tx, plan.localID); err != nil {
+		return applied{}, err
+	}
+	added, err := catalog.AddMissingItemsInTx(ctx, tx, plan.localID, plan.missing)
+	if err != nil {
+		return applied{}, err
+	}
+	grouped, err := restoreGroups(ctx, tx, plan.localID, c, libMap)
+	if err != nil {
+		return applied{}, err
+	}
+	a.claim(claimCollection, plan.localID, id)
+	if len(added) == 0 && grouped == 0 {
+		return unchanged(item), nil
+	}
+	item.Outcome = OutcomeRestored
+	item.Message = fmt.Sprintf("Added %d items to the collection here and put it back in %d groups.", len(added), grouped)
 	return applied{item: item}, nil
 }
 

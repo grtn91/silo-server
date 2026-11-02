@@ -70,6 +70,9 @@ SHA-256 of its stored bytes, the `SECRET_KEY` check value, how the table of cont
 set, `restore_set`: its format version and the item count of each section.
 The objects are exactly `db.dump` and `blobs.tar`, plus `restore-set.tar`
 when `restore_set` is present.
+A manifest is at most 16 MiB, the most a reader reads: `missing_blobs` lists
+at most 10,000 entries, with `missing_blobs_total` counting them all when
+there are more, and a manifest that would still be larger is not written.
 
 The inventory covers `users`, `user_profiles`, `media_folders`, `media_items`,
 `media_files`, `server_settings`, `plugin_installations`,
@@ -92,6 +95,34 @@ The check value is HKDF-SHA256 over `SECRET_KEY` with info
 prints the value, so an operator can tell which key a backup needs without
 showing either key.
 
+`mac` authenticates the rest of the manifest: HMAC-SHA256 under a key
+derived from `SECRET_KEY` (HKDF-SHA256, info `silo/backup-manifest/v1`,
+`secret.BackupManifestKey`) of the manifest encoded with `mac` empty, in hex.
+It covers the id, kind, server id, times, every object's name, size, and
+checksum, and every other field. Anyone who can write the destination can
+change an object and its checksum together; only a server with the key can
+write a `mac` that verifies. Every read checks it before trusting anything
+else in the manifest: the listing, downloads and download links, a
+selective restore's preview and restore, `silo backup restore`, and
+`silo backup verify`. The check is a strict state machine, with no legacy
+path (every Silo that writes manifests signs them):
+
+- The manifest names this server's check value: its `mac` must verify, or
+  it is refused (`ErrManifestTampered`), a missing `mac` included, even with
+  `--accept-lost-credentials`.
+- It names another check value, none, or `SECRET_KEY` is not set here: it
+  cannot be authenticated. `silo backup restore` refuses it unless the
+  operator passes `--accept-lost-credentials`, the flag that already accepts
+  a backup taken with another key (whose encrypted settings are lost), and
+  says plainly that the backup cannot be verified; `silo backup verify`
+  warns. A selective restore needs the admin's confirmation
+  (`accept_unauthenticated`) before it reads anything inside the restore
+  set, its preview included, and the listing shows it as `unverified`.
+- A manifest a destination read must also name the folder and server it was
+  read from. A folder whose manifest names this key and does not verify is
+  listed as `unverified` with no details, cannot be restored or downloaded,
+  and the sweep leaves it.
+
 ## Taking a backup
 
 1. Preflight: the user store is PostgreSQL, the destination exists, its id
@@ -104,12 +135,25 @@ showing either key.
    versions, the table inventory, and the referenced blob keys.
 3. Run `pg_dump --format=custom --compress=zstd:3 --snapshot=<id>` with
    `--exclude-table-data-and-children` for `activity_log`, `operational_logs`,
-   `policy_decisions`, `catalog_search_index_events`, `backup_status` (its row
-   describes the backup being taken), `backup_uploads`, `backup_upload_parts`,
-   and `backup_upload_attempts` (their parts are not in the backup), and, unless
+   `policy_decisions`, `catalog_search_index_events`, the short-lived
+   secrets of [Credentials](#credentials) (login sessions and refresh
+   tokens, Jellyfin and Audiobookshelf sessions, device-code, OIDC,
+   account-link, password-reset, email-verification, Discord-link,
+   watch-provider, and history-import sign-in flows, Watch Together rooms),
+   `backup_status` (its row describes the backup being taken),
+   `backup_uploads`, `backup_upload_parts`, and `backup_upload_attempts`
+   (their parts are not in the backup), and, unless
    `backup.include_intro_fingerprints`, `media_intro_fingerprints`. The schema
-   is always dumped. The password moves from the URL into `PGPASSWORD` so it
-   never appears in a process listing.
+   is always dumped. Leaving sign-in state out means a restore never brings
+   back a session or token revoked after the backup: after a full restore
+   every client, Jellyfin-protocol ones included, signs in again. Long-lived
+   credentials stay in the dump, and a restore replaces them (see
+   [Credentials](#credentials)). No secret from the URL appears in a
+   process listing: the password moves into `PGPASSWORD`, and an
+   `sslpassword` (the client key's passphrase, which libpq reads from no
+   environment variable) into a service file readable only by this user,
+   named by `PGSERVICEFILE` and removed when the command exits. pgx's
+   `sslinline`, which puts key material in the URL, is refused.
 4. Stream `pg_dump`'s stdout straight into the destination with no local
    spool, hashing the stored bytes. `pg_restore --list` reads a tee of the
    stream. `pg_restore` reads a custom-format archive's table of contents
@@ -140,7 +184,15 @@ Blob keys come from the snapshot's references, never from listing the store:
 | Library posters (`media_folders.poster_path`) | assets |
 | Branding assets (`branding.*_ref` settings, `branding.AssetObjectKey`) | assets |
 | Uploaded profile avatars (`user_profiles.avatar` starting `upload:`) | operational |
-| Downloaded subtitles (`downloaded_subtitles.s3_key`), unless `backup.include_subtitles` is off | assets |
+| Uploaded subtitles (`downloaded_subtitles.s3_key` with provider `upload`), always: they cannot be fetched again | assets |
+| Downloaded subtitles (`downloaded_subtitles.s3_key` from a provider), unless `backup.include_subtitles` is off | assets |
+
+A backup taken with `backup.include_subtitles` off still dumps every
+`downloaded_subtitles` row. A full restore deletes the provider rows whose
+object is not in the storage the restored server uses (in separate mode,
+all of them), so players do not list tracks with no content; Silo downloads
+them again when they are chosen. Storing a subtitle whose row exists but
+whose object is gone writes the object back under the row.
 
 For an artwork original (`.../original[.<revision>].<ext>`) the copy also
 takes the stored variants of the same revision in its directory. Only the
@@ -173,6 +225,12 @@ download. The one destination, `default`, is the operational store from
 backend there is no local operational store, so there is nowhere to write
 backups; the Backups page says so and links to Storage settings. Uploads use
 the same store.
+
+A storage transition never copies `backups/` (see
+[blob-storage.md](blob-storage.md#managed-transitions)). Local backups stay
+on this server's disk when the operational store moves to a bucket; the
+Backups page then lists the bucket's backups only, and an earlier local one
+is still restored from its folder with `silo backup restore --from <dir>`.
 
 **Every API server must share the operational store.** Backups are written by
 whichever server runs the task and listed, downloaded, and deleted by any
@@ -289,9 +347,13 @@ away copies the admin meant to keep.
   swept.
 - `nightly` and `manual` copies share `backup.keep`; older ones beyond it are
   deleted, oldest first.
-- The newest `nightly` or `manual` copy without warnings is never deleted, even
-  when that keeps one more than `backup.keep`, so repeated runs with missing
-  blobs cannot rotate away the last copy that has every blob.
+- The newest clean `nightly` or `manual` copy is never deleted, even when
+  that keeps one more than `backup.keep`, so repeated runs with missing blobs
+  cannot rotate away the last copy that has every blob. A clean copy is
+  complete, has every blob, and verifies under this server's `SECRET_KEY`:
+  one this server can restore without extra flags. An unverified copy never
+  stands in for it. The listing sends `clean` per backup, and the page
+  predicts rotation from that instead of deciding it again.
 - `before-restore` copies are deleted after 7 days and do not count toward
   `backup.keep`.
 - Rotation manages only the current server id's prefix, and never deletes a backup that is the source of a queued or
@@ -299,8 +361,10 @@ away copies the admin meant to keep.
   run, so no other rotation, sweep, or delete runs, and the rotation of its
   own before-restore backup is told to keep the source. A queued restore is
   read from the job queue under the lock rotation holds, the lock restores
-  are queued under ([The restore job](#the-restore-job)); when the queue
-  cannot be read, rotation deletes nothing and warns.
+  are queued under ([The restore job](#the-restore-job)); the service reads
+  it from `admin_jobs` itself, wired when it is built, so nothing that
+  starts before the API router can rotate without it. When the queue cannot
+  be read, rotation deletes nothing and warns.
 - Deleting a backup takes the same lock and refuses (409) while a queued or
   running restore reads it.
 - A delete that fails leaves a warning in the task result.
@@ -353,7 +417,7 @@ accept versions 1 to 3; version 3 is always written.
 | Section | Holds | Blob prefixes |
 |---|---|---|
 | `libraries` | `media_folders` rows with their paths and per-library options, and the poster key | `library-posters/` |
-| `plugins` | per installation: plugin id, version, enabled state, installation id, the stored archive (`plugin_archives`), and `plugin_runtime_configs` rows as stored | none |
+| `plugins` | per installation: plugin id, version, enabled state, installation id, the stored archive (`plugin_archives`, a record only: never installed), and `plugin_runtime_configs` rows as stored | none |
 | `settings` | `server_settings` rows the restore table offers, as stored | none |
 | `users` | one document per account: the account's fields, its profiles with their fields and data by data type, and the items that data names (see [Users](#users)) | `profile-avatars/` (operational store), `user-collection-images/` |
 | `collections` | manually managed admin collections with their library scope, group, and items; template-bundle collections (see below); uploaded item and season artwork (`upload://` sources); branding assets | `collection-images/`, `local/`, `branding/` |
@@ -396,19 +460,55 @@ segment, backslash, or NUL; no duplicate paths, sections, or item ids;
 `restore-set.json` first; every other file listed in the index with its size
 and digest, and every listed file present; blobs only under their section's
 prefixes and only keys the section references, or variants stored in a
-referenced artwork original's directory; branding entries only for a
-branding asset setting (`branding.AssetSettingKeys`) whose reference is one
-file name naming the entry's own blob, because a branding entry is written as
-a setting; user documents whose file names their own account, with a known
-role, bounded fields, unique profile ids, avatars only under
-`profile-avatars/` and listed for the section, and data only of registered
-data types, each passing its owner's strict checks; documents that decode strictly
+referenced artwork original's directory; avatars a user document names
+listed for the section; documents that decode strictly
 (unknown fields and trailing data refused) and match the index counts; and
-limits on entries (200,000), document size (64 MiB), plugin archive and blob
-size (256 MiB), total bytes (32 GiB), and JSON nesting (32). A plugin archive
-also gets the installer's normal checks when it is installed. Readers accept
+limits on entries (200,000), document size (64 MiB; 32 MiB for the index,
+16 MiB for `settings.json` and each `plugin.json`), the documents one read
+holds together (256 MiB, checked from the index's listed sizes before any
+document is read), plugin archive and blob size (256 MiB), total bytes
+(32 GiB), and JSON nesting (32). A plugin archive is checked against its
+digest and discarded, never installed ([Plugins](#plugins)). Readers accept
 every format version up to theirs and refuse a newer one with "This backup is
 from a newer Silo. Upgrade this server first."
+
+**Nothing inside a restore set is decoded before it is verified.** The
+manifest records the restore set's digest and the digest of its index
+(`restore_set.index_sha256`), both covered by the manifest's `mac`. For an
+authenticated manifest the reader checks the index against its digest
+before decoding it, and the whole archive against its digest
+(`ReadOptions.Verify`) before decoding any document; until then documents
+are held as bytes, each checked against its index digest. A backup whose
+manifest cannot be authenticated, or that records no index digest, is read
+only after the admin confirms (`accept_unauthenticated`), its preview
+included. Previews of one archive share a read (`restoreSetCache`); the read
+stops when every preview waiting on it has gone.
+
+A restored library, admin collection, template collection, or section
+meets the editor's own checks, run through restore targets so they are the
+editor's code: the library create command's (`CheckRestoredLibrary`), the
+admin collection create command's (`CheckRestoredCollection`), and the
+section editor's (`CheckRestoredSection`). One the editor would refuse is not
+offered, with its message. No entry may encode to more than the v2 API's
+request body cap (1 MiB; a collection's item list is not counted), as no
+editor request could write more for one.
+
+Any of those failures refuses the whole set. An entry whose own values no
+restore could write is left out instead, and the rest stays readable
+(`RestoreSet.Unusable`): a setting key that is not one, a library without an
+id, name, type, or clean absolute folders, a collection, template
+collection, or section with no valid id, title, scope, type, or JSON, a
+section carrying a collection its configuration does not name, item artwork
+that does not say what it is, a plugin whose configuration keys repeat or
+whose values are not JSON, and a branding entry that is not for a branding
+asset setting (`branding.AssetSettingKeys`) or whose reference is not one
+file name naming its own blob (a branding entry is written as a setting), and
+a user document that names another account than its file, or whose account
+or profiles fail their checks (a known role, bounded fields, unique profile
+ids, avatars only under `profile-avatars/`, and data only of registered data
+types, each passing its owner's strict checks); that account is left out.
+The preview lists each as an unchoosable item with reason `unreadable`; an
+id listed twice still refuses the set.
 
 A referenced blob absent from the archive was missing when the backup was
 taken; the preview and the report list it with the item.
@@ -441,7 +541,41 @@ grouped by the admin page that edits each key: a key or prefix with its class.
   `backup.*`, and state the server writes for itself under an admin prefix:
   sweep and cleanup checkpoints, `recommendations.embedding_lock` (the
   stored vectors' model and dimensions), and
-  `recommendations.policy_marked_generation`.
+  `recommendations.policy_marked_generation`. The network-security and
+  sign-in trust toggles are server-specific too (`trustSettings`): whether
+  webhooks and media-server connections may reach private networks
+  (`*.allow_private_destinations`), `clientip.trusted_proxies`, sign-up,
+  self-service password reset, local password sign-in, and matching
+  external sign-ins by email. A backup is only as trustworthy as its
+  destination, and one of these turned on would let a profile reach this
+  server's private network or let someone sign in, so they stay as the live
+  server has them. `TestTrustSettingsAreServerSpecific` fails on a setting
+  named like one that is not in the list.
+- A restore never widens access. The access settings
+  (`accessSettings`, shared with the full restore: `access.unrated_content`, the Jellyfin and
+  Audiobookshelf sign-in switches, access and refresh token and Jellyfin
+  session lifetimes, and the identity provider's re-check interval and
+  outage policy) are offered, but a value that grants more than the live one
+  (`AccessSettingWider`; a value that does not parse counts as wider)
+  is never written: the preview marks it `kept_stricter` and the report says
+  the stricter current value was kept. The write compares again under the
+  settings lock (`accessUnchanged`, the admin settings write path's guard),
+  so a stricter value an admin saves after the plan is kept: the item starts
+  again from its read. `TestAccessSettingsAreComparedOnRestore` requires
+  every access setting to be offered, so none is compared in vain. Mail's
+  transport security (`email.smtp_security`) is compared the same way: a
+  restore never weakens it to `none`.
+- A service's address and its secrets restore together (`settingRoutes`:
+  the SMTP host and password, the AI, speech, subtitle-AI, and embedding
+  base URLs and their keys). When a restore changes the address, each secret
+  must come from the backup and decrypt here; otherwise the restore clears
+  it and turns the service off (`email.enabled`) instead of sending this
+  server's secret to the backup's address. The preview marks those settings
+  `cleared`, and the secrets are expected unchanged under the settings lock.
+- A backup this server cannot authenticate restores no setting that
+  connects to an outside service (class `external_service`) and no plugin
+  configuration, whatever the admin confirmed: the preview marks them
+  `unverified_backup`.
 
 A key the table does not match is never offered. `TestEverySettingIsClassified`
 fails for any admin setting default, sensitive setting, or branding asset key
@@ -459,27 +593,27 @@ it is never offered and the preview says so.
 
 ### Plugins
 
-A plugin missing here is installed from the backup's archive through the
-admin upload path's checks, with the installer's `KeepDisabled` option: the
-installation is persisted disabled and is never enabled in between. Its
-configuration is decrypted under the source installation id, checked with
-the validation an admin save uses, and written re-encrypted under the new
-installation id (`plugin_runtime_configs:config_value:<installation id>:<key>`).
-Only then is the backup's enabled state applied, and after commit
-`EventPluginsChanged` is published and a metadata provider joins the library
-chains as an upload's does. Configuration that fails validation or cannot be
-decrypted leaves the plugin disabled, and the report says why.
+A restore never installs or runs a plugin from a backup. Its archive is
+vouched for only by the backup's own checksums, and anyone who can write the
+backup destination could replace it with code that would run as the Silo
+user. A plugin missing here is not selectable (`needs_install`): the preview
+and the report tell the admin to install that plugin id and version from a
+plugin catalog, through the normal install path and its checks, and to
+restore it again, which then applies its settings. The archive stays in the
+restore set as a record of what was installed; the reader checks its digest
+and keeps no copy.
 
 A plugin installed here keeps its installation and enabled state. At the
-same version its configuration is restored the same way; at another version
-only values the installed version accepts are written ("settings only").
-With another `SECRET_KEY` a missing plugin installs without configuration and
-stays disabled. `plugin_instance_state` is never restored.
-
-A new installation's lifecycle event and provider-chain sync are owed
-durably (see [Follow-ups](#follow-ups)). Reconfiguring an installed plugin
-advances its runtime generation in the item's transaction, which replaces
-stale processes even when the event after commit is lost.
+same version its configuration is decrypted under the source installation
+id, checked with the validation an admin save uses, and written re-encrypted
+under this installation's id
+(`plugin_runtime_configs:config_value:<installation id>:<key>`); at another
+version only values the installed version accepts are written ("settings
+only"). Configuration that cannot be decrypted, as with another
+`SECRET_KEY`, or that fails validation is left out, and the report says why.
+`plugin_instance_state` is never restored. Reconfiguring a plugin advances
+its runtime generation in the item's transaction, which replaces stale
+processes even when the event after commit is lost.
 
 ### Libraries
 
@@ -516,7 +650,14 @@ admin chose since stays, and a re-run repairs a membership left ungrouped. Items
 are left out. Uploaded item and season artwork is published for the same
 content id, whose blob key is the same on every server, as an upload does,
 with the images lock. Branding assets write their blob and then their setting
-through the admin settings write path.
+through the admin settings write path. Item artwork or a branding asset this
+server already shows as the backup has it is the same only when its files
+(the artwork's stored family, the branding blob) are in the assets store,
+checked with `Stat`, eight at a time. When any is missing it differs
+(`files_missing_here`), and restoring it writes the missing files back with
+the exclusive create every restore uses and changes nothing else; the next
+preview finds it the same. Library posters and collection images of a library
+or collection matched here are not restored onto it, so they are not checked.
 
 ### Template collections
 
@@ -629,11 +770,59 @@ are written under ids the restore just took, so a legitimate restore finds
 them absent or equal; an archive naming a live asset's key cannot replace
 it, whether or not the item's transaction later commits.
 
+A restored blob meets the checks an upload of its kind meets, before it
+reaches storage (`checkRestoredBlob`): a branding asset its kind's size limit,
+the type its extension serves, and the kind's processing
+(`branding.CheckStoredAsset`); any other image at most 10 MB, a JPEG, PNG, or
+WebP by its bytes, and a source `imageutil.CheckImage` accepts. A blob that
+fails fails its item with `ErrRestoredFileRefused`; other items go on.
+
+The job extracts only the blobs its selected items write (`selectedBlobs`),
+sizing them from the preview's read of the same restore set, and refuses to
+start (`ErrNotEnoughTempSpace`) unless the temporary directory has their size
+plus 1 GB free. The rest of the archive is read, checked, and discarded.
+
+Before its first item, a restore records each store's identity
+(`blobstore.RecordIdentity`), which a store opened with settings would do on
+its first write through a pool connection; items write files inside their
+transactions, and on a one-connection pool that second connection never
+comes.
+
+### Lock order
+
+An item takes the locks the editor or API path for the same rows takes, in
+the same order, so the two wait for each other instead of deadlocking:
+
+- Admin collections: the collection parent (`FOR NO KEY UPDATE`), then the
+  library's collection order revision, then membership rows. The library
+  editor's move and reorder takes every parent of the library first, in id
+  order, so a restore holding one parent never holds what the editor waits
+  on. Restoring onto an existing collection (admin, template, or a page
+  section's managed one) takes its parent first in the item's transaction
+  (`catalog.LockLibraryCollectionInTx`), before it creates a group, adds
+  items, or regroups a membership, any of which takes the order revision
+  (`TestGroupingWaitsForTheEditorDB`). The catalog functions take the parent
+  again themselves, which is free in the same transaction, so no caller can
+  skip it.
+- Page sections and featured sections: the section editor's order (see
+  `selective_sections.go`): collection parents, then section rows in id
+  order, then surface revisions. A section whose collection references
+  changed between its read and its row lock is `sections.ErrReferencesChanged`:
+  its new parents are never locked under the section lock.
+- Any item that fails with that, a deadlock (`40P01`), or a serialization
+  failure (`40001`) rolls back to its savepoint and starts again from its
+  read, up to three times, and is then left out as changed during the
+  restore (`changed_since_preview`).
+- Accounts and profiles: `userdata.Preparer`'s order, the account locks, then
+  each data type's own, then data rows.
+- Libraries, plugins, and settings write through the editor's own functions
+  (`catalog.CreateFolderInTx`, the plugin configuration store, the admin settings write
+  path) and take their locks.
+
 ### Follow-ups
 
 Some work runs only after an item commits: a restored library's sections,
-provider chain, monitoring, and first scan, a restored plugin's lifecycle
-event and provider-chain sync, and a restored template collection's
+provider chain, monitoring, and first scan, and a restored template collection's
 template poster and sync. The item's transaction records it in
 `backup_restore_followups`, and the row is deleted only once every step of
 the work succeeded: the restore's follow-ups return each failed step
@@ -644,6 +833,11 @@ a fallback placement, on any path, and the restore's retry places it from
 the manifest. A
 crash or failure between the commit and the work leaves the row; every
 restore job runs the owed rows before its own items, and after each item.
+A restored library's default and home sections are their own follow-up
+(`library_sections`), which runs only at the end of the restore, once the
+saved sections it carries are written, and seeds only where none exist: a
+default renamed before the backup comes back once, not beside a fresh
+default. Template and section-managed collections seed no sections.
 Only rows a restore recorded run, so a library or plugin that exists for any
 other reason is never set up again. A library's follow-ups seed sections only
 where none exist and leave a provider chain an admin already set; a target
@@ -797,7 +991,15 @@ with no group, compared against the no-group policy, and never given the
 default group. An account with a group joins the group of that name here, if
 there is one and it grants nothing more (`group_not_on_this_server`
 otherwise); groups themselves are never restored. A new account keeps its
-password hash, so it signs in with its old password.
+password hash, so it signs in with its old password. A password or PIN hash
+in a format or cost this server does not accept is replaced, and the report
+notes that a new one must be set.
+
+After an account's item or a profile import commits, the restore tells the
+notification system which items each profile's data now names
+(`ItemsChanged`, the interest recompute the user store's own writes
+trigger), so new-episode notifications follow the restored favorites,
+watchlist, and progress without waiting for the nightly repair.
 
 **Access never loosens.** A library id with no library here is dropped from
 an account's library list and from a profile's allowed libraries; a list
@@ -886,8 +1088,21 @@ Personal collection posters are not carried. The export holds what the
 profile may see now, as every other read of its data does: rows about titles
 outside its libraries or above its content-rating or advisory limits are left
 out, and so are those titles' item references (`userdata.Keep`, checked once
-in the export's snapshot). A title the catalog no longer holds stays, since
+in the export's snapshot). Watchlisted titles outside the library are kept
+by the watchlist's own rule: their stored certification under the profile's
+rating ceiling (`access.RatingAllowed`), so a title without one is left out
+under a ceiling. A title the catalog no longer holds stays, since
 no read can show it. A server backup's user documents are not filtered.
+The export reads the data once to learn which items it names, keeping no
+row, and once to write it, and refuses (413) a document larger than an
+import accepts.
+
+Exports and imports share one admission (`ProfileTransfer.admit`): one per
+account and two per server at a time, refused (409) rather than queued, and
+taken before either opens a transaction. An import's slot is taken before
+its body is read (an operation middleware on `importProfile`), so a busy
+server buffers nothing; the import parses the document once into its
+top-level members, once strictly, and runs each data type's checks once.
 
 An import writes only the profile of the session, never one the document
 names, in one transaction, with the merge rules above. It refuses a document
@@ -1063,27 +1278,194 @@ in its store's backup namespaces, and no two entries land on the same object
 is not newer than this binary's newest migration, the backup applied no
 migration this binary does not carry (`database.MigrationVersions`; the
 refusal names the versions), and the key check value matches. All of it runs
-before anything changes. Migrations run out of order, so a database can hold
+before anything changes. The checksums are taken of private copies: after
+the manifest's MAC, `db.dump` and `blobs.tar` are copied into a new 0700
+directory (`TMPDIR`, as 0600 files) and hashed as they are written, after a
+check that their size plus 1 GB is free there. `pg_restore`, the archive
+checks, and the blob writes read only those copies, so a backup folder
+changed after the check changes nothing. The command removes them when it
+ends, failed or not. Migrations run out of order, so a database can hold
 a version below the binary's newest that the binary does not have, such as
 one from another branch's build; the newest-version check alone would let it
 through. A manifest written before `applied_migrations` existed is checked
 by its goose version alone, and the restored database's applied versions are
 checked against the binary in the verification step instead. A backup taken
 with another key needs `--accept-lost-credentials`: its encrypted settings and credentials cannot be
-read with this key.
+read with this key. Silo refuses to start on a setting it cannot decrypt, so
+after verification such a restore deletes, in the restored database, every
+encrypted `server_settings` row this key cannot open and prints their key
+names (never values) for the admin to enter again. Rows are only deleted,
+never renamed: a value is bound to its key name.
+
+### Credentials
+
+`secretTables` in `internal/backup/credentials.go` classifies every table
+that holds a bearer secret or a public capability, each one way:
+
+- Left out: short-lived secrets and capabilities (sessions, sign-in flows,
+  reset and verification tokens, Watch Together join codes, Audiobookshelf
+  playback sessions, whose id alone opens the public track route). The dump leaves their
+  rows out, so a restore never brings back a session or token revoked
+  after the backup, and after a full restore every client signs in again.
+- Carried from the live server: long-lived credentials that clients and
+  other services present to Silo (API keys, pending invitations, invite
+  codes, autoscan webhook tokens, audiobook RSS feed links, Plex and
+  Jellyfin webhook sync secrets with their profile mappings, external
+  sign-in links and sign-in providers), and the
+  destinations that receive notifications without a session (browser and
+  mobile push registrations, notification webhooks, notification email
+  addresses, Discord links, server notification channels): one removed
+  since the backup would receive them again. A restore
+  never brings back the backup's rows: one revoked after the backup would
+  work again, and one created since would stop working. They stay in the
+  dump (`marker_edit_audit` refers to API keys), and the restore replaces
+  them as below.
+- Restored with the data: what looks like a secret admits no one to this
+  server or belongs to the record it comes with (outbound provider tokens,
+  URL slugs, worker leases, delivery histories, account passwords and
+  profile PINs with their accounts).
+
+Every other table is classified too (`internal/backup/tables.go`): the
+logs and queues the dump leaves out (`loggedTables`), the server's data
+(`restoredDataTables`), and the running server's own state, restored as it
+is and rebuilt or reconciled by the server (`serverStateTables`: caches,
+queues, job, lease, and lock state, revisions, samples).
+`TestEveryTableIsClassifiedDB` reads every table after the migrations and
+fails on one in no list or in two, and on a listed name that is not a table,
+so a new table needs a decision before it ships; a layer that adds one
+classifies it.
+
+Sensitive settings (`catalog.SensitiveSettingKeys`) are classified the same
+way in `internal/backup/settings_secrets.go`. The signing keys Silo
+generates for the tokens it issues (`auth.jwt_secret`, which signs sessions,
+download and artwork links, backup object links, OAuth state, and cursors,
+and `audiobooks.abs.jwt_secret`) are replaced on every restore, swap or
+separate, before the lost-settings pass: a fresh random value written
+encrypted with this server's `SECRET_KEY`, bound to its key name as the
+settings store writes it, or, without a key, deleted so the server generates
+one when it starts. A key leaked and rotated after the backup therefore
+never signs again; every session ends with a restore anyway. The other
+sensitive settings are credentials for other services and are restored.
+`TestSensitiveSettingsAreClassified` fails on a sensitive setting in
+neither list.
+
+- A full restore (swap mode) keeps the live server's carried credentials as
+  they are right before the swap. After verification, in the same step
+  that clears unreadable settings, it reads them from the live database
+  and writes them into the restored database in one transaction,
+  before it becomes live. A restored credential identical to a live one
+  (same id, owner, and secret) is updated in place, so what refers to it
+  stays linked; the others are deleted. Accepted and revoked invitations
+  are the restored history and stay. A live credential whose account,
+  profile, access group, item, autoscan source, or connection is not in the
+  restored data is dropped, and so is one whose account (owner, inviter, or
+  creator) has more authority in the restored data than on the live server:
+  a higher role (the Owner over admin over user), enabled where it is
+  disabled now, break-glass access, an effective account policy wider in
+  any field (`access.WiderThan`: libraries, quality, stream and transcode
+  caps, profiles, downloads, requests, permissions, with access groups
+  applied), or, for a profile both sides have, a restriction lifted or
+  loosened (child profile, rating or advisory-age ceiling, library
+  restriction). Changing an account's role deletes its keys for the same
+  reason. An invitation or invite code is also dropped when the account it
+  would create gets a wider effective policy under the restored data than
+  live: its role and libraries applied to its access group, or the default
+  group when it names none, as account creation resolves them. The command
+  counts what it kept per kind and lists what it dropped by id and label,
+  never key material. Identity sequences move past the ids written. Live rows are
+  encrypted with this server's key, so they stay readable after
+  `--accept-lost-credentials`.
+- Carrying from the live server is for the deployment the backup came from:
+  credentials, destinations, sign-in links, and switches are tied to its
+  account, profile, and installation ids, which on another deployment are
+  other people. When the authenticated manifest's server id is not the live
+  server's (or the manifest cannot be verified), the restore says so before
+  anything changes and needs `--accept-lost-credentials`; it then carries
+  none of them, deleting the backup's own, so everyone signs in again and
+  admins create keys, invitations, and links again
+  (`ErrOtherDeployment`, `checkDeployment`). Stricter-of server settings,
+  which are not tied to ids, still apply.
+- In the same transaction, a full restore keeps each security, access,
+  sharing, or outbound switch inside an otherwise restored table at the
+  stricter of the backup's and the live server's value (`stricterFlags`),
+  so it never turns back on what an admin or a user turned off since the
+  backup: a library's `enabled`; autoscan's and each autoscan source's;
+  history-import sources, request integrations, routes, and the request
+  settings (requests, auto-approval, watchlist requests); subtitle
+  providers; marker sharing; per-account and per-group download,
+  transcode, and request permissions; a profile's child flag, library
+  restriction, and advisory-age requirement (on wins); a personal
+  collection's sharing; a profile's notification preferences; a
+  watch-provider connection's sync switches; an account's `enabled`,
+  `break_glass`, and `local_password_login_enabled` (off wins) and
+  `password_change_required` (on wins), and the `enabled` of every plugin
+  installation, plugin task binding, and plugin catalog (off wins): plugins run as the server, so one
+  turned off during an incident stays off, and a sign-in provider's carried
+  links then sign no one in. A plugin installation or catalog the backup
+  has and the live server no longer does comes back off, never on. Nothing
+  a full restore does turns a plugin on; the admin does. A row is the live
+  one when its id and username (an account), plugin id, catalog URL, or
+  installation and capability (a task binding) match. The command
+  lists each switch it kept. Grants through policy rather than a switch
+  (`users.role`, `is_owner`, access group and per-account permissions) are
+  restored as the backup has them; the credential carry above refuses
+  credentials whose account gains authority that way. Every other boolean
+  column of a restored table is in `restoredFlagColumns` with why the
+  backup's value is safe, and `TestEveryTableIsClassifiedDB` fails on one in
+  neither list.
+- Every server setting has exactly one kind (`SettingKindOf`,
+  `settings_classes.go`), which both restores read: restored as the backup
+  has it, server-specific (never written by a selective restore), stricter
+  of backup and live (`accessSettings`), or part of a service route
+  (`settingRoutes`: an address and the secrets sent there, restored
+  together). `TestEverySettingIsClassified` enumerates the registries (admin
+  defaults, sensitive settings, branding assets, rate limits, and the keys
+  the server writes for itself) and fails on a setting with no kind or an
+  entry that names none.
+- It also keeps the live value of each stricter setting the backup would
+  widen (`accessSettings` in `settings_access.go`): who may sign in and how (local password
+  sign-in, email auto-match, sign-up, self-service password reset, the
+  Jellyfin and Audiobookshelf sign-in surfaces), session, token, and
+  provider re-check lifetimes and the provider outage policy, what a
+  rating-capped profile sees (`access.unrated_content`), private-network
+  destinations, trusted proxies (a list that trusts any network the live
+  one does not is wider), mail transport security, and the sign-in rate
+  limits (`ratelimit.enabled`, `ratelimit.auth.*`, `ratelimit.ip.*`), and
+  the delivery switches (`email.enabled` and the email, Web Push, webhook,
+  Apple and Android push, Discord, server-channel, and fan-out notification
+  switches), so a channel an admin turned off stays off while its live
+  destinations are carried, the release-event pause and in-app
+  notifications, downloads, the AI, transcription, recommendation, and
+  semantic-search providers that receive library data, marker sharing and
+  online marker lookups, and LAN discovery. Every other switch setting is in
+  `restoredFlagSettings` with its reason (`TestEverySwitchSettingIsDecided`).
+  The
+  live row is copied as stored, so an encrypted value stays bound to its
+  key name; values are compared decrypted, and one that does not decrypt
+  counts as wider. The command lists each setting it kept.
+- Separate mode (`--into`) restores a copy, not the live server: it deletes
+  the backup's carried credentials and carries none.
 
 ### Separate mode
 
 `silo backup restore --from <backup> --into <database URL> --blobs-into <dir>`
 restores into a pre-created empty database and a separate directory laid out
-as a local store root, changing nothing in the live deployment. It needs no
+as a local store root, changing nothing in the live deployment. Before
+anything is written it refuses a target that would overwrite something,
+since a copy keeps nothing it replaces: `--into` must not be the live
+database (`DATABASE_URL`, compared by host, port, and database as pgx
+resolves them), and `--blobs-into` must be missing or an empty directory
+and not the live server's local file storage (read from its settings when
+`DATABASE_URL` is set; symbolic links resolved). It needs no
 `CREATEDB` or rename privilege. After `pg_restore --exit-on-error
 --no-owner --no-privileges`, it verifies the schema version, the applied
 migrations, and the table inventory against the manifest. It then deletes
 the recorded storage identities (`artwork.storage_identity`,
 `storage.operational_identity`) from the target: they name the backed-up
 server's stores, so a server started on the copy would refuse the stores it
-is configured with. That server records its own on its first start or write.
+is configured with. That server records its own on its first start or write. The copy
+gets none of the backup's long-lived credentials
+([Credentials](#credentials)).
 The target stays open for the operator to point `DATABASE_URL` and the
 artwork storage settings at. `--database-only` replaces `--blobs-into` and warns that uploaded
 artwork, avatars, and branding will be missing. Separate mode clears no
@@ -1091,6 +1473,22 @@ Redis: the live deployment may still be running on it, and which Redis a
 server on the restored database will use is not known here. The command
 says to run `FLUSHDB` on that Redis database, or use an empty one, before
 starting Silo on the restored database.
+
+A database URL given on the command line (`--into`, `silo backup verify
+--scratch`) must not carry a password, an `sslpassword`, or inline key
+material: any account on the host can read a running command's arguments.
+The command refuses one and points to `PGPASSWORD` or a password file
+(`~/.pgpass`, `PGPASSFILE`), and to a service file (`PGSERVICEFILE`) for an
+`sslpassword`, which both the command and `pg_restore` read.
+
+A swap reaches the maintenance database and the databases it creates through
+URLs derived from `DATABASE_URL` with only the database changed. The
+database is replaced wherever the URL can name it: the path and a `dbname`
+query parameter (which overrides the path in libpq and pgx), or every
+`dbname` of a key=value string. The live database's name is read the same
+way. A URL using a connection service (`service`, `servicefile`) is refused,
+since the service file can name the database; host and port overrides are
+kept, because they pick the server, which stays the same.
 
 ### Swap mode: never destroy first
 
@@ -1100,6 +1498,14 @@ every server and turns off automatic restarts (Compose `restart`, Kubernetes
 replicas set to 0), so nothing can write blobs. The command cannot prove that,
 so it refuses while any other client is connected to the live database and
 closes the database as an extra guard.
+
+Before anything else, the restore takes the full-restore lock: a session
+advisory lock on its control connection (`PGControl.LockRestore`, keys
+`"SRST"` and the live database's name hashed, apart from the subsystem lock),
+held until the command returns or its connection drops. A second restore or
+`--recover` of the same database fails at once with `ErrRestoreRunning`,
+naming the holder's process: each control connection is on the maintenance
+database, so neither preflight would see the other.
 
 1. Validate (above).
 2. Preflight on a control connection to the maintenance database
@@ -1112,9 +1518,14 @@ closes the database as an extra guard.
 4. Verify it: schema version, applied migrations, and inventory match the
    manifest, no applied migration is one this binary does not carry, and the
    restored settings record the storage location the live stores are. Then
-   close it to connections and end the command's sessions on it.
-5. Quiesce the live database: `ALLOW_CONNECTIONS false`, then end any session
-   that appeared since step 2. The journal starts just before this, in
+   replace its credentials with the live ones ([Credentials](#credentials)),
+   close it to connections, and end the command's sessions on it.
+5. Quiesce the live database: `ALLOW_CONNECTIONS false`. The carried
+   credentials are the live ones only while no other client is on the live
+   database, so a client that connected since step 2 stops the restore
+   (`ErrLiveInUse`), both just before the credentials are read and here,
+   once the database is closed; its session is never ended, which would lose
+   what it changed. The live database is reopened and left unchanged. The journal starts just before this, in
    `silo-restore-<time>.journal` in the working directory (each record
    synced, and the directory synced once the file exists, so its name
    survives a host crash; if that cannot be done the swap stops before
@@ -1134,14 +1545,17 @@ closes the database as an extra guard.
 8. The old database stays closed and the overwritten-blobs folder stays. The
    command prints how to drop them once the restored server works, or how to
    go back.
-9. Clear Redis, unless `--keep-redis`: `FLUSHDB` on the database the live
-   deployment is configured with (`REDIS_URL` when set, otherwise the
-   `redis.url` and `redis.db` settings read from the live database before
-   step 2), never `FLUSHALL`, so no server serves sessions, caches, or
+9. Clear Redis, unless `--keep-redis`: `FLUSHDB` on the database the
+   restored server will use (`REDIS_URL` when set, otherwise the
+   `redis.url` and `redis.db` settings read from the restored database now
+   live), never `FLUSHALL`, so no server serves sessions, caches, or
    coordination state from before the restore. A deployment without Redis
    skips this. The restore has finished by now, so a Redis that cannot be
    reached or cleared does not fail it: the command warns and prints the
-   `redis-cli -n <db> FLUSHDB` to run before starting Silo.
+   `redis-cli -n <db> FLUSHDB` to run before starting Silo. When the
+   restored settings cannot be read, it clears nothing, since the Redis the
+   database named before the swap may not be the restored server's, and
+   warns the operator to clear the one Silo uses.
 
 A failure in step 6, or before the second rename completes, rolls back with
 connections blocked throughout and the live database reopened last:

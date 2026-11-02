@@ -1,6 +1,9 @@
 package backup
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -30,11 +33,23 @@ const (
 	// StatusIncomplete: no manifest and nothing running; the sweep deletes it
 	// after 24 hours.
 	StatusIncomplete Status = "incomplete"
+	// StatusUnverified: a manifest this server cannot authenticate: written
+	// under another SECRET_KEY or with none recorded, or one naming this key
+	// that does not verify (then nothing in it is shown). A restore from it
+	// needs the admin's confirmation, and from a tampered one is refused.
+	StatusUnverified Status = "unverified"
 )
 
 // Manifest is manifest.json, written after every other object. Readers accept
 // every version up to manifestVersion and refuse a newer one.
 type Manifest struct {
+	// storedSize is the manifest object's own size, when it was read from a
+	// destination (readManifest).
+	storedSize int64
+	// authenticated is set when a read verified the MAC under this
+	// server's SECRET_KEY (checkMAC).
+	authenticated bool
+
 	Format      string    `json:"format"`
 	Version     int       `json:"version"`
 	ID          string    `json:"id"`
@@ -63,14 +78,89 @@ type Manifest struct {
 	// while streaming, or "read_back" from the stored object.
 	TOCCheck string `json:"toc_check"`
 
-	Blobs        BlobSummary   `json:"blobs"`
-	MissingBlobs []MissingBlob `json:"missing_blobs"`
+	Blobs BlobSummary `json:"blobs"`
+	// MissingBlobs lists at most maxRecordedMissingBlobs of the blobs the
+	// backup found gone; MissingBlobsTotal counts them all when it lists
+	// fewer.
+	MissingBlobs      []MissingBlob `json:"missing_blobs"`
+	MissingBlobsTotal int           `json:"missing_blobs_total,omitempty"`
 	// Tables is the core table inventory from the backup's snapshot. Full
 	// restore compares the restored database with it, presence and counts.
 	Tables []TableCount `json:"tables"`
 	// RestoreSet describes restore-set.tar, the sections selective restore
 	// reads. Absent when the backup has none.
 	RestoreSet *RestoreSetSummary `json:"restore_set,omitempty"`
+	// MAC authenticates every other field: HMAC-SHA256, under the key
+	// secret.BackupManifestKey derives from SECRET_KEY, of the manifest
+	// encoded with MAC empty, in hex. Anyone who can write the destination
+	// can change objects and their checksums together; only a server with
+	// SECRET_KEY can write a MAC that verifies (checkMAC).
+	MAC string `json:"mac,omitempty"`
+}
+
+// Errors of a manifest's MAC.
+var (
+	// ErrManifestTampered refuses a manifest written under this server's
+	// SECRET_KEY whose MAC is missing or does not verify: it, or an object
+	// it describes, was changed since the backup wrote it.
+	ErrManifestTampered = errors.New("the backup's manifest does not verify under this server's SECRET_KEY: it was changed after the backup was written")
+)
+
+// macInput is what a manifest's MAC covers: the manifest encoded with MAC
+// empty. Encoding the decoded manifest again is stable: every field
+// round-trips, and a manifest from a newer format is refused before.
+func (m *Manifest) macInput() ([]byte, error) {
+	c := *m
+	c.MAC = ""
+	return json.Marshal(&c)
+}
+
+// sign sets m.MAC under key; a nil key leaves m unsigned.
+func (m *Manifest) sign(key []byte) error {
+	if key == nil {
+		return nil
+	}
+	data, err := m.macInput()
+	if err != nil {
+		return err
+	}
+	mac := hmac.New(sha256.New, key)
+	mac.Write(data)
+	m.MAC = hex.EncodeToString(mac.Sum(nil))
+	return nil
+}
+
+// checkMAC authenticates m for a server whose SECRET_KEY has check value
+// keyCheck and manifest key key, as a strict state machine:
+//
+//   - a manifest naming this key's check value must carry a MAC that
+//     verifies (ErrManifestTampered otherwise, a missing MAC included);
+//   - one without a check value or a MAC, or naming another key, cannot be
+//     authenticated here: authenticated is false, and the caller refuses it
+//     unless the operator confirmed (a full restore's
+//     --accept-lost-credentials, a selective restore's confirmation).
+//
+// Every Silo that writes manifests signs them, so a legitimate one from
+// this server always verifies. Without a key (key nil) nothing can be
+// authenticated.
+func (m *Manifest) checkMAC(key []byte, keyCheck string) (authenticated bool, err error) {
+	if key == nil || keyCheck == "" || m.KeyCheck != keyCheck {
+		return false, nil
+	}
+	want, err := hex.DecodeString(m.MAC)
+	if err != nil || len(want) != sha256.Size {
+		return false, ErrManifestTampered
+	}
+	data, err := m.macInput()
+	if err != nil {
+		return false, err
+	}
+	mac := hmac.New(sha256.New, key)
+	mac.Write(data)
+	if !hmac.Equal(mac.Sum(nil), want) {
+		return false, ErrManifestTampered
+	}
+	return true, nil
 }
 
 // RestoreSetSummary is the manifest's record of restore-set.tar: its format
@@ -81,6 +171,11 @@ type RestoreSetSummary struct {
 	// Omitted lists items the restore set could not carry; the backup is
 	// complete with warnings.
 	Omitted []OmittedItem `json:"omitted,omitempty"`
+	// IndexSHA256 is the digest of the restore set's index, its first
+	// entry. With the manifest authenticated, a read checks the index
+	// against it before decoding it, and the archive against its object
+	// digest before decoding any document.
+	IndexSHA256 string `json:"index_sha256,omitempty"`
 }
 
 // ObjectEntry is one stored object: its size and the SHA-256 of the bytes as
@@ -143,6 +238,15 @@ func (m *Manifest) object(name string) (ObjectEntry, bool) {
 // ParseManifest decodes manifest.json and refuses a format it cannot read or
 // a manifest whose contents a restore could not check against: a restore's
 // verification is only as strong as the inventory and checksums here.
+// MaxManifestBytes bounds a manifest: what readers read of one, and what
+// a backup may write.
+const MaxManifestBytes = 16 << 20
+
+// maxRecordedMissingBlobs bounds the missing blobs a manifest lists, so a
+// store that lost most of its objects cannot grow the manifest past
+// MaxManifestBytes.
+const maxRecordedMissingBlobs = 10_000
+
 func ParseManifest(data []byte) (*Manifest, error) {
 	var m Manifest
 	if err := json.Unmarshal(data, &m); err != nil {
@@ -235,6 +339,9 @@ func (r *RestoreSetSummary) validate() error {
 	}
 	if r.FormatVersion < 1 {
 		return fmt.Errorf("restore set format version %d is not valid", r.FormatVersion)
+	}
+	if r.IndexSHA256 != "" && !sha256Hex.MatchString(r.IndexSHA256) {
+		return errors.New("restore set index digest is not valid")
 	}
 	for id, count := range r.Sections {
 		if _, known := sectionByID(id); !known && (r.FormatVersion <= restoreSetVersion || !validSectionID(id)) {

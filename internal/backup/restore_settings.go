@@ -2,7 +2,6 @@ package backup
 
 import (
 	"slices"
-	"sort"
 	"strings"
 
 	"github.com/Silo-Server/silo-server/internal/branding"
@@ -38,9 +37,9 @@ type SettingsPage struct {
 // page edits.
 var settingsPages = []SettingsPage{
 	{"general", "General"}, {pageAppearance, "Appearance"}, {"storage", "Storage"}, {"logging", "Logging"},
-	{"sign-in", "Sign-in"}, {"security", "Security"}, {pageLibrary, "Library & Metadata"}, {"search", "Search"},
+	{pageSignIn, "Sign-in"}, {"security", "Security"}, {pageLibrary, "Library & Metadata"}, {"search", "Search"},
 	{"playback", "Playback"}, {"downloads", "Downloads"}, {"requests", "Requests"}, {"providers", "Providers"},
-	{"ai", "AI Services"}, {"email", "Email"}, {"notifications", "Notifications"}, {"compatibility", "Compatibility"},
+	{"ai", "AI Services"}, {pageEmail, "Email"}, {"notifications", "Notifications"}, {"compatibility", "Compatibility"},
 	{"recommendations", "Recommendations"}, {"nodes", "Nodes"}, {pageBackups, "Backups"}, {pageOther, "Other settings"},
 }
 
@@ -59,19 +58,25 @@ const (
 	pageAppearance = "appearance"
 	pageBackups    = "backups"
 	pageLibrary    = "library"
+	pageSignIn     = "sign-in"
+	pageEmail      = "email"
 )
+
+// settingRateLimitOn is the switch that throttles sign-in.
+const settingRateLimitOn = "ratelimit.enabled"
 
 type settingRule struct {
 	page  string
 	class SettingClass
 }
 
-// settingRulesByPage is the allowlist, grouped by the admin page that edits
-// each setting: every restorable key or key prefix (ending in "." or "_")
-// with its class. Exact keys win over prefixes, and a longer prefix over a
-// shorter one. A key that matches nothing is never offered, and
-// TestEverySettingIsClassified fails for any admin setting default left out,
-// so a new setting must be classified here.
+// settingRulesByPage places each setting on the admin page that edits it,
+// with how the review shows it: portable, connecting to an outside service,
+// or server-specific. Whether a restore writes a setting at all is its
+// kind (SettingKindOf, the one classification both restores read); a key's
+// server-specific class here must match that kind, which
+// TestEverySettingHasAPage checks with every other setting having a page.
+// Exact keys win over prefixes, and a longer prefix over a shorter one.
 var settingRulesByPage = []struct {
 	page  string
 	rules map[string]SettingClass
@@ -80,7 +85,7 @@ var settingRulesByPage = []struct {
 		"server.identity_id":       SettingServerSpecific,
 		"server.public_url":        SettingServerSpecific,
 		"server.local_url":         SettingServerSpecific,
-		"clientip.trusted_proxies": SettingServerSpecific,
+		"clientip.trusted_proxies": SettingPortable,
 		"database.":                SettingServerSpecific,
 		"redis.":                   SettingServerSpecific,
 		"userdb.":                  SettingServerSpecific,
@@ -108,15 +113,20 @@ var settingRulesByPage = []struct {
 		"opslog.":          SettingPortable,
 		"policy.":          SettingPortable,
 	}},
-	{"sign-in", map[string]SettingClass{
-		"auth.jwt_secret": SettingServerSpecific,
-		"auth.":           SettingPortable,
+	{pageSignIn, map[string]SettingClass{
+		settingJWTSecret: SettingServerSpecific,
+		"auth.":          SettingPortable,
+		// Who may sign in and how: restored only when no wider than here
+		// (SettingKindStricter).
 		"signup.":         SettingPortable,
 		"password_reset.": SettingPortable,
 	}},
 	{"security", map[string]SettingClass{
-		"ratelimit.":     SettingServerSpecific,
-		"media_servers.": SettingPortable,
+		"ratelimit.":       SettingServerSpecific,
+		settingRateLimitOn: SettingPortable,
+		"ratelimit.auth.":  SettingPortable,
+		"ratelimit.ip.":    SettingPortable,
+		"media_servers.":   SettingPortable,
 	}},
 	{pageLibrary, map[string]SettingClass{
 		"access.":    SettingPortable,
@@ -163,13 +173,16 @@ var settingRulesByPage = []struct {
 		"ai.text_provider_id":   SettingServerSpecific,
 		"ai.speech_provider_id": SettingServerSpecific,
 		"ai.api_key":            SettingExternalService,
+		"ai.base_url":           SettingExternalService,
+		"ai.asr_base_url":       SettingExternalService,
+		"subtitle_ai.base_url":  SettingExternalService,
 		"ai.asr_api_key":        SettingExternalService,
 		"subtitle_ai.api_key":   SettingExternalService,
 		"ai.":                   SettingPortable,
 		"subtitle_ai.":          SettingPortable,
 		"metadata_ai.":          SettingPortable,
 	}},
-	{"email", map[string]SettingClass{
+	{pageEmail, map[string]SettingClass{
 		"email.": SettingExternalService,
 	}},
 	{"notifications", map[string]SettingClass{
@@ -181,12 +194,13 @@ var settingRulesByPage = []struct {
 		"notifications.":                       SettingPortable,
 	}},
 	{"compatibility", map[string]SettingClass{
-		"audiobooks.abs.jwt_secret":       SettingServerSpecific,
+		settingABSJWTSecret:               SettingServerSpecific,
 		"jellyfin_compat.public_url":      SettingServerSpecific,
 		"jellyfin_compat.web_install_dir": SettingServerSpecific,
-		"jellyfin_compat.server_id":       SettingServerSpecific,
-		"jellyfin_compat.":                SettingPortable,
-		"audiobookshelf_compat.":          SettingPortable,
+		// Where the server downloads the Jellyfin web client it serves.
+		"jellyfin_compat.web_source_url": SettingExternalService,
+		"jellyfin_compat.":               SettingPortable,
+		"audiobookshelf_compat.":         SettingPortable,
 	}},
 	{"recommendations", map[string]SettingClass{
 		"recommendations.embedding_provider_id": SettingServerSpecific,
@@ -196,6 +210,7 @@ var settingRulesByPage = []struct {
 		"recommendations.policy_marked_generation": SettingServerSpecific,
 		"recommendations.embedding_auth_token":     SettingExternalService,
 		"recommendations.openai_api_key":           SettingExternalService,
+		"recommendations.embedding_base_url":       SettingExternalService,
 		"recommendations.":                         SettingPortable,
 	}},
 	{"nodes", map[string]SettingClass{
@@ -251,28 +266,19 @@ func classifySetting(key string) (settingRule, bool) {
 	return settingRules[best], true
 }
 
-// RestorableSetting reports the page and class of a key a restore offers.
-// Server-specific keys, keys another section restores, and unclassified keys
-// are not offered.
+// RestorableSetting reports the page and class of a key a selective restore
+// offers: one whose kind is not server-specific (SettingKindOf), on a page
+// that edits it. Keys another section restores (branding assets) and keys
+// with no page are not offered.
 func RestorableSetting(key string) (settingRule, bool) {
+	if kind, ok := SettingKindOf(key); !ok || kind == SettingKindServerSpecific {
+		return settingRule{}, false
+	}
 	rule, ok := classifySetting(key)
 	if !ok || (rule.class != SettingPortable && rule.class != SettingExternalService) {
 		return settingRule{}, false
 	}
 	return rule, true
-}
-
-// ServerSpecificSettings lists the keys and prefixes (ending in "." or "_")
-// a restore never writes, sorted.
-func ServerSpecificSettings() []string {
-	var out []string
-	for key, rule := range settingRules {
-		if rule.class == SettingServerSpecific {
-			out = append(out, key)
-		}
-	}
-	sort.Strings(out)
-	return out
 }
 
 // SettingsPages lists the pages in display order.

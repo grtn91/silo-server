@@ -123,6 +123,14 @@ func (p *planner) planHomeSection(ctx context.Context, e HomeSectionEntry, libMa
 		plan.item.Status, plan.item.Message = ItemNotOnThisServer, "This server cannot restore page sections."
 		return plan, nil
 	}
+	if c := e.Collection; c != nil {
+		in := collectionInput(c.CollectionEntry)
+		in.ManagementMode, in.ManagementSource, in.ManagementKey = managementSection, c.ManagementSource, c.ManagementKey
+		if err := p.checkCollection(in); err != nil {
+			plan.item.Status, plan.item.Reason, plan.item.Message = ItemNotOnThisServer, ReasonUnreadable, refusedMessage(err)
+			return plan, nil
+		}
+	}
 	libraries := sectionConfigLibraries(e.Config)
 	if e.LibraryID != nil {
 		libraries = append([]int{*e.LibraryID}, libraries...)
@@ -426,7 +434,11 @@ func (a *applier) applyHomeSection(ctx context.Context, tx pgx.Tx, id string) (a
 	} else {
 		item.Message = plan.item.Message
 	}
-	return applied{item: item}, nil
+	out := applied{item: item}
+	if e.Collection != nil {
+		out.after = a.smartCollectionCreated(e.Collection.CollectionType, collection)
+	}
+	return out, nil
 }
 
 // freeSectionID keeps the backup's section id when no section here has it.
@@ -461,6 +473,9 @@ func (a *applier) restoreManagedCollection(ctx context.Context, tx pgx.Tx, e Hom
 		return "", err
 	}
 	if existing != "" {
+		if err := catalog.LockLibraryCollectionInTx(ctx, tx, existing); err != nil {
+			return "", err
+		}
 		_, err = catalog.AddMissingItemsInTx(ctx, tx, existing, items)
 		return existing, err
 	}

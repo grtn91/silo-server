@@ -48,6 +48,14 @@ export const REASON_SENTENCES: Record<RestoreReason, string> = {
     "This server's starter packs don't have its template, or the template doesn't suit the library.",
   collection_not_mapped:
     "The collection it shows isn't on this server or in the backup, so there's nothing for it to show.",
+  unreadable: "The backup's copy of it can't be read, so it was left out.",
+  files_missing_here: "Its files are missing on this server. Restoring writes them back.",
+  needs_install:
+    "It isn't installed here. Install it from a plugin catalog, then restore it again for its settings. A restore never installs a plugin from a backup.",
+  kept_stricter:
+    "Its settings that differ would widen access, so this server keeps its stricter current values.",
+  unverified_backup:
+    "It connects to outside services, so it isn't restored from a backup this server can't verify.",
 };
 
 export const SECTION_TITLES: Record<RestoreSectionId, string> = {
@@ -635,6 +643,31 @@ export function restoreCaveats(set: RestoreSet, selection: SelectionKeys): Cavea
       add(
         "key",
         `${plural(otherKey, "encrypted setting")} saved with a different SECRET_KEY ${otherKey === 1 ? "is" : "are"} left out.`,
+      );
+    }
+    const stricter = (item.settings ?? []).filter(
+      (setting) => setting.status === "kept_stricter",
+    ).length;
+    const cleared = (item.settings ?? []).filter((setting) => setting.status === "cleared").length;
+    if (cleared > 0) {
+      add(
+        "cleared",
+        "A service's address changes without its credentials in the backup, so restoring clears them here and turns the service off until they're entered again.",
+      );
+    }
+    const unverified = (item.settings ?? []).filter(
+      (setting) => setting.status === "unverified_backup",
+    ).length;
+    if (unverified > 0) {
+      add(
+        "unverified",
+        `${plural(unverified, "setting")} that ${unverified === 1 ? "connects" : "connect"} to outside services ${unverified === 1 ? "isn't" : "aren't"} restored from a backup this server can't verify.`,
+      );
+    }
+    if (stricter > 0) {
+      add(
+        "stricter",
+        `${plural(stricter, "setting")} would widen access, so this server keeps ${stricter === 1 ? "its" : "their"} stricter current ${stricter === 1 ? "value" : "values"}.`,
       );
     }
     const unknown = item.collection?.unknown_items ?? 0;

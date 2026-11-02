@@ -11,6 +11,15 @@ import (
 type fakeProfileTransfer struct {
 	exports []string
 	imports []backup.ProfileImportScope
+	// busy refuses every transfer slot.
+	busy bool
+}
+
+func (f *fakeProfileTransfer) Admit(ctx context.Context, _ int) (context.Context, func(), error) {
+	if f.busy {
+		return ctx, nil, backup.ErrProfileTransferBusy
+	}
+	return ctx, func() {}, nil
 }
 
 func (f *fakeProfileTransfer) Capability() backup.ProfileExportCapability {
@@ -51,5 +60,12 @@ func TestProfileTransferActsOnTheVerifiedProfile(t *testing.T) {
 	requireProblem(t, do(t, h, http.MethodPost, Prefix+"/profile/import", doc, with(bearer(apiKeyToken), "X-Profile-Id", "p-locked")), TypeProfileVerificationRequired)
 	if len(f.imports) != 1 {
 		t.Fatalf("a refused import reached the service: %+v", f.imports)
+	}
+
+	// A busy server refuses the import before reading it.
+	f.busy = true
+	requireProblem(t, do(t, h, http.MethodPost, Prefix+"/profile/import", doc, with(bearer(memberToken), "X-Profile-Id", "p-owner")), TypeConflict)
+	if len(f.imports) != 1 {
+		t.Fatalf("an import refused for a busy server reached the service: %+v", f.imports)
 	}
 }

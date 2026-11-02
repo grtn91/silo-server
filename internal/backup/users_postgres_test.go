@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -172,7 +173,7 @@ func seedUsers(t *testing.T, f *selectiveFixture) userSeed {
 		s.alice, "pa-kids-"+s.suffix, s.lib1, s.lib2)
 	avatarDir := "profile-avatars/" + strconv.Itoa(s.alice) + "/pa-main-" + s.suffix + "/"
 	for name, data := range map[string]string{"original.webp": "avatar", "w256.webp": "avatar small"} {
-		if err := f.store.Put(ctx, avatarDir+name, []byte(data)); err != nil {
+		if err := f.store.Put(ctx, avatarDir+name, testImage(t, data)); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -200,7 +201,7 @@ func seedUsers(t *testing.T, f *selectiveFixture) userSeed {
 		s.collectionID, s.alice, main, poster)
 	dbExec(t, pool, `INSERT INTO user_personal_collection_items (user_id, collection_id, media_item_id, position) VALUES ($1, $2, $3, 0), ($1, $2, $4, 1)`,
 		s.alice, s.collectionID, s.movies[0], s.movies[2])
-	if err := f.store.Put(ctx, poster, []byte("collection poster")); err != nil {
+	if err := f.store.Put(ctx, poster, testImage(t, "collection poster")); err != nil {
 		t.Fatal(err)
 	}
 	seedUserAuthored(t, f, &s, main)
@@ -313,6 +314,21 @@ func (f *selectiveFixture) moveToAnotherServer(t *testing.T, backupID string) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		if path.Base(obj.Key) == ManifestName {
+			// The copy is a backup of this server now: its manifest names it,
+			// signed with this server's key as a backup here writes it.
+			m, err := ParseManifest(data)
+			if err != nil {
+				t.Fatal(err)
+			}
+			m.ServerID = f.serverID
+			if err := m.sign(f.svc.opts.ManifestKey); err != nil {
+				t.Fatal(err)
+			}
+			if data, err = json.Marshal(m); err != nil {
+				t.Fatal(err)
+			}
+		}
 		if err := f.store.Put(ctx, folderPrefix(f.serverID, backupID)+strings.TrimPrefix(obj.Key, from), data); err != nil {
 			t.Fatal(err)
 		}
@@ -347,7 +363,7 @@ func TestUserRestoreDB(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.loseUsers(t, &s, source.ID)
-	preview, err := f.svc.Preview(ctx, source.ID)
+	preview, err := f.svc.Preview(ctx, source.ID, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -815,9 +831,21 @@ func TestProfileTransferDB(t *testing.T) {
 		}
 	}
 
+	// After the commit the import names the profile's items, so their
+	// notification interest is recomputed as the user store's writes do.
+	var told []string
+	transfer.SetItemsChanged(func(userID int, profileID string, items []string) {
+		if userID == user && profileID == dst {
+			told = items
+		}
+	})
 	res, err := transfer.Import(ctx, ProfileImportScope{UserID: user, ProfileID: dst}, data)
 	if err != nil {
 		t.Fatal(err)
+	}
+	transfer.SetItemsChanged(nil)
+	if len(told) == 0 {
+		t.Fatal("the import named no changed items after its commit")
 	}
 	if !res.SameServer || countRows(t, pool, `SELECT count(*) FROM user_favorites WHERE user_id = $1 AND profile_id = $2`, user, dst) != 3 ||
 		countRows(t, pool, `SELECT count(*) FROM user_library_playback_preferences WHERE user_id = $1 AND profile_id = $2`, user, dst) != 2 {
@@ -913,7 +941,7 @@ func TestUserRestoreSameServerDB(t *testing.T) {
 	}
 	dbExec(t, f.pool, `DELETE FROM user_profiles WHERE user_id = $1 AND id = $2`, account, gone)
 	dbExec(t, f.pool, `DELETE FROM user_watch_progress WHERE user_id = $1`, account)
-	preview, err := f.svc.Preview(ctx, source.ID)
+	preview, err := f.svc.Preview(ctx, source.ID, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -970,7 +998,7 @@ func TestOmittedAccountIsReportedDB(t *testing.T) {
 	if source.Status != StatusCompleteWithWarnings || !slices.ContainsFunc(source.Omitted, isOurs) {
 		t.Fatalf("backup = %s, omitted %+v", source.Status, source.Omitted)
 	}
-	preview, err := f.svc.Preview(ctx, source.ID)
+	preview, err := f.svc.Preview(ctx, source.ID, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1025,7 +1053,7 @@ func TestEmailLessAccountRestoreDB(t *testing.T) {
 
 	// Same server: the account, which lost its progress, matches by id.
 	dbExec(t, f.pool, `DELETE FROM user_watch_progress WHERE user_id = $1`, a)
-	preview, err := f.svc.Preview(ctx, source.ID)
+	preview, err := f.svc.Preview(ctx, source.ID, false)
 	if err != nil {
 		t.Fatalf("same-server preview with email-less accounts: %v", err)
 	}
@@ -1038,7 +1066,7 @@ func TestEmailLessAccountRestoreDB(t *testing.T) {
 	dbExec(t, f.pool, `DELETE FROM users WHERE id = ANY($1)`, []int{a, b})
 	emailLessAccount(t, f.pool, "ne-here-"+sfx, "pne-here-"+sfx, movie)
 	f.moveToAnotherServer(t, source.ID)
-	preview, err = f.svc.Preview(ctx, source.ID)
+	preview, err = f.svc.Preview(ctx, source.ID, false)
 	if err != nil {
 		t.Fatalf("cross-server preview with email-less accounts: %v", err)
 	}
@@ -1167,7 +1195,8 @@ func pendingOf(p PreviewProfile) map[string]int {
 //   - a play, a rating, and a profile preference changed since make that
 //     account and profile differ, with one pending change in each type;
 //   - a profile the backup has and this server lost makes its account
-//     differ;
+//     differ, and the profile sharing a collection with it stays
+//     selectable, since sharing is restored from the owner's collections;
 //   - after the restore, a fresh preview finds the account the same again.
 func TestMatchedAccountPendingDB(t *testing.T) {
 	f := newSelectiveFixture(t)
@@ -1190,6 +1219,10 @@ func TestMatchedAccountPendingDB(t *testing.T) {
 	bob := testAccount(t, pool, "pend-bob-"+sfx, "h", nil, nil)
 	testProfile(t, pool, bob, "pb-main-"+sfx, "Main", true, "")
 	testProfile(t, pool, bob, "pb-kids-"+sfx, "Kids", false, "")
+	// Bob's main profile shares a collection with Kids.
+	dbExec(t, pool, `INSERT INTO user_personal_collections (id, user_id, profile_id, creator_profile_id, name, native) VALUES ($1, $2, $3, $3, 'Shared', true)`,
+		"pcb-"+sfx, bob, "pb-main-"+sfx)
+	dbExec(t, pool, `INSERT INTO user_personal_collection_profiles (user_id, collection_id, profile_id) VALUES ($1, $2, $3)`, bob, "pcb-"+sfx, "pb-kids-"+sfx)
 
 	source, err := backupUnderLock(t, f.svc, KindManual)
 	if err != nil {
@@ -1197,7 +1230,7 @@ func TestMatchedAccountPendingDB(t *testing.T) {
 	}
 	preview := func() *RestorePreview {
 		t.Helper()
-		p, err := f.svc.Preview(ctx, source.ID)
+		p, err := f.svc.Preview(ctx, source.ID, false)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1239,8 +1272,16 @@ func TestMatchedAccountPendingDB(t *testing.T) {
 	if profile.Status != ItemDiffers || !profile.Selectable {
 		t.Fatalf("changed profile = %+v", profile)
 	}
-	if got := previewItem(t, p, SectionUsers, strconv.Itoa(bob)); got.Status != ItemDiffers || !got.Selectable {
+	got := previewItem(t, p, SectionUsers, strconv.Itoa(bob))
+	if got.Status != ItemDiffers || !got.Selectable {
 		t.Fatalf("account missing a profile = %+v", got)
+	}
+	// Sharing comes back from the owner's collections, so the owner whose
+	// data is otherwise the same stays selectable beside the lost profile.
+	for _, pr := range got.Account.Profiles {
+		if pr.ID == "pb-main-"+sfx && (!pr.Selectable || !strings.Contains(pr.Message, "Kids")) {
+			t.Fatalf("owner of a collection shared with a lost profile = %+v, want selectable with it", pr)
+		}
 	}
 
 	f.restoreUsers(t, source.ID, p.Digest, []UserSelection{{Account: strconv.Itoa(alice), Target: strconv.Itoa(alice),
@@ -1278,7 +1319,7 @@ func TestFreshBackupComparesSameDB(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	preview, err := f.svc.Preview(t.Context(), source.ID)
+	preview, err := f.svc.Preview(t.Context(), source.ID, false)
 	if err != nil {
 		t.Fatal(err)
 	}

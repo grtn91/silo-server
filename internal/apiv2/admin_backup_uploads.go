@@ -86,6 +86,12 @@ type AdminBackupUploadPath struct {
 	UploadID string `path:"upload_id" pattern:"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"`
 }
 
+// AdminBackupUploadRestoreSetInput names the upload to preview.
+type AdminBackupUploadRestoreSetInput struct {
+	AdminBackupUploadPath
+	AcceptUnauthenticated bool `query:"accept_unauthenticated" default:"false" doc:"Confirms reading an upload, which this server cannot authenticate: it carries no manifest this server signed. Without it the preview answers 409 backup_unauthenticated and nothing inside the upload is read"`
+}
+
 type AdminBackupUploadPartInput struct {
 	AdminBackupUploadPath
 	Part int `path:"part" minimum:"0" maximum:"4095" doc:"The part's position, counting from 0"`
@@ -262,14 +268,17 @@ func registerAdminBackupUploads(reg *Registry, op func(method, path, id, summary
 // as the backup operations do a backup.
 func registerAdminBackupUploadRestore(reg *Registry, op func(method, path, id, summary string) Operation) {
 	preview := op(http.MethodGet, "/uploads/{upload_id}/restore-set", "getAdminBackupUploadRestoreSet",
-		"Preview a complete upload's restore set against this server, as for a backup. The digest is the one frozen when the upload completed. 409 for an upload not yet complete.")
+		"Preview a complete upload's restore set against this server, as for a backup. The digest is the one frozen when the upload completed. 409 for an upload not yet complete, and 409 backup_unauthenticated, before anything inside it is read, without accept_unauthenticated: an upload carries no manifest this server signed.")
 	preview.Errors = []int{http.StatusConflict}
-	Register(reg, preview, func(ctx context.Context, in *AdminBackupUploadPath) (*AdminBackupRestoreSetOutput, error) {
+	Register(reg, preview, func(ctx context.Context, in *AdminBackupUploadRestoreSetInput) (*AdminBackupRestoreSetOutput, error) {
 		svc, p := reg.backups()
 		if p != nil {
 			return nil, p
 		}
-		out, err := svc.PreviewUpload(ctx, in.UploadID)
+		out, err := svc.PreviewUpload(ctx, in.UploadID, in.AcceptUnauthenticated)
+		if errors.Is(err, backup.ErrUnauthenticated) {
+			return nil, backupProblem(err)
+		}
 		if err != nil {
 			return nil, uploadProblem(err)
 		}

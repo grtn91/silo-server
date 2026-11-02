@@ -192,6 +192,10 @@ type userPlanner struct {
 	// pending, set for a preview, counts what a matched account's restore
 	// would change; nil (a restore) skips the count.
 	pending *pendingCompare
+	// users are the backup's accounts; claims counts, per account here, the
+	// backup accounts that match it (sharedTargets).
+	users  []UserDocument
+	claims map[int]int
 }
 
 func (s *Service) newUserPlanner(rs *RestoreSet, q queryer, serverID string, libMap map[int]int) *userPlanner {
@@ -199,7 +203,8 @@ func (s *Service) newUserPlanner(rs *RestoreSet, q queryer, serverID string, lib
 	if s.opts.UserStoreBackend != nil {
 		backend = strings.ToLower(strings.TrimSpace(s.opts.UserStoreBackend()))
 	}
-	return &userPlanner{q: q, sourceID: rs.Index.ServerID, sameServer: rs.Index.ServerID == serverID, libMap: libMap, userStore: backend != "sqlite"}
+	return &userPlanner{q: q, sourceID: rs.Index.ServerID, sameServer: rs.Index.ServerID == serverID, libMap: libMap, userStore: backend != "sqlite",
+		users: rs.Users}
 }
 
 func (u *userPlanner) planAll(ctx context.Context, docs []UserDocument) ([]accountPlan, error) {
@@ -246,6 +251,20 @@ func (u *userPlanner) plan(ctx context.Context, doc *UserDocument) (accountPlan,
 		acct.Target = TargetNew
 		return plan, nil
 	}
+	if match == MatchLogin {
+		// A match by login is a guess; one that another backup account also
+		// matches here would merge two households.
+		claims, err := u.sharedTargets(ctx)
+		if err != nil {
+			return plan, err
+		}
+		if n := claims[localID]; n > 1 {
+			plan.item.Status, plan.item.Reason = ItemAmbiguous, ReasonAmbiguousAccount
+			plan.item.Message = fmt.Sprintf("%d accounts in the backup match the same account here.", n)
+			acct.Match, acct.Target = MatchNew, TargetNew
+			return plan, nil
+		}
+	}
 	plan.localID = localID
 	acct.Target = plan.target()
 	if localID > 0 {
@@ -267,6 +286,27 @@ func (u *userPlanner) plan(ctx context.Context, doc *UserDocument) (accountPlan,
 		}
 	}
 	return plan, nil
+}
+
+// sharedTargets counts, per account here, the backup accounts that match
+// it, read once per planner. A restore plans one account at a time, so it
+// counts them all to see the others.
+func (u *userPlanner) sharedTargets(ctx context.Context) (map[int]int, error) {
+	if u.claims != nil {
+		return u.claims, nil
+	}
+	claims := map[int]int{}
+	for i := range u.users {
+		_, localID, reason, _, err := u.matchAccount(ctx, u.users[i].Account)
+		if err != nil {
+			return nil, err
+		}
+		if reason == "" && localID > 0 {
+			claims[localID]++
+		}
+	}
+	u.claims = claims
+	return claims, nil
 }
 
 // matchAccount finds the account a backup account is here. It never

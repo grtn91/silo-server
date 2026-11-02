@@ -6,11 +6,16 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
 	"github.com/Silo-Server/silo-server/internal/blobstore"
+	"github.com/Silo-Server/silo-server/internal/secret"
+	"github.com/Silo-Server/silo-server/internal/serveridentity"
+	"github.com/Silo-Server/silo-server/internal/subtitles"
 )
 
 // PGLoader restores dumps with pg_restore and reads databases with pgx.
@@ -38,18 +43,27 @@ func (l PGLoader) Empty(ctx context.Context, dbURL string) (bool, error) {
 // Load restores without owners or grants: the restoring role owns everything,
 // which is the role Silo then connects as.
 func (l PGLoader) Load(ctx context.Context, dbURL, dumpPath string) error {
-	target, env, err := libpqTarget(dbURL, "")
+	conn, err := newLibpqConn(dbURL)
 	if err != nil {
 		return err
 	}
-	cmd := exec.CommandContext(ctx, l.Tools.PgRestore, "--exit-on-error", "--no-owner", "--no-privileges", "--no-password", "--dbname="+target, dumpPath) //nolint:gosec // G204: the discovered pg_restore with arguments built here, no shell
-	cmd.Env = append(os.Environ(), env...)
+	defer conn.Close()
+	cmd := exec.CommandContext(ctx, l.Tools.PgRestore, "--exit-on-error", "--no-owner", "--no-privileges", "--no-password", "--dbname="+conn.Conn, dumpPath) //nolint:gosec // G204: the discovered pg_restore with arguments built here, no shell
+	cmd.Env = append(os.Environ(), conn.Env...)
 	stderr := &limitedBuffer{limit: stderrLimit}
 	cmd.Stderr = stderr
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("pg_restore failed: %w: %s", err, strings.TrimSpace(stderr.String()))
 	}
 	return nil
+}
+
+func (l PGLoader) ServerID(ctx context.Context, dbURL string) (string, error) {
+	rows, err := readSettingsAt(ctx, dbURL, []string{serveridentity.Key})
+	if err != nil {
+		return "", err
+	}
+	return rows[serveridentity.Key], nil
 }
 
 func (l PGLoader) Inspect(ctx context.Context, dbURL string) (Inspection, error) {
@@ -77,10 +91,88 @@ func (l PGLoader) UnbindStorage(ctx context.Context, dbURL string) error {
 	return err
 }
 
+func (l PGLoader) ClearUnreadableSettings(ctx context.Context, dbURL string, cipher *secret.Cipher) ([]string, error) {
+	conn, err := pgx.Connect(ctx, dbURL)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = conn.Close(context.WithoutCancel(ctx)) }()
+	rows, err := conn.Query(ctx, `SELECT key, value FROM server_settings ORDER BY key`)
+	if err != nil {
+		return nil, err
+	}
+	var unreadable []string
+	for rows.Next() {
+		var key, value string
+		if err := rows.Scan(&key, &value); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		if !secret.IsEncrypted(value) {
+			continue
+		}
+		if cipher != nil {
+			if _, err := cipher.Decrypt(value, secret.SettingsAAD(key)); err == nil {
+				continue
+			}
+		}
+		unreadable = append(unreadable, key)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil || len(unreadable) == 0 {
+		return nil, err
+	}
+	if _, err := conn.Exec(ctx, `DELETE FROM server_settings WHERE key = ANY($1)`, unreadable); err != nil {
+		return nil, err
+	}
+	return unreadable, nil
+}
+
+func (l PGLoader) DropSubtitles(ctx context.Context, dbURL string, exists func(context.Context, string) (bool, error)) (int, error) {
+	conn, err := pgx.Connect(ctx, dbURL)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = conn.Close(context.WithoutCancel(ctx)) }()
+	rows, err := conn.Query(ctx, `SELECT id, s3_key FROM downloaded_subtitles WHERE provider <> $1`, subtitles.ProviderUpload)
+	if err != nil {
+		return 0, err
+	}
+	type row struct {
+		id  int
+		key string
+	}
+	all, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (row, error) {
+		var out row
+		return out, r.Scan(&out.id, &out.key)
+	})
+	if err != nil {
+		return 0, err
+	}
+	var gone []int
+	for _, r := range all {
+		if exists != nil {
+			present, err := exists(ctx, r.key)
+			if err != nil {
+				return 0, fmt.Errorf("checking %s: %w", r.key, err)
+			}
+			if present {
+				continue
+			}
+		}
+		gone = append(gone, r.id)
+	}
+	if len(gone) == 0 {
+		return 0, nil
+	}
+	tag, err := conn.Exec(ctx, `DELETE FROM downloaded_subtitles WHERE id = ANY($1)`, gone)
+	return int(tag.RowsAffected()), err
+}
+
 // PGControl is the swap's control connection to the maintenance database.
 type PGControl struct {
 	Conn *pgx.Conn
-	// Like is the database whose encoding and libc locale a created
+	// Like is the database whose encoding and locale a created
 	// database copies, so the restored catalog sorts as the live one did.
 	Like string
 }
@@ -150,17 +242,53 @@ func (c *PGControl) CheckPrivileges(ctx context.Context, live string) error {
 }
 
 func (c *PGControl) Create(ctx context.Context, name string) error {
-	var encoding, collate, ctype, provider string
-	err := c.Conn.QueryRow(ctx, `SELECT pg_encoding_to_char(encoding), datcollate, datctype, datlocprovider::text FROM pg_database WHERE datname = $1`, c.Like).Scan(&encoding, &collate, &ctype, &provider)
+	want, err := c.locale(ctx, c.Like)
 	if err != nil {
 		return fmt.Errorf("reading %s's locale: %w", c.Like, err)
 	}
-	sql := "CREATE DATABASE " + ident(name) + " TEMPLATE template0 ENCODING " + quoteLiteral(encoding)
-	if provider == "c" {
-		sql += " LOCALE_PROVIDER libc LC_COLLATE " + quoteLiteral(collate) + " LC_CTYPE " + quoteLiteral(ctype)
+	sql := "CREATE DATABASE " + ident(name) + " TEMPLATE template0 ENCODING " + quoteLiteral(want.encoding) +
+		" LC_COLLATE " + quoteLiteral(want.collate) + " LC_CTYPE " + quoteLiteral(want.ctype)
+	switch want.provider {
+	case "c":
+		sql += " LOCALE_PROVIDER libc"
+	case "i":
+		sql += " LOCALE_PROVIDER icu ICU_LOCALE " + quoteLiteral(want.locale)
+		if want.icuRules != "" {
+			sql += " ICU_RULES " + quoteLiteral(want.icuRules)
+		}
+	case "b":
+		sql += " LOCALE_PROVIDER builtin BUILTIN_LOCALE " + quoteLiteral(want.locale)
+	default:
+		return fmt.Errorf("%s uses locale provider %q, which a restore cannot copy", c.Like, want.provider)
 	}
-	_, err = c.Conn.Exec(ctx, sql)
-	return err
+	if _, err := c.Conn.Exec(ctx, sql); err != nil {
+		return err
+	}
+	// Sorting and case rules (citext logins, names) must match the live
+	// database's, or the swap would change them.
+	got, err := c.locale(ctx, name)
+	if err != nil {
+		return fmt.Errorf("reading %s's locale: %w", name, err)
+	}
+	if got != want {
+		return fmt.Errorf("%s was created with locale %+v, not %s's %+v", name, got, c.Like, want)
+	}
+	return nil
+}
+
+// dbLocale is what decides a database's text sorting and case rules.
+type dbLocale struct {
+	encoding, collate, ctype, provider, locale, icuRules string
+}
+
+// locale reads a database's locale. The ICU or builtin locale column is
+// datlocale from PostgreSQL 17 and daticulocale before, read by name.
+func (c *PGControl) locale(ctx context.Context, name string) (dbLocale, error) {
+	var l dbLocale
+	err := c.Conn.QueryRow(ctx, `SELECT pg_encoding_to_char(d.encoding), d.datcollate, d.datctype, d.datlocprovider::text,
+			COALESCE(to_jsonb(d)->>'datlocale', to_jsonb(d)->>'daticulocale', ''), COALESCE(to_jsonb(d)->>'daticurules', '')
+		FROM pg_database d WHERE d.datname = $1`, name).Scan(&l.encoding, &l.collate, &l.ctype, &l.provider, &l.locale, &l.icuRules)
+	return l, err
 }
 
 func (c *PGControl) Drop(ctx context.Context, name string) error {
@@ -174,17 +302,46 @@ func (c *PGControl) Rename(ctx context.Context, from, to string) error {
 }
 
 func (c *PGControl) AllowConnections(ctx context.Context, name string, allow bool) error {
-	value := "false"
-	if allow {
-		value = "true"
-	}
-	_, err := c.Conn.Exec(ctx, "ALTER DATABASE "+ident(name)+" WITH ALLOW_CONNECTIONS "+value)
+	_, err := c.Conn.Exec(ctx, "ALTER DATABASE "+ident(name)+" WITH ALLOW_CONNECTIONS "+strconv.FormatBool(allow))
 	return err
 }
 
 func (c *PGControl) Terminate(ctx context.Context, name string) error {
 	_, err := c.Conn.Exec(ctx, `SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()`, name)
 	return err
+}
+
+// restoreLockClass is the first key of the full-restore lock, "SRST": a
+// two-key advisory lock never collides with the subsystem's one-key lock
+// (SubsystemLockKey). The second key is the live database's name, hashed.
+const restoreLockClass = 0x53525354
+
+// LockRestore takes a session advisory lock on the control connection, held
+// until unlock or until the connection closes, so a restore that dies
+// releases it. Both restores reach the same maintenance database, which
+// scopes advisory locks.
+func (c *PGControl) LockRestore(ctx context.Context, live string) (func(context.Context), error) {
+	var acquired bool
+	if err := c.Conn.QueryRow(ctx, `SELECT pg_try_advisory_lock($1, hashtext($2))`, int32(restoreLockClass), live).Scan(&acquired); err != nil {
+		return nil, fmt.Errorf("taking the restore lock: %w", err)
+	}
+	if !acquired {
+		var holder string
+		_ = c.Conn.QueryRow(ctx, `
+			SELECT format('process %s, %s, since %s', a.pid, coalesce(nullif(a.application_name, ''), 'no application name'), a.backend_start)
+			FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid
+			WHERE l.locktype = 'advisory' AND l.granted AND l.objsubid = 2 AND l.classid = $1::int4::oid AND l.objid = hashtext($2)::oid
+			LIMIT 1`, int32(restoreLockClass), live).Scan(&holder)
+		if holder == "" {
+			holder = "holder unknown"
+		}
+		return nil, fmt.Errorf("%w (%s): wait for it to finish, or for the other command to exit, and run this again", ErrRestoreRunning, holder)
+	}
+	return func(ctx context.Context) {
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		_, _ = c.Conn.Exec(ctx, `SELECT pg_advisory_unlock($1, hashtext($2))`, int32(restoreLockClass), live)
+	}, nil
 }
 
 func (c *PGControl) Close(ctx context.Context) error { return c.Conn.Close(ctx) }

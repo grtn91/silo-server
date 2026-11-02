@@ -44,7 +44,7 @@ func blockedImporter(t *testing.T, pool *pgxpool.Pool, userID int) int {
 		var pid int
 		err := pool.QueryRow(t.Context(), `
 			SELECT l.pid FROM pg_locks l
-			WHERE l.locktype = 'advisory' AND l.granted AND l.classid = $1 AND l.objid = $2
+			WHERE l.locktype = 'advisory' AND l.granted AND l.objsubid = 2 AND l.classid = $1 AND l.objid = $2
 			  AND EXISTS (SELECT 1 FROM pg_locks w WHERE w.pid = l.pid AND NOT w.granted)
 			LIMIT 1`, preferenceLockClass, userID).Scan(&pid)
 		if err == nil {
@@ -63,8 +63,8 @@ func checkHoldsAccountLocks(t *testing.T, pool *pgxpool.Pool, pid, userID int, p
 	var section, waitsOnHistory bool
 	if err := pool.QueryRow(t.Context(), `
 		SELECT
-			EXISTS (SELECT 1 FROM pg_locks WHERE pid = $1 AND locktype = 'advisory' AND granted AND classid = $2 AND objid = $3),
-			EXISTS (SELECT 1 FROM pg_locks WHERE pid = $1 AND locktype = 'advisory' AND NOT granted AND classid = $3
+			EXISTS (SELECT 1 FROM pg_locks WHERE pid = $1 AND locktype = 'advisory' AND granted AND objsubid = 2 AND classid = $2 AND objid = $3),
+			EXISTS (SELECT 1 FROM pg_locks WHERE pid = $1 AND locktype = 'advisory' AND NOT granted AND objsubid = 2 AND classid = $3
 				AND objid = (hashtext('imported-history:' || $4::text))::oid)`,
 		pid, sectionLockClass, userID, profileID).Scan(&section, &waitsOnHistory); err != nil {
 		t.Fatal(err)
@@ -138,7 +138,9 @@ func TestProfileImportLockOrderDB(t *testing.T) {
 		waitDone(t, errs)
 	})
 
-	t.Run("titles before library watchlist entries", func(t *testing.T) {
+	t.Run("an import takes no title lock", func(t *testing.T) {
+		// A profile's own export links no watchlist title (it would tell
+		// which titles other accounts list), so it never waits on one.
 		dbExec(t, pool, `DELETE FROM user_watchlist WHERE user_id = $1 AND profile_id = $2`, user, dst)
 		dbExec(t, pool, `DELETE FROM user_watchlist_titles WHERE user_id = $1 AND profile_id = $2`, user, dst)
 		holder, err := pool.Begin(ctx)
@@ -149,28 +151,10 @@ func TestProfileImportLockOrderDB(t *testing.T) {
 		if _, err := holder.Exec(ctx, `SELECT 1 FROM watchlist_titles WHERE id = $1 FOR UPDATE`, titleID); err != nil {
 			t.Fatal(err)
 		}
-		errs := run()
-		blockedImporter(t, pool, user)
-		// The promotion's library write, on its own connection while the
-		// title lock is held, must not wait on the import.
-		promoter, err := pool.Begin(ctx)
-		if err != nil {
-			t.Fatal(err)
+		waitDone(t, run())
+		if n := countRows(t, pool, `SELECT count(*) FROM user_watchlist_titles WHERE user_id = $1 AND profile_id = $2`, user, dst); n != 0 {
+			t.Fatalf("the import linked %d titles the profile did not list", n)
 		}
-		if _, err := promoter.Exec(ctx, `SET LOCAL lock_timeout = '3s'`); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := promoter.Exec(ctx, `INSERT INTO user_watchlist (user_id, profile_id, media_item_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`, user, dst, movie); err != nil {
-			_ = promoter.Rollback(context.Background())
-			_ = holder.Rollback(context.Background())
-			<-errs
-			t.Fatalf("the library write waited on the import: %v", err)
-		}
-		if err := promoter.Commit(ctx); err != nil {
-			t.Fatal(err)
-		}
-		_ = holder.Rollback(ctx)
-		waitDone(t, errs)
 	})
 }
 
@@ -189,7 +173,7 @@ func TestRestoreLockOrderDB(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	preview, err := f.svc.Preview(ctx, source.ID)
+	preview, err := f.svc.Preview(ctx, source.ID, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -245,7 +229,7 @@ func TestProfileImportAndDeleteLockOrderDB(t *testing.T) {
 	var deleter int
 	for deadline := time.Now().Add(20 * time.Second); deleter == 0; {
 		err := pool.QueryRow(ctx, `
-			SELECT pid FROM pg_locks WHERE locktype = 'advisory' AND NOT granted AND classid = $1 AND objid = $2 AND pid <> $3 LIMIT 1`,
+			SELECT pid FROM pg_locks WHERE locktype = 'advisory' AND NOT granted AND objsubid = 2 AND classid = $1 AND objid = $2 AND pid <> $3 LIMIT 1`,
 			preferenceLockClass, user, importer).Scan(&deleter)
 		if err != nil && time.Now().After(deadline) {
 			t.Fatal("the deletion never waited on the account lock")

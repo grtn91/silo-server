@@ -44,6 +44,7 @@ func (a *applier) stageArtwork(ctx context.Context, id string) {
 		return
 	}
 	a.staged[id] = a.writeArtwork(ctx, *entry)
+	a.filesWritten[id] = plan.Reason == ReasonFilesMissingHere && a.staged[id] == nil
 }
 
 // writeArtwork registers and writes an artwork entry's objects.
@@ -78,6 +79,11 @@ func (a *applier) applyArtwork(ctx context.Context, tx pgx.Tx, id string) (appli
 		return applied{}, err
 	}
 	item.Label = plan.Label
+	if a.filesWritten[id] && plan.Reason == ReasonSame {
+		// Its files are back; the catalog already points at them.
+		item.Outcome = OutcomeRestored
+		return applied{item: item}, nil
+	}
 	if !plan.Selectable {
 		return leftOutFor(item, plan), nil
 	}
@@ -125,7 +131,10 @@ func (a *applier) applyBranding(ctx context.Context, tx pgx.Tx, id string) (appl
 	if err != nil {
 		return applied{}, err
 	}
-	plan := a.s.newPlanner(a.rs, tx).planBranding(stored, *entry)
+	plan, err := a.s.newPlanner(a.rs, tx).planBranding(ctx, stored, *entry)
+	if err != nil {
+		return applied{}, err
+	}
 	if !plan.Selectable {
 		return leftOutFor(item, plan), nil
 	}
@@ -135,10 +144,14 @@ func (a *applier) applyBranding(ctx context.Context, tx pgx.Tx, id string) (appl
 	if err := a.writeBlob(ctx, entry.Blob, entry.Blob); err != nil {
 		return applied{}, err
 	}
-	_, after, err := a.s.targets.ApplySettings(ctx, tx, map[string]string{entry.Key: entry.Ref})
+	item.Outcome = OutcomeRestored
+	if plan.Reason == ReasonFilesMissingHere {
+		// The setting already names the file just written back.
+		return applied{item: item}, nil
+	}
+	_, after, err := a.s.targets.ApplySettings(ctx, tx, map[string]string{entry.Key: entry.Ref}, nil)
 	if err != nil {
 		return applied{}, err
 	}
-	item.Outcome = OutcomeRestored
 	return applied{item: item, after: after}, nil
 }

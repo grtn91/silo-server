@@ -5,11 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/Silo-Server/silo-server/internal/adminjob"
 	"github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/plugins"
@@ -28,6 +30,16 @@ const (
 	ItemFolderMissing   = "folder_missing"
 	ItemAmbiguous       = "ambiguous"
 	ItemNeedsAnotherKey = "needs_another_key"
+	// SettingKeptStricter is a setting whose backup value would widen
+	// access (AccessSettingWider): a restore keeps the live value.
+	SettingKeptStricter = "kept_stricter"
+	// SettingCleared is a service secret a restore clears, or the service's
+	// switch it turns off: the restore changes where the service connects,
+	// and the backup has no secret this server can read for it.
+	SettingCleared = "cleared"
+	// SettingUnverifiedBackup is a setting that connects to an outside
+	// service, which a backup this server cannot verify never restores.
+	SettingUnverifiedBackup = "unverified_backup"
 )
 
 // Reasons an item cannot be chosen, is restored only in part, or was left
@@ -52,6 +64,24 @@ const (
 	// ReasonCollectionNotMapped: a page section naming a collection that is
 	// neither here nor restorable.
 	ReasonCollectionNotMapped = "collection_not_mapped"
+	// ReasonUnreadable marks an entry the restore-set reader left out
+	// (RestoreSet.Unusable).
+	ReasonUnreadable = "unreadable"
+	// ReasonFilesMissingHere: an image this server already shows, whose
+	// files are missing from its storage; restoring writes them back and
+	// changes nothing else.
+	ReasonFilesMissingHere = "files_missing_here"
+	// ReasonNeedsInstall: a plugin this server does not have. A restore
+	// never installs one from a backup; an admin installs it from a plugin
+	// catalog and restores it again for its settings.
+	ReasonNeedsInstall = "needs_install"
+	// ReasonKeptStricter: every setting of the page that differs would
+	// widen access, so the live values stay.
+	ReasonKeptStricter = "kept_stricter"
+	// ReasonUnverifiedBackup: what the item would restore connects to
+	// outside services, which a backup this server cannot verify never
+	// restores.
+	ReasonUnverifiedBackup = "unverified_backup"
 )
 
 // Report outcomes.
@@ -90,14 +120,19 @@ var ErrDigestMismatch = errors.New("the backup changed since it was previewed; o
 // follow-up scans). They are built with the API handlers, after the service.
 type RestoreTargets struct {
 	// ApplySettings writes values through the admin settings write path in
-	// tx and reports the keys that apply after a restart.
-	ApplySettings func(ctx context.Context, tx pgx.Tx, values map[string]string) (restartKeys []string, after func(context.Context), err error)
+	// tx and reports the keys that apply after a restart. A non-nil check
+	// runs under the settings lock with the stored values, before anything
+	// is written; its error refuses the write.
+	ApplySettings func(ctx context.Context, tx pgx.Tx, values map[string]string, check func(stored map[string]string) error) (restartKeys []string, after func(context.Context), err error)
 	Plugins       PluginRestorer
 	// LibraryCreated runs the library editor's follow-ups for a committed
 	// new library: sections, provider chain, monitoring, and the first scan.
 	// It may run again after a crash, so each step must be idempotent and
 	// must not overwrite setup an admin made since.
 	LibraryCreated func(ctx context.Context, id int) error
+	// LibrarySectionsCreated seeds a restored library's default and home
+	// sections where none exist, once the restore wrote any it carries.
+	LibrarySectionsCreated func(ctx context.Context, id int) error
 	// PluginInstalled runs a restored installation's follow-ups: the
 	// lifecycle change (EventPluginsChanged) and the provider-chain sync an
 	// upload performs. Like LibraryCreated it may run again.
@@ -112,9 +147,9 @@ type RestoreTargets struct {
 	CheckFolder func(ctx context.Context, path string) error
 	// CreateJob queues the backup_restore admin job.
 	CreateJob func(ctx context.Context, userID int, req RestoreRequest) (*models.AdminJob, error)
-	// ActiveRestore returns the request of the restore job queued or
-	// running now, or nil when there is none.
-	ActiveRestore func(ctx context.Context) (*RestoreRequest, error)
+	// CancelJob cancels a restore job StartRestore queued but could not
+	// keep (it lost the lock meanwhile).
+	CancelJob func(ctx context.Context, id string) error
 	// TemplateCollection returns the collection a bundle apply creates from
 	// a template for a library of libraryType, with every default, and the
 	// template's title; ErrTemplateNotAvailable when this server's catalog
@@ -129,6 +164,17 @@ type RestoreTargets struct {
 	// CheckSection validates a page section as the admin section editor
 	// does; create marks a new row.
 	CheckSection func(sectionType, scope string, libraryID *int, config json.RawMessage, create bool) error
+	// CheckLibrary and CheckCollection validate a library or an admin
+	// collection as the editor's create command does. A restore offers no
+	// entry they refuse.
+	CheckLibrary    func(catalog.CreateFolderInput) error
+	CheckCollection func(catalog.CreateLibraryCollectionInput) error
+	// ItemsChanged hears, after an account's item commits, which items each
+	// restored profile's data names (ProfileTransfer.SetItemsChanged).
+	ItemsChanged ItemsChanged
+	// SmartCollectionCreated refreshes a committed smart collection's item
+	// count, as the editor does after creating one.
+	SmartCollectionCreated func(ctx context.Context, collectionID string) error
 }
 
 // TemplateDefaults is a template collection as a bundle apply creates it.
@@ -163,6 +209,10 @@ type RestoreRequest struct {
 	// Users are the chosen accounts of the users section, with their
 	// targets, profiles, and data types.
 	Users []UserSelection `json:"users,omitempty"`
+	// AcceptUnauthenticated is the admin's confirmation to restore from a
+	// backup whose manifest this server cannot authenticate
+	// (RestorePreview.Authenticated false).
+	AcceptUnauthenticated bool `json:"accept_unauthenticated,omitempty"`
 }
 
 // maxSelectedItems bounds one restore request.
@@ -195,35 +245,74 @@ func (r RestoreRequest) source() restoreSource {
 	return restoreSource{backupID: r.BackupID, uploadID: r.UploadID}
 }
 
-// locate returns a source's digest, frozen in its manifest or at upload
-// completion, and a function that opens it. The digest is of the stored
-// bytes; the opened reader hashes them as it reads.
-func (s *Service) locate(ctx context.Context, src restoreSource) (string, func(context.Context) (*storedReader, error), error) {
+// locatedSource is a restore set as its manifest records it.
+type locatedSource struct {
+	// digest is of the stored bytes, frozen in the manifest; the opened
+	// reader hashes them as it reads.
+	digest string
+	// indexSHA256 is the index's digest the manifest records.
+	indexSHA256 string
+	// authenticated is set when the manifest verified under this server's
+	// SECRET_KEY (Manifest.checkMAC) and records the index's digest: a read
+	// then checks every byte against it before decoding any. A manifest of
+	// another key cannot verify.
+	authenticated bool
+	// uploaded marks an uploaded restore set, whose digest was taken when
+	// the upload completed.
+	uploaded bool
+	open     func(context.Context) (*storedReader, error)
+}
+
+// locate reads a source's manifest, which completeBackup refuses when it
+// was changed after the backup wrote it, and returns its restore set.
+func (s *Service) locate(ctx context.Context, src restoreSource) (locatedSource, error) {
 	if src.uploadID != "" {
 		digest, keys, err := s.completedUpload(ctx, src.uploadID)
 		if err != nil {
-			return "", nil, err
+			return locatedSource{}, err
 		}
-		return digest, func(ctx context.Context) (*storedReader, error) {
+		// An upload has no manifest this server wrote: nothing in it can be
+		// authenticated, so it reads only with the admin's confirmation.
+		return locatedSource{digest: digest, uploaded: true, open: func(ctx context.Context) (*storedReader, error) {
 			return openUploaded(s.openParts(ctx, keys)), nil
-		}, nil
+		}}, nil
 	}
 	b, err := s.completeBackup(ctx, src.backupID)
 	if err != nil {
-		return "", nil, err
+		return locatedSource{}, err
 	}
 	entry, ok := b.manifest.object(RestoreSetName)
 	if b.manifest.RestoreSet == nil || !ok {
-		return "", nil, ErrNoRestoreSet
+		return locatedSource{}, ErrNoRestoreSet
 	}
-	return entry.SHA256, func(ctx context.Context) (*storedReader, error) {
+	index := b.manifest.RestoreSet.IndexSHA256
+	return locatedSource{digest: entry.SHA256, indexSHA256: index, authenticated: b.manifest.authenticated && index != "", open: func(ctx context.Context) (*storedReader, error) {
 		return s.openPlain(ctx, b, RestoreSetName)
-	}, nil
+	}}, nil
 }
+
+// ErrUnauthenticated refuses restoring from a backup this server cannot
+// authenticate (written under another SECRET_KEY) without the admin's
+// confirmation: anyone who can write its destination could have changed it.
+var ErrUnauthenticated = &SelectionError{Message: "this server cannot authenticate this backup (it was written under another SECRET_KEY, or by a build that did not record what checking it needs), so it cannot tell whether the backup was changed since; confirm to open and restore from it anyway"}
 
 // readStoredRestoreSet reads a restore set from body and records the digest
 // of the stored bytes it read, which is what manifests and uploads freeze.
-func readStoredRestoreSet(ctx context.Context, body *storedReader, opts ReadOptions) (*RestoreSet, error) {
+// A non-empty digest is the one the stored bytes must have: the read checks
+// it once the whole archive is read and before it decodes any document.
+func readStoredRestoreSet(ctx context.Context, body *storedReader, opts ReadOptions, digest, mismatch string) (*RestoreSet, error) {
+	if digest != "" {
+		opts.Verify = func() error {
+			stored, err := body.storedEntry(RestoreSetName)
+			if err != nil {
+				return err
+			}
+			if stored.SHA256 != digest {
+				return errors.New(mismatch)
+			}
+			return nil
+		}
+	}
 	rs, err := ReadRestoreSet(ctx, body, opts)
 	if err != nil {
 		return nil, err
@@ -237,56 +326,69 @@ func readStoredRestoreSet(ctx context.Context, body *storedReader, opts ReadOpti
 	return rs, nil
 }
 
-// openRestoreSet reads a source's restore set and checks it against the
-// digest recorded for it. extract writes plugin archives and blobs to a
-// temporary directory the caller removes with Cleanup.
-func (s *Service) openRestoreSet(ctx context.Context, src restoreSource, extract bool) (*RestoreSet, error) {
-	digest, open, err := s.locate(ctx, src)
-	if err != nil {
-		return nil, err
-	}
-	body, err := open(ctx)
+// openRestoreSet reads a source's restore set, checking it against the
+// digests its manifest records before decoding what it holds: the index
+// before it is decoded when the manifest is authenticated, and the whole
+// archive before any document. A non-nil extract writes the blobs it picks
+// to a temporary directory the caller removes with Cleanup.
+func (s *Service) openRestoreSet(ctx context.Context, located locatedSource, extract func(key string) bool) (*RestoreSet, error) {
+	body, err := located.open(ctx)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = body.Close() }()
-	opts := ReadOptions{}
-	if extract {
+	opts := ReadOptions{Extract: extract}
+	if extract != nil {
 		opts.ExtractDir = os.TempDir()
 	}
-	rs, err := readStoredRestoreSet(ctx, body, opts)
+	if located.authenticated {
+		opts.IndexSHA256 = located.indexSHA256
+	}
+	mismatch := RestoreSetName + " does not match the checksum in its manifest"
+	if located.uploaded {
+		mismatch = "the uploaded restore set no longer matches the checksum taken when it was uploaded"
+	}
+	rs, err := readStoredRestoreSet(ctx, body, opts, located.digest, mismatch)
 	if err != nil {
 		if errors.Is(err, ErrRestoreSetTooNew) || ctx.Err() != nil {
 			return nil, err
 		}
 		return nil, &InvalidRestoreSetError{Err: err}
 	}
-	if rs.Digest != digest {
-		rs.Cleanup()
-		if src.uploadID != "" {
-			return nil, errors.New("the uploaded restore set no longer matches the checksum taken when it was uploaded")
-		}
-		return nil, fmt.Errorf("%s does not match the checksum in its manifest", RestoreSetName)
-	}
 	return rs, nil
 }
 
 // previewSet returns a source's validated restore set for a preview,
 // sharing one read among previews of the same archive (restoreSetCache).
-func (s *Service) previewSet(ctx context.Context, src restoreSource) (*RestoreSet, error) {
-	digest, _, err := s.locate(ctx, src)
+// A source this server cannot authenticate is read only with the admin's
+// confirmation (accept); without it nothing inside the archive is parsed
+// (ErrUnauthenticated).
+func (s *Service) previewSet(ctx context.Context, src restoreSource, accept bool) (*RestoreSet, bool, error) {
+	located, err := s.locateConfirmed(ctx, src, accept)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	return s.restoreSets.get(ctx, digest, func(ctx context.Context) (*RestoreSet, error) {
-		rs, err := s.openRestoreSet(ctx, src, false)
-		if err != nil {
-			return nil, err
-		}
-		if rs.Digest != digest {
-			return nil, errors.New("the restore set changed while it was read")
-		}
-		return rs, nil
+	rs, err := s.cachedSet(ctx, located)
+	return rs, located.authenticated, err
+}
+
+// locateConfirmed is locate, refusing a source this server cannot
+// authenticate unless accept confirms it.
+func (s *Service) locateConfirmed(ctx context.Context, src restoreSource, accept bool) (locatedSource, error) {
+	located, err := s.locate(ctx, src)
+	if err != nil {
+		return locatedSource{}, err
+	}
+	if !located.authenticated && !accept {
+		return locatedSource{}, ErrUnauthenticated
+	}
+	return located, nil
+}
+
+// cachedSet is the located restore set as previews share it.
+func (s *Service) cachedSet(ctx context.Context, located locatedSource) (*RestoreSet, error) {
+	return s.restoreSets.get(ctx, located.digest, func(ctx context.Context) (*RestoreSet, error) {
+		return s.openRestoreSet(ctx, located, nil)
 	})
 }
 
@@ -335,14 +437,33 @@ func (s *Service) StartRestore(ctx context.Context, userID int, req RestoreReque
 	defer held.Release(context.WithoutCancel(ctx))
 	ctx, cancel := withLost(ctx, held)
 	defer cancel()
-	digest, _, err := s.locate(ctx, req.source())
+	located, err := s.locate(ctx, req.source())
 	if err != nil {
 		return nil, err
 	}
-	if req.Digest != digest {
+	if req.Digest != located.digest {
 		return nil, ErrDigestMismatch
 	}
-	return s.targets.CreateJob(ctx, userID, req)
+	if !located.authenticated && !req.AcceptUnauthenticated {
+		return nil, ErrUnauthenticated
+	}
+	job, err := s.targets.CreateJob(ctx, userID, req)
+	if err != nil {
+		return nil, err
+	}
+	// The job row is written on the pool. A delete of this source checks for
+	// a queued restore under the lock, so the job must have committed while
+	// this request still held it: a statement on the lock's own session
+	// fails once the lock is gone, and the job is then canceled.
+	if _, err := held.Exec(ctx, `SELECT 1`); err != nil {
+		if s.targets.CancelJob != nil {
+			if cancelErr := s.targets.CancelJob(context.WithoutCancel(ctx), job.ID); cancelErr != nil {
+				slog.WarnContext(ctx, "canceling a restore queued without the lock failed", "component", "backup", "job_id", job.ID, "error", cancelErr)
+			}
+		}
+		return nil, fmt.Errorf("the backup lock was lost while the restore was queued; start it again: %w", err)
+	}
+	return job, nil
 }
 
 // ErrBackupInUse refuses deleting a backup a queued or running restore
@@ -350,15 +471,15 @@ func (s *Service) StartRestore(ctx context.Context, userID int, req RestoreReque
 var ErrBackupInUse = errors.New("a restore from this backup is queued or running")
 
 // activeRestoreSource returns the source of the restore queued or running
-// now; zero when there is none, or when this server cannot queue restores.
-// The caller holds the subsystem lock, under which restores are queued
-// (StartRestore), so no restore is queued between this read and what the
-// caller then deletes.
+// now; zero when there is none. The caller holds the subsystem lock, under
+// which restores are queued (StartRestore), so no restore is queued between
+// this read and what the caller then deletes. It fails closed: a server
+// that cannot read its restore jobs deletes nothing a restore might read.
 func (s *Service) activeRestoreSource(ctx context.Context) (restoreSource, error) {
-	if s.targets.ActiveRestore == nil {
-		return restoreSource{}, nil
+	if s.opts.ActiveRestore == nil {
+		return restoreSource{}, errors.New("this server cannot read its queued restores")
 	}
-	active, err := s.targets.ActiveRestore(ctx)
+	active, err := s.opts.ActiveRestore(ctx)
 	if err != nil {
 		return restoreSource{}, fmt.Errorf("reading the queued restore: %w", err)
 	}
@@ -366,6 +487,25 @@ func (s *Service) activeRestoreSource(ctx context.Context) (restoreSource, error
 		return restoreSource{}, nil
 	}
 	return active.source(), nil
+}
+
+// activeRestoreJob reads the backup_restore admin job queued or running
+// now from jobs.
+func activeRestoreJob(jobs *adminjob.Repository) func(context.Context) (*RestoreRequest, error) {
+	return func(ctx context.Context) (*RestoreRequest, error) {
+		job, err := jobs.GetActiveByType(ctx, adminjob.JobTypeBackupRestore)
+		if errors.Is(err, adminjob.ErrJobNotFound) {
+			return nil, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		var req RestoreRequest
+		if err := json.Unmarshal(job.RequestPayload, &req); err != nil {
+			return nil, fmt.Errorf("reading the active restore job: %w", err)
+		}
+		return &req, nil
+	}
 }
 
 // InvalidRestoreSetError is a restore set that failed the reader's checks:

@@ -233,18 +233,22 @@ func (b *restoreSetBuild) addUsers(ctx context.Context, tx pgx.Tx, spec sectionS
 	return nil
 }
 
+// omit records an account the restore set leaves out. Every text field is
+// cut to the length the reader accepts (validateOmitted): one long name
+// must not make the whole index unreadable.
 func (b *restoreSetBuild) omit(spec sectionSpec, account AccountEntry, reason, message string) {
 	label := account.Username
 	if label == "" {
 		label = account.Email
 	}
-	b.index.Omitted = append(b.index.Omitted, OmittedItem{Section: spec.id, ID: strconv.Itoa(account.ID), Label: label, Reason: reason, Message: message})
+	b.index.Omitted = append(b.index.Omitted, OmittedItem{Section: spec.id, ID: strconv.Itoa(account.ID),
+		Label: truncateText(label, maxAccountField), Reason: reason, Message: truncateText(message, maxOmittedText)})
 }
 
 // omitFailed records an account whose export failed, with what failed and
 // the underlying error as separate fields a client can group by.
 func (b *restoreSetBuild) omitFailed(spec sectionSpec, account AccountEntry, err error) {
-	b.omit(spec, account, OmittedExportFailed, truncateText("Its data could not be read: "+err.Error(), maxOmittedText))
+	b.omit(spec, account, OmittedExportFailed, "Its data could not be read: "+err.Error())
 	last := &b.index.Omitted[len(b.index.Omitted)-1]
 	last.Cause, last.Error = exportCause(err), truncateText(rootError(err).Error(), maxOmittedText)
 }
@@ -292,13 +296,6 @@ func rootError(err error) error {
 		}
 		err = next
 	}
-}
-
-func truncateText(s string, limit int) string {
-	if len(s) <= limit {
-		return s
-	}
-	return strings.ToValidUTF8(s[:limit], "")
 }
 
 // exportUserIsolated reads one account under a savepoint, so a failing
@@ -443,7 +440,7 @@ func exportUser(ctx context.Context, tx pgx.Tx, account AccountEntry) (UserDocum
 		}
 		p.Data = map[string]json.RawMessage{}
 		for _, t := range userDataTypes {
-			exp, err := t.Export(ctx, tx, userdata.Owner{UserID: account.ID, ProfileID: p.ID}, nil)
+			exp, err := t.Export(ctx, tx, userdata.Owner{UserID: account.ID, ProfileID: p.ID}, userdata.Keep{})
 			if err != nil {
 				return doc, nil, &exportError{part: t.ID(), profile: p.ID, err: err}
 			}
@@ -570,21 +567,31 @@ func (p *restoreSetParser) decodeUsers(spec sectionSpec) (int, error) {
 		if !ok {
 			return 0, fmt.Errorf("%s is missing", name)
 		}
+		label := doc.Account.Username
+		if label == "" {
+			label = doc.Account.Email
+		}
 		if strconv.Itoa(doc.Account.ID) != id {
-			return 0, fmt.Errorf("%s holds account %d", name, doc.Account.ID)
+			p.unusable(SectionUsers, KindAccount, label, "Its document names another account than its file.")
+			continue
 		}
 		blobs, err := validateUserDocument(&doc)
 		if err != nil {
-			return 0, fmt.Errorf("%s: %w", name, err)
+			p.unusable(SectionUsers, KindAccount, label, truncateText("It cannot be restored: "+err.Error(), 500))
+			continue
 		}
 		for _, key := range blobs {
 			if err := p.requireReferenced(SectionUsers, key); err != nil {
 				return 0, err
 			}
 		}
+		if p.rs.accountBlobs == nil {
+			p.rs.accountBlobs = map[string][]string{}
+		}
+		p.rs.accountBlobs[id] = blobs
 		p.rs.Users = append(p.rs.Users, doc)
 	}
-	return len(p.rs.Users), nil
+	return len(p.itemIDs(spec)), nil
 }
 
 // validateUserDocument checks an untrusted user document and returns the

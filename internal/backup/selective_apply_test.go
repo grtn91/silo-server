@@ -1,12 +1,20 @@
 package backup
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"image"
+	"image/png"
+	"io"
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -15,7 +23,9 @@ import (
 
 	"github.com/Silo-Server/silo-server/internal/blobstore"
 	"github.com/Silo-Server/silo-server/internal/config"
+	"github.com/Silo-Server/silo-server/internal/imageutil"
 	"github.com/Silo-Server/silo-server/internal/models"
+	"github.com/Silo-Server/silo-server/internal/sections"
 )
 
 // TestWriteBlobNeverReplacesAnExistingObject: a restore writes a blob only
@@ -28,37 +38,91 @@ func TestWriteBlobNeverReplacesAnExistingObject(t *testing.T) {
 		t.Fatal(err)
 	}
 	extracted := filepath.Join(t.TempDir(), "blob")
-	if err := os.WriteFile(extracted, []byte("from the backup"), 0o600); err != nil {
+	fromBackup, live := testImage(t, "from the backup"), testImage(t, "live asset")
+	if err := os.WriteFile(extracted, fromBackup, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	const key = "local/movies/m1/abcd1234/poster/original.r1.jpg"
 	a := &applier{s: New(Options{Stores: blobstore.Stores{Assets: store}}), rs: &RestoreSet{blobs: map[string]string{key: extracted}}}
-	read := func() string {
+	read := func() []byte {
 		body, _, err := store.Get(ctx, key)
 		if err != nil {
 			t.Fatal(err)
 		}
 		defer func() { _ = body.Close() }()
-		data := make([]byte, 64)
-		n, _ := body.Read(data)
-		return string(data[:n])
+		data, err := io.ReadAll(body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return data
 	}
 
-	if err := store.Put(ctx, key, []byte("live asset")); err != nil {
+	if err := store.Put(ctx, key, live); err != nil {
 		t.Fatal(err)
 	}
 	if err := a.writeBlob(ctx, key, key); !errors.Is(err, ErrBlobConflict) {
 		t.Fatalf("writing over another object = %v, want ErrBlobConflict", err)
 	}
-	if got := read(); got != "live asset" {
-		t.Fatalf("existing object became %q", got)
+	if got := read(); !bytes.Equal(got, live) {
+		t.Fatal("the existing object changed")
 	}
 
-	if err := store.Put(ctx, key, []byte("from the backup")); err != nil {
+	if err := store.Put(ctx, key, fromBackup); err != nil {
 		t.Fatal(err)
 	}
 	if err := a.writeBlob(ctx, key, key); err != nil {
 		t.Fatalf("writing over the same bytes = %v", err)
+	}
+}
+
+// testImage is a small PNG whose pixels depend on seed, so two seeds make
+// files with different bytes.
+func testImage(t *testing.T, seed string) []byte {
+	t.Helper()
+	img := image.NewNRGBA(image.Rect(0, 0, 4, 4))
+	sum := sha256.Sum256([]byte(seed))
+	for i := range img.Pix {
+		img.Pix[i] = sum[i%len(sum)] | 1
+	}
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+// TestRestoredFilesMeetTheUploadChecks: a restore writes only a file its
+// kind's upload would accept, so a backup cannot place a file of another
+// type or size where a server serves uploads.
+func TestRestoredFilesMeetTheUploadChecks(t *testing.T) {
+	img := testImage(t, "poster")
+	webp, err := imageutil.EncodeWebPWidth(img, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oversized := append(slices.Clone(img), make([]byte, maxRestoredImage)...)
+	for name, tc := range map[string]struct {
+		key  string
+		data []byte
+		ok   bool
+	}{
+		"item artwork upload":         {key: "local/movies/m1/abcd1234/poster/original.r1.jpg", data: img, ok: true},
+		"collection image":            {key: "collection-images/c1/poster/w300.abcd.webp", data: webp, ok: true},
+		"branding mark":               {key: "branding/mark/0123456789abcdef.webp", data: webp, ok: true},
+		"favicon":                     {key: "branding/favicon/0123456789abcdef.png", data: img, ok: true},
+		"page served as an image":     {key: "library-posters/3.jpg", data: []byte("<html><script>alert(1)</script></html>")},
+		"image over the upload limit": {key: "library-posters/3.jpg", data: oversized},
+		"bytes that do not decode":    {key: "library-posters/3.jpg", data: img[:len(img)/2]},
+		"branding stored unconverted": {key: "branding/mark/0123456789abcdef.png", data: img},
+		"branding of another type":    {key: "branding/login-bg/0123456789abcdef.webp", data: img},
+		"branding outside a kind":     {key: "branding/other/0123456789abcdef.webp", data: webp},
+	} {
+		t.Run(name, func(t *testing.T) {
+			err := checkRestoredBlob(tc.key, tc.data)
+			if tc.ok != (err == nil) || err != nil && !errors.Is(err, ErrRestoredFileRefused) {
+				t.Fatalf("checkRestoredBlob(%s) = %v, want ok %v", tc.key, err, tc.ok)
+			}
+		})
 	}
 }
 
@@ -120,8 +184,9 @@ func (h *memHeld) Exec(context.Context, string, ...any) (pgconn.CommandTag, erro
 	return pgconn.CommandTag{}, nil
 }
 
-// putPlainBackup stores a complete unencrypted backup with a restore set
-// and returns the restore set's digest.
+// putPlainBackup stores a complete unencrypted backup with a restore set,
+// its manifest signed with testManifestKey, and returns the restore set's
+// digest.
 func putPlainBackup(t *testing.T, store blobstore.Store, serverID, id string) string {
 	t.Helper()
 	ctx := t.Context()
@@ -130,7 +195,11 @@ func putPlainBackup(t *testing.T, store blobstore.Store, serverID, id string) st
 	m.CreatedAt, m.Kind, _ = ParseFolderName(id)
 	m.CompletedAt = m.CreatedAt
 	m.Objects = nil
-	for name, data := range map[string][]byte{DumpName: []byte("dump"), BlobsName: {}, RestoreSetName: []byte("set " + id)} {
+	index, entries := testRestoreSet()
+	index.ServerID, index.ServerName = serverID, id
+	set := buildTar(t, index, entries)
+	indexSum := sha256.Sum256(mustJSON(index))
+	for name, data := range map[string][]byte{DumpName: []byte("dump"), BlobsName: {}, RestoreSetName: set} {
 		if err := store.Put(ctx, objectKey(serverID, id, name), data); err != nil {
 			t.Fatal(err)
 		}
@@ -138,7 +207,11 @@ func putPlainBackup(t *testing.T, store blobstore.Store, serverID, id string) st
 		_, _ = s.Write(data)
 		m.Objects = append(m.Objects, s.entry(name))
 	}
-	m.RestoreSet = &RestoreSetSummary{FormatVersion: restoreSetVersion, Sections: map[string]int{}}
+	m.RestoreSet = &RestoreSetSummary{FormatVersion: restoreSetVersion, Sections: map[string]int{}, IndexSHA256: hex.EncodeToString(indexSum[:])}
+	m.KeyCheck = testKeyCheck
+	if err := m.sign(testManifestKey); err != nil {
+		t.Fatal(err)
+	}
 	data, err := json.Marshal(m)
 	if err != nil {
 		t.Fatal(err)
@@ -174,7 +247,7 @@ func TestQueuedRestoreKeepsItsSource(t *testing.T) {
 		activeErr error
 		raced     error
 	)
-	svc := New(Options{Destination: NewStoreDestination(store), Locker: locker,
+	svc := New(Options{Destination: NewStoreDestination(store), Locker: locker, KeyCheck: testKeyCheck, ManifestKey: testManifestKey,
 		Settings: &mapSettings{values: map[string]string{config.BackupKeepSettingKey: "1"}},
 		ServerID: func(context.Context) (string, error) { return "server", nil }, Now: func() time.Time { return day(3) }})
 	svc.SetRestoreTargets(RestoreTargets{
@@ -189,12 +262,12 @@ func TestQueuedRestoreKeepsItsSource(t *testing.T) {
 			mu.Unlock()
 			return &models.AdminJob{ID: "job"}, nil
 		},
-		ActiveRestore: func(context.Context) (*RestoreRequest, error) {
-			mu.Lock()
-			defer mu.Unlock()
-			return queued, activeErr
-		},
 	})
+	svc.opts.ActiveRestore = func(context.Context) (*RestoreRequest, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		return queued, activeErr
+	}
 	req := RestoreRequest{BackupID: source, Digest: digest, Selection: map[string][]string{SectionSettings: {pageAppearance}}}
 
 	// Another operation holds the lock: nothing is queued.
@@ -240,8 +313,111 @@ func TestQueuedRestoreKeepsItsSource(t *testing.T) {
 	if err := svc.Delete(ctx, source); err == nil || errors.Is(err, ErrBackupInUse) {
 		t.Fatalf("delete without the queue = %v", err)
 	}
+	// Nor when the service has no way to read it.
+	active := svc.opts.ActiveRestore
+	svc.opts.ActiveRestore = nil
+	if rotated, _, warnings := svc.rotate(ctx, nil, tgt, "server", nil); len(rotated) != 0 || len(warnings) != 1 {
+		t.Fatalf("rotation without a queue reader = %v, %v", rotated, warnings)
+	}
+	svc.opts.ActiveRestore = active
 	activeErr, queued = nil, nil
 	if err := svc.Delete(ctx, source); err != nil {
 		t.Fatalf("deleting a backup no restore reads = %v", err)
+	}
+}
+
+// TestSelectiveRestoreAuthenticatesTheManifest: a selective restore starts
+// only from a backup whose manifest verifies under this server's
+// SECRET_KEY, or, when it cannot be authenticated (no key check value or
+// another key), with the admin's confirmation. One naming this key that
+// does not verify is refused even with it.
+func TestSelectiveRestoreAuthenticatesTheManifest(t *testing.T) {
+	tests := []struct {
+		name          string
+		change        func(*Manifest)
+		want          error // without confirmation
+		wantConfirmed error
+	}{
+		{name: "matching", change: func(*Manifest) {}},
+		{name: "wrong MAC", change: func(m *Manifest) { m.MAC = strings.Repeat("ab", 32) }, want: ErrManifestTampered, wantConfirmed: ErrManifestTampered},
+		{name: "missing MAC", change: func(m *Manifest) { m.MAC = "" }, want: ErrManifestTampered, wantConfirmed: ErrManifestTampered},
+		{name: "missing key check", change: func(m *Manifest) { m.KeyCheck = "" }, want: ErrUnauthenticated},
+		{name: "other key", change: func(m *Manifest) { m.KeyCheck = "9999-8888-7777-6666" }, want: ErrUnauthenticated},
+		// A manifest that does not record the index's digest cannot have
+		// its restore set checked before it is parsed.
+		{name: "no index digest", change: func(m *Manifest) {
+			m.RestoreSet.IndexSHA256 = ""
+			if err := m.sign(testManifestKey); err != nil {
+				panic(err)
+			}
+		}, want: ErrUnauthenticated},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := t.Context()
+			store, err := blobstore.NewFilesystem(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			id := FolderName(time.Date(2026, 10, 21, 4, 0, 0, 0, time.UTC), KindNightly)
+			digest := putPlainBackup(t, store, "server", id)
+			key := objectKey("server", id, ManifestName)
+			body, _, err := store.Get(ctx, key)
+			if err != nil {
+				t.Fatal(err)
+			}
+			data, _ := io.ReadAll(body)
+			_ = body.Close()
+			m, err := ParseManifest(data)
+			if err != nil {
+				t.Fatal(err)
+			}
+			tt.change(m)
+			changed, _ := json.Marshal(m)
+			if err := store.Put(ctx, key, changed); err != nil {
+				t.Fatal(err)
+			}
+			svc := New(Options{Destination: NewStoreDestination(store), Locker: &memLocker{}, KeyCheck: testKeyCheck, ManifestKey: testManifestKey,
+				ServerID: func(context.Context) (string, error) { return "server", nil }})
+			queued := 0
+			svc.SetRestoreTargets(RestoreTargets{CreateJob: func(context.Context, int, RestoreRequest) (*models.AdminJob, error) {
+				queued++
+				return &models.AdminJob{ID: "job"}, nil
+			}})
+			svc.opts.ActiveRestore = func(context.Context) (*RestoreRequest, error) { return nil, nil }
+			req := RestoreRequest{BackupID: id, Digest: digest, Selection: map[string][]string{SectionSettings: {"appearance"}}}
+			if _, err := svc.StartRestore(ctx, 1, req); !errors.Is(err, tt.want) || (tt.want == nil) != (err == nil) {
+				t.Fatalf("StartRestore = %v, want %v", err, tt.want)
+			}
+			// A preview refuses the same way, before it reads the restore set.
+			if _, _, err := svc.previewSet(ctx, restoreSource{backupID: id}, false); !errors.Is(err, tt.want) || (tt.want == nil) != (err == nil) {
+				t.Fatalf("preview = %v, want %v", err, tt.want)
+			}
+			req.AcceptUnauthenticated = true
+			if _, err := svc.StartRestore(ctx, 1, req); !errors.Is(err, tt.wantConfirmed) || (tt.wantConfirmed == nil) != (err == nil) {
+				t.Fatalf("StartRestore confirmed = %v, want %v", err, tt.wantConfirmed)
+			}
+			if _, _, err := svc.previewSet(ctx, restoreSource{backupID: id}, true); !errors.Is(err, tt.wantConfirmed) || (tt.wantConfirmed == nil) != (err == nil) {
+				t.Fatalf("preview confirmed = %v, want %v", err, tt.wantConfirmed)
+			}
+		})
+	}
+}
+
+// TestRetryableItemError: an item starts again from its read after a
+// deadlock, a serialization failure, or a section whose references changed
+// under it, and fails on anything else.
+func TestRetryableItemError(t *testing.T) {
+	for err, want := range map[error]bool{
+		fmt.Errorf("writing: %w", sections.ErrReferencesChanged): true,
+		fmt.Errorf("settings: %w", errSettingsChanged):           true,
+		&pgconn.PgError{Code: "40P01"}:                           true,
+		fmt.Errorf("item: %w", &pgconn.PgError{Code: "40001"}):   true,
+		&pgconn.PgError{Code: "23505"}:                           false,
+		errors.New("boom"):                                       false,
+	} {
+		if got := retryableItemError(err); got != want {
+			t.Errorf("retryableItemError(%v) = %v, want %v", err, got, want)
+		}
 	}
 }

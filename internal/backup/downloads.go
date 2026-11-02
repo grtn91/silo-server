@@ -22,7 +22,7 @@ type ObjectLink struct {
 // objects as they are, and the manifest that describes them.
 func downloadable(m *Manifest) []ObjectEntry {
 	out := append([]ObjectEntry(nil), m.Objects...)
-	return append(out, ObjectEntry{Name: ManifestName})
+	return append(out, ObjectEntry{Name: ManifestName, Size: m.storedSize})
 }
 
 // Download scopes.
@@ -99,7 +99,7 @@ func (s *Service) completeBackup(ctx context.Context, id string) (storedBackup, 
 	if err != nil {
 		return storedBackup{}, err
 	}
-	m, err := readManifest(ctx, t, objectKey(serverID, id, ManifestName))
+	m, err := s.readManifest(ctx, t, serverID, id)
 	if err != nil {
 		return storedBackup{}, err
 	}

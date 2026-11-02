@@ -226,8 +226,13 @@ func decodeWatchHistory(data json.RawMessage) (watchHistoryDocument, userdata.Su
 		sum.Items = append(sum.Items, id)
 		return nil
 	}
+	// Progress has one row per item; plays may repeat an item and a time.
+	progress := userdata.Distinct{}
 	for _, e := range doc.Progress {
 		if err := add(e.Item); err != nil {
+			return doc, sum, err
+		}
+		if err := progress.Add("watch progress", e.Item); err != nil {
 			return doc, sum, err
 		}
 		if e.Position < 0 || e.Duration < 0 || e.UpdatedAt.IsZero() {

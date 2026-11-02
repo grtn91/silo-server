@@ -5,11 +5,14 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/Silo-Server/silo-server/internal/blobstore"
 )
@@ -37,7 +40,8 @@ func TestPreviewsShareOneValidatedRestoreSet(t *testing.T) {
 		t.Fatal(err)
 	}
 	dest := &countingDestination{Destination: NewStoreDestination(store)}
-	svc := New(Options{Destination: dest, ServerID: func(context.Context) (string, error) { return "server", nil }})
+	svc := New(Options{Destination: dest, KeyCheck: testKeyCheck, ManifestKey: testManifestKey,
+		ServerID: func(context.Context) (string, error) { return "server", nil }})
 	put := func(id string) {
 		index, entries := testRestoreSet()
 		index.ServerName = id // each backup's archive differs
@@ -62,7 +66,7 @@ func TestPreviewsShareOneValidatedRestoreSet(t *testing.T) {
 	sets := make([]*RestoreSet, 8)
 	for i := range sets {
 		wg.Go(func() {
-			rs, err := svc.previewSet(ctx, restoreSource{backupID: first})
+			rs, _, err := svc.previewSet(ctx, restoreSource{backupID: first}, true)
 			if err != nil {
 				t.Error(err)
 			}
@@ -70,7 +74,7 @@ func TestPreviewsShareOneValidatedRestoreSet(t *testing.T) {
 		})
 	}
 	wg.Wait()
-	if _, err := svc.previewSet(ctx, restoreSource{backupID: first}); err != nil {
+	if _, _, err := svc.previewSet(ctx, restoreSource{backupID: first}, true); err != nil {
 		t.Fatal(err)
 	}
 	if n := dest.opens.Load(); n != 1 {
@@ -81,10 +85,66 @@ func TestPreviewsShareOneValidatedRestoreSet(t *testing.T) {
 			t.Fatal("previews did not share one validated restore set")
 		}
 	}
-	if _, err := svc.previewSet(ctx, restoreSource{backupID: second}); err != nil {
+	if _, _, err := svc.previewSet(ctx, restoreSource{backupID: second}, true); err != nil {
 		t.Fatal(err)
 	}
 	if n := dest.opens.Load(); n != 2 {
 		t.Fatalf("another backup's restore set reads = %d, want 2", n)
+	}
+}
+
+// TestRestoreSetReadStopsWithItsLastPreview: one preview leaving does not
+// fail another waiting on the same read, and the read stops once no preview
+// waits on it.
+func TestRestoreSetReadStopsWithItsLastPreview(t *testing.T) {
+	var c restoreSetCache
+	started, stopped := make(chan struct{}), make(chan struct{})
+	release := make(chan struct{})
+	load := func(ctx context.Context) (*RestoreSet, error) {
+		close(started)
+		select {
+		case <-release:
+			return &RestoreSet{}, nil
+		case <-ctx.Done():
+			close(stopped)
+			return nil, ctx.Err()
+		}
+	}
+	first, cancelFirst := context.WithCancel(t.Context())
+	second, cancelSecond := context.WithCancel(t.Context())
+	defer cancelSecond()
+	results := make(chan error, 2)
+	go func() { _, err := c.get(first, "d", load); results <- err }()
+	<-started
+	go func() { _, err := c.get(second, "d", load); results <- err }()
+	for deadline := time.Now().Add(10 * time.Second); ; {
+		c.mu.Lock()
+		joined := c.reading["d"] != nil && c.reading["d"].waiters == 2
+		c.mu.Unlock()
+		if joined {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the second preview never joined the read")
+		}
+		runtime.Gosched()
+	}
+	cancelFirst()
+	if err := <-results; !errors.Is(err, context.Canceled) {
+		t.Fatalf("the preview that left = %v, want canceled", err)
+	}
+	select {
+	case <-stopped:
+		t.Fatal("the read stopped while another preview waited on it")
+	default:
+	}
+	cancelSecond()
+	if err := <-results; !errors.Is(err, context.Canceled) {
+		t.Fatalf("the last preview = %v, want canceled", err)
+	}
+	select {
+	case <-stopped:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the read went on after its last preview left")
 	}
 }

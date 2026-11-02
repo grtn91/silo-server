@@ -22,6 +22,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/Silo-Server/silo-server/internal/adminjob"
 	"github.com/Silo-Server/silo-server/internal/blobstore"
 	"github.com/Silo-Server/silo-server/internal/buildinfo"
 	"github.com/Silo-Server/silo-server/internal/secret"
@@ -75,6 +76,10 @@ type Options struct {
 	ServerID    func(context.Context) (string, error)
 	// KeyCheck is secret.KeyCheckValue of this server's SECRET_KEY.
 	KeyCheck string
+	// ManifestKey is secret.BackupManifestKey of this server's SECRET_KEY:
+	// backups sign their manifests with it, and every read of one checks
+	// it. Nil writes unsigned manifests and checks none (tests).
+	ManifestKey []byte
 	// Cipher is this server's data cipher. A restore decrypts a backup's
 	// encrypted settings with it when the key check values match.
 	Cipher *secret.Cipher
@@ -87,6 +92,11 @@ type Options struct {
 	// Status publishes the active operation and the latest run for every
 	// API server. Nil publishes nothing.
 	Status StatusStore
+	// ActiveRestore returns the request of the restore job queued or
+	// running now, or nil when there is none. Rotation and deletes keep its
+	// source. New reads the admin jobs on Pool when it is nil; a service
+	// with neither deletes no backup.
+	ActiveRestore func(ctx context.Context) (*RestoreRequest, error)
 	// FindTools overrides tool discovery for tests.
 	FindTools func(context.Context) (Tools, error)
 	// UploadCheckTimeout overrides how long a completion may read an
@@ -132,6 +142,9 @@ func New(opts Options) *Service {
 	}
 	if opts.FindTools == nil {
 		opts.FindTools = FindTools
+	}
+	if opts.ActiveRestore == nil && opts.Pool != nil {
+		opts.ActiveRestore = activeRestoreJob(adminjob.NewRepository(opts.Pool))
 	}
 	stores := blobStores{}
 	if opts.Stores.Assets != nil {
@@ -403,6 +416,14 @@ func (s *Service) backup(ctx context.Context, prep backupPrep, kind Kind, starte
 	}
 	excluded := excludedTableData(includeFingerprints)
 
+	// The dump streams into the destination while the snapshot holds a pool
+	// connection; a store recording its identity on that first write would
+	// need another one.
+	if recorder, ok := t.Destination.(interface{ RecordIdentity(context.Context) error }); ok {
+		if err := recorder.RecordIdentity(ctx); err != nil {
+			return RunResult{}, fmt.Errorf("recording the destination storage: %w", err)
+		}
+	}
 	progress(5, "Opening a database snapshot")
 	conn, err := s.opts.Pool.Acquire(ctx)
 	if err != nil {
@@ -462,7 +483,7 @@ func (s *Service) backup(ctx context.Context, prep backupPrep, kind Kind, starte
 		Tables:            facts.tables,
 	}
 	progress(95, "Writing the manifest")
-	if err := writeManifest(ctx, t, manifest); err != nil {
+	if err := writeManifest(ctx, t, manifest, s.opts.ManifestKey); err != nil {
 		return RunResult{}, err
 	}
 	result := RunResult{ID: id, Kind: kind, Status: manifest.Status(), SizeBytes: manifest.Size(), MissingBlobs: manifest.MissingBlobs}
@@ -470,6 +491,9 @@ func (s *Service) backup(ctx context.Context, prep backupPrep, kind Kind, starte
 		result.Omitted = restoreSet.Omitted
 	}
 	result.Rotated, result.Swept, result.Warnings = s.rotate(ctx, prep.held, t, serverID, pinned)
+	if manifest.MissingBlobsTotal > 0 {
+		result.Warnings = append(result.Warnings, fmt.Sprintf("%d stored files were missing; the manifest lists the first %d", manifest.MissingBlobsTotal, len(manifest.MissingBlobs)))
+	}
 	result.DurationMs = s.opts.Now().Sub(started).Milliseconds()
 	progress(100, "Backed up "+id)
 	return result, nil
@@ -477,13 +501,22 @@ func (s *Service) backup(ctx context.Context, prep backupPrep, kind Kind, starte
 
 // writeManifest writes m last of a backup's objects: its presence completes
 // the backup.
-func writeManifest(ctx context.Context, t target, m *Manifest) error {
+func writeManifest(ctx context.Context, t target, m *Manifest, key []byte) error {
 	if m.MissingBlobs == nil {
 		m.MissingBlobs = []MissingBlob{}
+	}
+	if len(m.MissingBlobs) > maxRecordedMissingBlobs {
+		m.MissingBlobsTotal, m.MissingBlobs = len(m.MissingBlobs), m.MissingBlobs[:maxRecordedMissingBlobs]
+	}
+	if err := m.sign(key); err != nil {
+		return err
 	}
 	data, err := json.MarshalIndent(m, "", "  ")
 	if err != nil {
 		return err
+	}
+	if len(data) > MaxManifestBytes {
+		return fmt.Errorf("the manifest would be %d bytes, more than a reader takes (%d)", len(data), MaxManifestBytes)
 	}
 	if err := t.Put(ctx, objectKey(m.ServerID, m.ID, ManifestName), bytes.NewReader(data)); err != nil {
 		return fmt.Errorf("writing the manifest: %w", err)
@@ -721,12 +754,13 @@ func (s *Service) folders(ctx context.Context, t target, serverID string) ([]fol
 			f.newest = obj.ModTime
 		}
 		if name == ManifestName {
-			m, err := readManifest(ctx, t, obj.Key)
+			m, err := s.readManifest(ctx, t, serverID, id)
 			if err != nil {
+				f.tampered = errors.Is(err, ErrManifestTampered)
 				slog.WarnContext(ctx, "unreadable backup manifest", "component", "backup", "id", id, "error", err)
 				continue
 			}
-			f.manifest = m
+			f.manifest, f.verified = m, m.authenticated || s.opts.ManifestKey == nil
 		}
 	}
 	out := make([]folder, 0, len(order))
@@ -737,17 +771,39 @@ func (s *Service) folders(ctx context.Context, t target, serverID string) ([]fol
 	return out, nil
 }
 
-func readManifest(ctx context.Context, t target, key string) (*Manifest, error) {
+// readManifest reads and checks the manifest of backup id of serverID: it
+// must name that backup and server, and one written under this server's
+// SECRET_KEY must verify (checkMAC). Authenticated reports whether it did.
+func (s *Service) readManifest(ctx context.Context, t target, serverID, id string) (*Manifest, error) {
+	m, err := readManifestObject(ctx, t, objectKey(serverID, id, ManifestName))
+	if err != nil {
+		return nil, err
+	}
+	if m.ID != id || m.ServerID != serverID {
+		return nil, fmt.Errorf("the manifest of %s names backup %s of server %s", id, m.ID, m.ServerID)
+	}
+	if m.authenticated, err = m.checkMAC(s.opts.ManifestKey, s.opts.KeyCheck); err != nil {
+		return nil, err
+	}
+	return m, nil
+}
+
+func readManifestObject(ctx context.Context, t target, key string) (*Manifest, error) {
 	body, _, err := t.Open(ctx, key)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = body.Close() }()
-	data, err := io.ReadAll(io.LimitReader(body, 16<<20))
+	data, err := io.ReadAll(io.LimitReader(body, MaxManifestBytes))
 	if err != nil {
 		return nil, err
 	}
-	return ParseManifest(data)
+	m, err := ParseManifest(data)
+	if err != nil {
+		return nil, err
+	}
+	m.storedSize = int64(len(data))
+	return m, nil
 }
 
 // target is the destination one operation uses.

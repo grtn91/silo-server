@@ -2,9 +2,7 @@ package api
 
 import (
 	"context"
-	"encoding/json"
-	"errors"
-	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -13,6 +11,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/backup"
 	"github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/models"
+	"github.com/Silo-Server/silo-server/internal/notifications"
 )
 
 // wireBackupRestore gives selective restore the write paths it applies
@@ -33,11 +32,18 @@ func wireBackupRestore(deps Dependencies, admin *handlers.AdminHandler, librarie
 		CreateJob: func(ctx context.Context, userID int, req backup.RestoreRequest) (*models.AdminJob, error) {
 			return jobs.Create(ctx, adminjob.CreateJobInput{JobType: adminjob.JobTypeBackupRestore, CreatedByUserID: userID, RequestPayload: req, Message: "Queued restore"})
 		},
-		ActiveRestore: ActiveBackupRestore(jobs),
+		CancelJob: func(ctx context.Context, id string) error {
+			_, err := jobs.Cancel(ctx, id, "Canceled: the restore was queued after the backup lock was lost", time.Now().UTC())
+			return err
+		},
 	}
 	if admin != nil {
-		targets.ApplySettings = func(ctx context.Context, tx pgx.Tx, values map[string]string) ([]string, func(context.Context), error) {
-			result, publish, err := admin.ApplyAdminSettingsInTx(ctx, tx, values)
+		targets.ApplySettings = func(ctx context.Context, tx pgx.Tx, values map[string]string, check func(map[string]string) error) ([]string, func(context.Context), error) {
+			var guard func(handlers.AdminSettingsSnapshot) error
+			if check != nil {
+				guard = func(s handlers.AdminSettingsSnapshot) error { return check(s.Stored) }
+			}
+			result, publish, err := admin.ApplyAdminSettingsInTx(ctx, tx, values, guard)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -50,6 +56,8 @@ func wireBackupRestore(deps Dependencies, admin *handlers.AdminHandler, librarie
 	}
 	if libraries != nil {
 		targets.LibraryCreated = libraries.LibraryRestored
+		targets.LibrarySectionsCreated = libraries.LibrarySectionsRestored
+		targets.CheckLibrary = libraries.CheckRestoredLibrary
 	}
 	if images != nil {
 		targets.ArtworkChanged = images.ArtworkRestored
@@ -58,6 +66,8 @@ func wireBackupRestore(deps Dependencies, admin *handlers.AdminHandler, librarie
 		targets.TrackArtwork = tracker.TrackArtworkRevision
 	}
 	if collections != nil {
+		targets.CheckCollection = collections.CheckRestoredCollection
+		targets.SmartCollectionCreated = collections.SmartCollectionRestored
 		targets.TemplateTitle = collections.TemplateTitle
 		targets.TemplateCollectionCreated = collections.TemplateCollectionRestored
 		targets.TemplateCollection = func(bundleID, templateID string, libraryID int, libraryType string) (backup.TemplateDefaults, error) {
@@ -74,25 +84,20 @@ func wireBackupRestore(deps Dependencies, admin *handlers.AdminHandler, librarie
 	if pageSections != nil {
 		targets.CheckSection = pageSections.CheckRestoredSection
 	}
+	targets.ItemsChanged = interestChanges(deps.Notifications)
 	deps.Backups.SetRestoreTargets(targets)
 }
 
-// ActiveBackupRestore reads the request of the backup_restore job queued or
-// running now, or nil when there is none. Backup deletion, rotation, and
-// upload deletion and expiry keep its source.
-func ActiveBackupRestore(jobs *adminjob.Repository) func(context.Context) (*backup.RestoreRequest, error) {
-	return func(ctx context.Context) (*backup.RestoreRequest, error) {
-		job, err := jobs.GetActiveByType(ctx, adminjob.JobTypeBackupRestore)
-		if errors.Is(err, adminjob.ErrJobNotFound) {
-			return nil, nil
+// interestChanges queues a notification interest recompute for each item a
+// profile's restored or imported data names, as the user store's own writes
+// do (notifications.WrapUserStoreProvider); nil without notifications.
+func interestChanges(system *notifications.System) backup.ItemsChanged {
+	if system == nil || system.Interest == nil {
+		return nil
+	}
+	return func(userID int, profileID string, itemIDs []string) {
+		for _, id := range itemIDs {
+			system.Interest.QueueItemMutation(userID, profileID, id)
 		}
-		if err != nil {
-			return nil, err
-		}
-		var req backup.RestoreRequest
-		if err := json.Unmarshal(job.RequestPayload, &req); err != nil {
-			return nil, fmt.Errorf("reading the active restore job: %w", err)
-		}
-		return &req, nil
 	}
 }

@@ -684,7 +684,10 @@ func openUploaded(parts *partsReader) *storedReader { return openStored(parts) }
 // the set, or why the upload is rejected, or an error when the bytes could
 // not be read, which rejects nothing.
 func (s *Service) checkUpload(ctx context.Context, parts *partsReader, declared string) (*RestoreSet, *UploadRejection, error) {
-	rs, err := readStoredRestoreSet(ctx, openUploaded(parts), ReadOptions{})
+	// The admin's upload is checked whole here, its digest compared below
+	// with the one they sent; it is read again, for a preview or a
+	// restore, only with their confirmation (an upload is unauthenticated).
+	rs, err := readStoredRestoreSet(ctx, openUploaded(parts), ReadOptions{}, "", "")
 	switch {
 	case parts.err != nil:
 		return nil, nil, parts.err

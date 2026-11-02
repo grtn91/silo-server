@@ -10,15 +10,19 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"path/filepath"
 	"runtime"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/Silo-Server/silo-server/internal/access"
 	"github.com/Silo-Server/silo-server/internal/blobstore"
+	"github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/secret"
 )
 
@@ -63,10 +67,42 @@ type fakeControl struct {
 	// openAfter records, after each statement, which databases admitted
 	// connections.
 	openAfter [][]string
+	// joinOnLoad and joinOnCarry connect a client to the live database
+	// while the restore loads the dump, or right after it carries the
+	// credentials, as a server started meanwhile would.
+	joinOnLoad, joinOnCarry bool
+	// liveServerID is the live server's identity; "" is the manifest's.
+	// carriedFrom records the live URL each credential carry read from.
+	liveServerID string
+	carriedFrom  []string
+	// restoreLocks is the restore lock table, shared by every control of
+	// one server; held names the databases locked.
+	restoreLocks *fakeRestoreLocks
+}
+
+type fakeRestoreLocks struct {
+	mu   sync.Mutex
+	held map[string]bool
+}
+
+func (f *fakeControl) LockRestore(_ context.Context, live string) (func(context.Context), error) {
+	locks := f.restoreLocks
+	locks.mu.Lock()
+	defer locks.mu.Unlock()
+	if locks.held[live] {
+		return nil, ErrRestoreRunning
+	}
+	locks.held[live] = true
+	return func(context.Context) {
+		locks.mu.Lock()
+		defer locks.mu.Unlock()
+		delete(locks.held, live)
+	}, nil
 }
 
 func newFakeControl(t *testing.T) *fakeControl {
-	return &fakeControl{t: t, dbs: map[string]*fakeDB{liveDB: {oid: 100, allow: true}}, nextOID: 200, fail: map[string]error{}, lostReply: map[string]bool{}}
+	return &fakeControl{t: t, dbs: map[string]*fakeDB{liveDB: {oid: 100, allow: true}}, nextOID: 200, fail: map[string]error{}, lostReply: map[string]bool{},
+		restoreLocks: &fakeRestoreLocks{held: map[string]bool{}}}
 }
 
 func (f *fakeControl) do(call string, apply func() error) error {
@@ -200,10 +236,38 @@ type fakeLoader struct {
 
 func (l fakeLoader) Empty(context.Context, string) (bool, error) { return true, nil }
 func (l fakeLoader) UnbindStorage(context.Context, string) error { return nil }
+func (l fakeLoader) ClearUnreadableSettings(context.Context, string, *secret.Cipher) ([]string, error) {
+	return nil, nil
+}
+func (l fakeLoader) DropSubtitles(context.Context, string, func(context.Context, string) (bool, error)) (int, error) {
+	return 0, nil
+}
+func (l fakeLoader) RotateSigningSecrets(context.Context, string, *secret.Cipher) (bool, error) {
+	return true, nil
+}
+func (l fakeLoader) KeepStricterSettings(context.Context, string, string, *secret.Cipher) ([]string, error) {
+	return nil, nil
+}
+func (l fakeLoader) ServerID(context.Context, string) (string, error) {
+	if l.ctl.liveServerID != "" {
+		return l.ctl.liveServerID, nil
+	}
+	return l.m.ServerID, nil
+}
+func (l fakeLoader) CarryCredentials(_ context.Context, _, liveURL string) (CarriedCredentials, error) {
+	l.ctl.carriedFrom = append(l.ctl.carriedFrom, liveURL)
+	if l.ctl.joinOnCarry {
+		l.ctl.dbs[liveDB].sessions++
+	}
+	return CarriedCredentials{}, nil
+}
 func (l fakeLoader) Load(_ context.Context, dbURL, _ string) error {
 	name, err := databaseName(dbURL)
 	if err != nil {
 		return err
+	}
+	if l.ctl.joinOnLoad {
+		l.ctl.dbs[liveDB].sessions++
 	}
 	return l.ctl.connect(name)
 }
@@ -276,6 +340,10 @@ func writeTestBackup(t *testing.T, entries []tarEntry) *Source {
 	for _, name := range inventoryTables {
 		m.Tables = append(m.Tables, TableCount{Name: name})
 	}
+	m.KeyCheck = testKeyCheck
+	if err := m.sign(testManifestKey); err != nil {
+		t.Fatal(err)
+	}
 	data, _ := json.Marshal(m)
 	if err := os.WriteFile(filepath.Join(dir, ManifestName), data, 0o600); err != nil {
 		t.Fatal(err)
@@ -284,7 +352,48 @@ func writeTestBackup(t *testing.T, entries []tarEntry) *Source {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = src.Close() })
 	return src
+}
+
+// TestValidateReadsOnlyCheckedCopies: what a restore consumes is the bytes
+// Validate checked. Validation copies each object into a private directory
+// as it hashes it, and every later read goes there, so a backup folder
+// changed after the check changes nothing; one changed before fails it.
+func TestValidateReadsOnlyCheckedCopies(t *testing.T) {
+	src := writeTestBackup(t, []tarEntry{{name: "assets/" + addedKey, data: "added poster"}})
+	origin := src.Dir
+	opts := ValidateOptions{KeyCheck: testKeyCheck, ManifestKey: testManifestKey, CopyDir: t.TempDir()}
+	if err := src.Validate(t.Context(), opts); err != nil {
+		t.Fatal(err)
+	}
+	if src.Dir == origin {
+		t.Fatal("validation left the restore reading the backup folder")
+	}
+	info, err := os.Stat(src.Dir)
+	if err != nil || info.Mode().Perm() != 0o700 {
+		t.Fatalf("private copy directory %v (%v), want 0700", info, err)
+	}
+	if err := os.WriteFile(filepath.Join(origin, DumpName), []byte("swapped after the check"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(src.path(DumpName)); err != nil || string(got) != "PGDMP fake dump" {
+		t.Fatalf("the restore reads %q (%v), want the checked dump", got, err)
+	}
+	private := src.Dir
+	if err := src.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(private); !os.IsNotExist(err) {
+		t.Fatalf("private copies left behind: %v", err)
+	}
+	// Changed before the check: refused, and no copy is left.
+	if err := src.Validate(t.Context(), opts); err == nil || !strings.Contains(err.Error(), "does not match its checksum") {
+		t.Fatalf("validating a changed dump = %v", err)
+	}
+	if entries, _ := os.ReadDir(opts.CopyDir); len(entries) != 0 {
+		t.Fatalf("a failed check left %d copies", len(entries))
+	}
 }
 
 type swapFixture struct {
@@ -321,8 +430,24 @@ func newSwapFixtureWith(t *testing.T, entries []tarEntry) *swapFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &swapFixture{t: t, ctl: newFakeControl(t), root: root, live: live, src: writeTestBackup(t, entries), workDir: t.TempDir(), cipher: cipher}
+	return &swapFixture{t: t, ctl: newFakeControl(t), root: root, live: live, src: writeTestBackup(t, entries), workDir: t.TempDir(), cipher: cipher,
+		validate: ValidateOptions{KeyCheck: testKeyCheck, ManifestKey: testManifestKey}}
 }
+
+// resign signs the fixture's manifest again after a test changed it, as
+// the backup that wrote it would have.
+func (f *swapFixture) resign() {
+	f.t.Helper()
+	if err := f.src.Manifest.sign(testManifestKey); err != nil {
+		f.t.Fatal(err)
+	}
+}
+
+// testManifestKey and testKeyCheck are the SECRET_KEY test backups are
+// written under and test restores check them with.
+var testManifestKey = []byte("0123456789abcdef0123456789abcdef")
+
+const testKeyCheck = "0000-1111-2222-3333"
 
 func (f *swapFixture) openStores(ctx context.Context, sc StoreConfig) (blobstore.Stores, error) {
 	if sc.Backend != blobstore.BackendLocal || sc.LocalPath != f.root {
@@ -641,6 +766,103 @@ func TestSwapPreflightChangesNothing(t *testing.T) {
 	})
 }
 
+// TestSwapWaitsForNoOtherRestore: a full restore or a recovery of a
+// database another one holds is refused before it changes anything, and
+// the lock is free again once a restore returns.
+func TestSwapWaitsForNoOtherRestore(t *testing.T) {
+	f := newSwapFixture(t)
+	unlock, err := f.ctl.LockRestore(t.Context(), liveDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err, _ := f.restore(); !errors.Is(err, ErrRestoreRunning) || len(f.ctl.calls) != 0 {
+		t.Fatalf("restore beside another = %v, calls %v", err, f.ctl.calls)
+	}
+	unlock(t.Context())
+	if err, _ := f.restore(); err != nil {
+		t.Fatalf("%v\n%s", err, f.output.String())
+	}
+	if again, err := f.ctl.LockRestore(t.Context(), liveDB); err != nil {
+		t.Fatalf("the restore kept its lock: %v", err)
+	} else {
+		again(t.Context())
+	}
+
+	// A recovery takes the same lock: one beside another changes nothing.
+	f = newSwapFixture(t)
+	f.ctl.crashAt = "rename silo " + beforeDB
+	if _, crashed := f.restore(); !crashed {
+		t.Fatal("the restore did not crash")
+	}
+	f.ctl.crashAt = ""
+	unlock, err = f.ctl.LockRestore(t.Context(), liveDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	calls := len(f.ctl.calls)
+	if err, _ := f.recover(); !errors.Is(err, ErrRestoreRunning) || len(f.ctl.calls) != calls {
+		t.Fatalf("recovery beside another = %v, calls %v", err, f.ctl.calls[calls:])
+	}
+	unlock(t.Context())
+	if err, crashed := f.recover(); err != nil || crashed {
+		t.Fatalf("recover = %v (crashed %v)\n%s", err, crashed, f.output.String())
+	}
+	f.wantRolledBack()
+}
+
+// TestSwapCarriesOnlyForTheSameDeployment: the live server's credentials,
+// switches, and destinations are tied to its ids, so a restore carries them
+// only from the deployment the backup's manifest names. A backup from
+// another needs --accept-lost-credentials, refused before anything changes
+// without it, and then carries none.
+func TestSwapCarriesOnlyForTheSameDeployment(t *testing.T) {
+	f := newSwapFixture(t)
+	if err, _ := f.restore(); err != nil {
+		t.Fatalf("%v\n%s", err, f.output.String())
+	}
+	if !slices.Equal(f.ctl.carriedFrom, []string{"postgres://silo@db.invalid/" + liveDB}) {
+		t.Fatalf("the same deployment carried from %q, want the live database", f.ctl.carriedFrom)
+	}
+
+	f = newSwapFixture(t)
+	f.ctl.liveServerID = "another-deployment"
+	if err, _ := f.restore(); !errors.Is(err, ErrOtherDeployment) || len(f.ctl.calls) != 0 {
+		t.Fatalf("another deployment's backup = %v, calls %v; want ErrOtherDeployment before any change", err, f.ctl.calls)
+	}
+	f.validate.AcceptLostCredentials = true
+	if err, _ := f.restore(); err != nil {
+		t.Fatalf("%v\n%s", err, f.output.String())
+	}
+	if !slices.Equal(f.ctl.carriedFrom, []string{""}) || !strings.Contains(f.output.String(), "is not this deployment's") {
+		t.Fatalf("another deployment carried from %q, want nothing; output:\n%s", f.ctl.carriedFrom, f.output.String())
+	}
+}
+
+// TestSwapStopsWhenAClientJoinsTheLiveDatabase: the credentials a restore
+// carries are the live server's only while nothing else is on the live
+// database. A client that connects after preflight, before or after the
+// carry, stops the restore with the live database open and unchanged,
+// rather than having its session ended and its changes lost.
+func TestSwapStopsWhenAClientJoinsTheLiveDatabase(t *testing.T) {
+	for name, join := range map[string]func(*fakeControl){
+		"while the dump loads":  func(c *fakeControl) { c.joinOnLoad = true },
+		"after the credentials": func(c *fakeControl) { c.joinOnCarry = true },
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newSwapFixture(t)
+			join(f.ctl)
+			err, _ := f.restore()
+			if !errors.Is(err, ErrLiveInUse) {
+				t.Fatalf("restore = %v, want ErrLiveInUse\n%s", err, f.output.String())
+			}
+			if slices.Contains(f.ctl.calls, "terminate "+liveDB) {
+				t.Fatalf("the swap ended the client's session: %v", f.ctl.calls)
+			}
+			f.wantRolledBack()
+		})
+	}
+}
+
 // TestSwapRefusesUnsafeArchives: blobs.tar is checked whole before anything
 // changes. Two entries for one object would preserve the first restored
 // bytes over the original, so the rollback could not put it back; keys
@@ -695,7 +917,7 @@ func TestSwapStopsWhenTheJournalCannotBeMadeDurable(t *testing.T) {
 // back to the newest-version check, and the restored database is checked
 // before the swap goes ahead.
 func TestSwapRefusesMigrationsThisBinaryDoesNotCarry(t *testing.T) {
-	binary := ValidateOptions{BinaryGooseVersion: 9, BinaryMigrations: []int64{1, 9}}
+	binary := ValidateOptions{BinaryGooseVersion: 9, BinaryMigrations: []int64{1, 9}, KeyCheck: testKeyCheck, ManifestKey: testManifestKey}
 	tests := []struct {
 		name     string
 		goose    int64
@@ -718,6 +940,7 @@ func TestSwapRefusesMigrationsThisBinaryDoesNotCarry(t *testing.T) {
 			f := newSwapFixture(t)
 			f.validate = binary
 			f.src.Manifest.GooseVersion, f.src.Manifest.AppliedMigrations = tt.goose, tt.recorded
+			f.resign()
 			f.restoredApplied = tt.restored
 			err, _ := f.restore()
 			if tt.want == nil {
@@ -735,6 +958,123 @@ func TestSwapRefusesMigrationsThisBinaryDoesNotCarry(t *testing.T) {
 			}
 			if f.ctl.dbs[restoredDB] != nil || !f.ctl.dbs[liveDB].allow || f.blob(replacedKey) != liveBytes {
 				t.Fatalf("a refused restore changed something: %v", f.ctl.calls)
+			}
+		})
+	}
+}
+
+// TestAuthorityWiderThan: a live credential is carried only when its
+// account has no more authority in the restored data than live, by role,
+// sign-in, account policy, or a restriction of a profile both sides have.
+func TestAuthorityWiderThan(t *testing.T) {
+	age := func(n int) *int { return &n }
+	live := accountAuthority{rank: 0, enabled: true,
+		policy: access.EffectiveUserPolicy{LibraryIDs: []int{1}},
+		profiles: map[string]profileLimits{"kid": {child: true, ceiling: "PG", advisoryAge: age(10), requireAdvisoryAge: true,
+			restricted: true, libraries: []int{1}}}}
+	cases := []struct {
+		name   string
+		change func(*accountAuthority)
+		wider  bool
+	}{
+		{"same", func(*accountAuthority) {}, false},
+		{"admin", func(a *accountAuthority) { a.rank = 1 }, true},
+		{"break glass", func(a *accountAuthority) { a.breakGlass = true }, true},
+		{"every library", func(a *accountAuthority) { a.policy.LibraryIDs = nil }, true},
+		{"a profile only the backup has", func(a *accountAuthority) { a.profiles["old"] = profileLimits{} }, false},
+		{"not a child", func(a *accountAuthority) {
+			a.profiles["kid"] = with(a.profiles["kid"], func(p *profileLimits) { p.child = false })
+		}, true},
+		{"higher rating ceiling", func(a *accountAuthority) {
+			a.profiles["kid"] = with(a.profiles["kid"], func(p *profileLimits) { p.ceiling = "R" })
+		}, true},
+		{"lower rating ceiling", func(a *accountAuthority) {
+			a.profiles["kid"] = with(a.profiles["kid"], func(p *profileLimits) { p.ceiling = "G" })
+		}, false},
+		{"no advisory limit", func(a *accountAuthority) {
+			a.profiles["kid"] = with(a.profiles["kid"], func(p *profileLimits) { p.advisoryAge = nil })
+		}, true},
+		{"another library", func(a *accountAuthority) {
+			a.profiles["kid"] = with(a.profiles["kid"], func(p *profileLimits) { p.libraries = []int{1, 2} })
+		}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			restored := live
+			restored.profiles = maps.Clone(live.profiles)
+			tc.change(&restored)
+			if got := restored.widerThan(live); got != tc.wider {
+				t.Fatalf("widerThan = %v, want %v", got, tc.wider)
+			}
+		})
+	}
+}
+
+func with(p profileLimits, change func(*profileLimits)) profileLimits {
+	change(&p)
+	return p
+}
+
+// TestSensitiveSettingsAreClassified: every sensitive setting is either a
+// signing key a restore replaces or a credential it restores, so a new
+// signing key cannot come back from a backup without someone deciding so.
+func TestSensitiveSettingsAreClassified(t *testing.T) {
+	restored := map[string]bool{}
+	for _, key := range restoredSecretSettings {
+		restored[key] = true
+		if _, rotated := rotatedSettings[key]; rotated {
+			t.Errorf("%s is both rotated and restored", key)
+		}
+	}
+	for key := range catalog.SensitiveSettingKeys {
+		if _, rotated := rotatedSettings[key]; !rotated && !restored[key] {
+			t.Errorf("sensitive setting %s is neither in rotatedSettings nor in restoredSecretSettings", key)
+		}
+	}
+	for _, key := range append(rotatedSettingKeys(), restoredSecretSettings...) {
+		if !catalog.SensitiveSettingKeys[key] {
+			t.Errorf("%s is classified but is not a sensitive setting", key)
+		}
+	}
+}
+
+// TestValidateAuthenticatesTheManifest: a full restore trusts a manifest
+// only when it verifies under this server's SECRET_KEY. One naming this
+// key that does not verify is refused even when the operator accepts lost
+// credentials; one that cannot be checked (no key check value, another
+// key, or no SECRET_KEY here) is refused unless the operator passes
+// --accept-lost-credentials.
+func TestValidateAuthenticatesTheManifest(t *testing.T) {
+	tests := []struct {
+		name      string
+		change    func(*Manifest)
+		keyCheck  string
+		key       []byte
+		want      error // without --accept-lost-credentials
+		wantAfter error // with it
+	}{
+		{name: "matching", change: func(*Manifest) {}},
+		{name: "wrong MAC", change: func(m *Manifest) { m.MAC = strings.Repeat("ab", 32) }, want: ErrManifestTampered, wantAfter: ErrManifestTampered},
+		{name: "missing MAC", change: func(m *Manifest) { m.MAC = "" }, want: ErrManifestTampered, wantAfter: ErrManifestTampered},
+		{name: "changed checksum", change: func(m *Manifest) { m.Objects[0].SHA256 = strings.Repeat("0", 64) }, want: ErrManifestTampered, wantAfter: ErrManifestTampered},
+		{name: "missing key check", change: func(m *Manifest) { m.KeyCheck = "" }, want: ErrUnauthenticatedBackup},
+		{name: "other key", change: func(m *Manifest) { m.KeyCheck = "9999-8888-7777-6666" }, want: ErrKeyMismatch},
+		{name: "no SECRET_KEY here", change: func(*Manifest) {}, keyCheck: "-", want: ErrUnauthenticatedBackup},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			src := writeTestBackup(t, nil)
+			tt.change(src.Manifest)
+			opts := ValidateOptions{KeyCheck: testKeyCheck, ManifestKey: testManifestKey}
+			if tt.keyCheck == "-" {
+				opts = ValidateOptions{}
+			}
+			if err := src.Validate(t.Context(), opts); !errors.Is(err, tt.want) || (tt.want == nil) != (err == nil) {
+				t.Fatalf("Validate = %v, want %v", err, tt.want)
+			}
+			opts.AcceptLostCredentials = true
+			if err := src.Validate(t.Context(), opts); !errors.Is(err, tt.wantAfter) || (tt.wantAfter == nil) != (err == nil) {
+				t.Fatalf("Validate with --accept-lost-credentials = %v, want %v", err, tt.wantAfter)
 			}
 		})
 	}

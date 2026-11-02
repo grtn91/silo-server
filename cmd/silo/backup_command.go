@@ -38,6 +38,7 @@ const backupCommandUsage = `usage:
       Finish a replace that stopped, from silo-restore-<time>.journal in this directory.
   silo backup verify --from <backup> --scratch <database URL> [-env .env]
       Restore into an empty scratch database and check it against the manifest.
+  A --into or --scratch URL must not carry a password: set PGPASSWORD, or use ~/.pgpass.
 
 <backup> is a backup folder on this computer: the folder at the backup destination, or a
 downloaded copy of its objects`
@@ -119,7 +120,7 @@ func parseBackupRestoreFlags(args []string) (backupRestoreFlags, error) {
 	flags.StringVar(&f.into, "into", "", "empty database to restore into (separate mode)")
 	flags.StringVar(&f.blobsInto, "blobs-into", "", "directory for the restored files (separate mode)")
 	flags.BoolVar(&f.databaseOnly, "database-only", false, "skip files")
-	flags.BoolVar(&f.acceptLostCredentials, "accept-lost-credentials", false, "restore a backup taken with another SECRET_KEY")
+	flags.BoolVar(&f.acceptLostCredentials, "accept-lost-credentials", false, "restore a backup taken with another SECRET_KEY; the encrypted settings this key cannot read are cleared and listed")
 	flags.BoolVar(&f.keepRedis, "keep-redis", false, "leave Redis as it is after a replace")
 	flags.StringVar(&f.recoverTime, "recover", "", "finish an interrupted replace from its journal")
 	if err := flags.Parse(args); err != nil || flags.NArg() != 0 {
@@ -142,8 +143,27 @@ func parseBackupRestoreFlags(args []string) (backupRestoreFlags, error) {
 		return f, errors.New("--blobs-into and --database-only exclude each other")
 	case strings.Contains(f.blobsInto, "://"):
 		return f, errors.New("--blobs-into must be a directory on this computer")
+	case f.into != "" && backup.HasSecret(f.into):
+		return f, passwordOnCommandLine("--into")
 	}
 	return f, nil
+}
+
+// passwordOnCommandLine refuses a database URL that carries a secret in a
+// flag: any account on the host can read a running command's arguments.
+// PostgreSQL reads the password from PGPASSWORD or a password file, and a
+// client key's passphrase from a service file, instead.
+func passwordOnCommandLine(flagName string) error {
+	return fmt.Errorf("%s carries a database password or key passphrase, which other accounts on this computer can read from the process list; "+
+		"leave it out of the URL and set PGPASSWORD or put it in ~/.pgpass (PGPASSFILE), and put an sslpassword in a service file (PGSERVICEFILE)", flagName)
+}
+
+// optionalCipher is the cipher of masterKey, or nil without one.
+func optionalCipher(masterKey []byte) (*secret.Cipher, error) {
+	if len(masterKey) == 0 {
+		return nil, nil
+	}
+	return secret.New(masterKey)
 }
 
 func runBackupRestore(ctx context.Context, args []string, out io.Writer) error {
@@ -159,22 +179,17 @@ func runBackupRestore(ctx context.Context, args []string, out io.Writer) error {
 	if err != nil {
 		return err
 	}
-	src, tools, validate, err := openBackupSource(ctx, f.from, keyCheck, f.acceptLostCredentials)
+	src, tools, validate, err := openBackupSource(ctx, f.from, masterKey, keyCheck, f.acceptLostCredentials)
 	if err != nil {
 		return err
 	}
+	// Validation copies the objects it checks to a private directory and
+	// every step reads those; they go when the command ends, failed or not.
+	// A restore that went ahead stays a success when they cannot be removed.
+	defer func() { _ = closeSource(src, out) }()
 	loader := backup.PGLoader{Tools: tools}
 	if f.into != "" {
-		opts := backup.SeparateOptions{
-			Validate: validate, Into: f.into, BlobsInto: f.blobsInto, DatabaseOnly: f.databaseOnly, Out: out,
-		}
-		if _, err := backup.RestoreSeparate(ctx, src, loader, opts); err != nil {
-			return err
-		}
-		if !f.keepRedis {
-			_, _ = fmt.Fprintln(out, separateRestoreRedisNote)
-		}
-		return nil
+		return runSeparateRestore(ctx, f, src, loader, validate, masterKey, out)
 	}
 	liveURL, err := liveDatabaseURL()
 	if err != nil {
@@ -184,25 +199,17 @@ func runBackupRestore(ctx context.Context, args []string, out io.Writer) error {
 	if err != nil {
 		return err
 	}
-	// The live deployment's storage and Redis, read from its configuration
-	// before anything changes; this connection closes before the preflight
-	// checks that no other client is connected. The journal keeps the
-	// storage so --recover never reopens a database to find it.
+	// The live deployment's storage, read from its configuration before
+	// anything changes; this connection closes before the preflight checks
+	// that no other client is connected. The journal keeps the storage so
+	// --recover never reopens a database to find it.
 	var storeConfig backup.StoreConfig
-	afterRedis := redisPlan{keep: f.keepRedis}
-	if !f.databaseOnly || (!f.keepRedis && os.Getenv("REDIS_URL") == "") {
+	if !f.databaseOnly {
 		cfg, err := liveConfigFromDatabase(ctx, liveURL, cipher)
-		switch {
-		case err != nil && !f.databaseOnly:
+		if err != nil {
 			return fmt.Errorf("reading the live blob storage settings: %w", err)
-		case err != nil:
-			afterRedis.readErr = err
-		default:
-			storeConfig = backupStoreConfig(cfg)
-			afterRedis.config = liveRedisConfig(cfg)
 		}
-	} else {
-		afterRedis.config = liveRedisConfig(&config.Config{})
+		storeConfig = backupStoreConfig(cfg)
 	}
 	ctl, err := backup.ConnectControl(ctx, liveURL)
 	if err != nil {
@@ -221,8 +228,68 @@ func runBackupRestore(ctx context.Context, args []string, out io.Writer) error {
 	}); err != nil {
 		return err
 	}
-	clearRedisAfterRestore(ctx, afterRedis, dialRedis, out)
+	clearRedisAfterRestore(ctx, restoredRedisPlan(ctx, f.keepRedis, liveURL, cipher), dialRedis, out)
 	return nil
+}
+
+// restoredRedisPlan picks the Redis to clear once the restored database is
+// live: the one the servers started on it will use. REDIS_URL, when set,
+// wins, as it does at startup; otherwise the restored database names it.
+// When that read fails the plan clears nothing and says so, because the
+// Redis the live database named before the swap need not be the restored
+// server's.
+func restoredRedisPlan(ctx context.Context, keep bool, liveURL string, cipher *secret.Cipher) redisPlan {
+	if keep {
+		return redisPlan{keep: true}
+	}
+	if os.Getenv("REDIS_URL") != "" {
+		return redisPlan{config: liveRedisConfig(&config.Config{})}
+	}
+	readCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
+	cfg, err := liveConfigFromDatabase(readCtx, liveURL, cipher)
+	if err != nil {
+		return redisPlan{readErr: err}
+	}
+	return redisPlan{config: liveRedisConfig(cfg)}
+}
+
+// runSeparateRestore restores into --into and --blobs-into, aimed away
+// from the live server named by DATABASE_URL, when set.
+func runSeparateRestore(ctx context.Context, f backupRestoreFlags, src *backup.Source, loader backup.PGLoader,
+	validate backup.ValidateOptions, masterKey []byte, out io.Writer) error {
+	opts := backup.SeparateOptions{
+		Validate: validate, Into: f.into, BlobsInto: f.blobsInto, DatabaseOnly: f.databaseOnly, Out: out,
+		LiveURL: os.Getenv("DATABASE_URL"),
+	}
+	var err error
+	if opts.Cipher, err = optionalCipher(masterKey); err != nil {
+		return err
+	}
+	if opts.LiveURL != "" && !f.databaseOnly {
+		opts.LiveBlobRoots = liveBlobRoots(ctx, opts.LiveURL, opts.Cipher)
+	}
+	if _, err := backup.RestoreSeparate(ctx, src, loader, opts); err != nil {
+		return err
+	}
+	if !f.keepRedis {
+		_, _ = fmt.Fprintln(out, separateRestoreRedisNote)
+	}
+	return nil
+}
+
+// liveBlobRoots is the live server's local file storage, which a separate
+// restore must not write into, read from its settings when it can be. The
+// restore also requires an empty directory, so a failed read leaves that
+// check in force.
+func liveBlobRoots(ctx context.Context, liveURL string, cipher *secret.Cipher) []string {
+	readCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	cfg, err := liveConfigFromDatabase(readCtx, liveURL, cipher)
+	if err != nil {
+		return nil
+	}
+	return []string{cfg.Artwork.LocalPath}
 }
 
 // closeControl closes the control connection after the command's context
@@ -276,18 +343,22 @@ func runBackupVerify(ctx context.Context, args []string, out io.Writer) error {
 	if err := flags.Parse(args); err != nil || flags.NArg() != 0 || *from == "" || *scratch == "" {
 		return errors.New(backupCommandUsage)
 	}
+	if backup.HasSecret(*scratch) {
+		return passwordOnCommandLine("--scratch")
+	}
 	_ = godotenv.Load(*envFile)
 	// The drill runs anywhere: without SECRET_KEY it only cannot say whether
 	// the key matches.
-	_, keyCheck, err := backupMasterKey(false)
+	masterKey, keyCheck, err := backupMasterKey(false)
 	if err != nil {
 		return err
 	}
-	src, tools, validate, err := openBackupSource(ctx, *from, keyCheck, true)
+	src, tools, validate, err := openBackupSource(ctx, *from, masterKey, keyCheck, true)
 	if err != nil {
 		return err
 	}
-	return backup.VerifyBackup(ctx, src, backup.PGLoader{Tools: tools}, *scratch, validate, out)
+	verified := backup.VerifyBackup(ctx, src, backup.PGLoader{Tools: tools}, *scratch, validate, out)
+	return errors.Join(verified, closeSource(src, out))
 }
 
 // liveDatabaseURL reads DATABASE_URL, the database a replace or recovery
@@ -316,10 +387,22 @@ func backupMasterKey(required bool) ([]byte, string, error) {
 // findBackupTools discovers pg_dump and pg_restore; tests replace it.
 var findBackupTools = backup.FindTools
 
+// closeSource removes the private copies validation made of src, warning
+// prominently, with the directory to delete, when it cannot.
+func closeSource(src *backup.Source, out io.Writer) error {
+	err := src.Close()
+	if err != nil {
+		_, _ = fmt.Fprintf(out, "\nWARNING: could not remove the private copies of the backup's database dump and files: %v\nThey hold the backup's data; delete that directory now.\n", err)
+	}
+	return err
+}
+
 // openBackupSource opens the backup folder at from, the tools that restore
-// it, and the checks a restore runs: keyCheck is this SECRET_KEY's check
-// value, and acceptLostCredentials restores a backup taken with another key.
-func openBackupSource(ctx context.Context, from, keyCheck string, acceptLostCredentials bool) (*backup.Source, backup.Tools, backup.ValidateOptions, error) {
+// it, and the checks a restore runs: masterKey and keyCheck are this
+// SECRET_KEY and its check value (a backup written under it must carry a
+// manifest MAC that verifies), and acceptLostCredentials restores a backup
+// taken with another key.
+func openBackupSource(ctx context.Context, from string, masterKey []byte, keyCheck string, acceptLostCredentials bool) (*backup.Source, backup.Tools, backup.ValidateOptions, error) {
 	src, err := backup.OpenSource(from)
 	if err != nil {
 		return nil, backup.Tools{}, backup.ValidateOptions{}, err
@@ -336,6 +419,11 @@ func openBackupSource(ctx context.Context, from, keyCheck string, acceptLostCred
 		return nil, backup.Tools{}, backup.ValidateOptions{}, err
 	}
 	validate := backup.ValidateOptions{KeyCheck: keyCheck, BinaryMigrations: carried, AcceptLostCredentials: acceptLostCredentials}
+	if masterKey != nil {
+		if validate.ManifestKey, err = secret.BackupManifestKey(masterKey); err != nil {
+			return nil, backup.Tools{}, backup.ValidateOptions{}, err
+		}
+	}
 	if len(carried) > 0 {
 		validate.BinaryGooseVersion = carried[len(carried)-1]
 	}

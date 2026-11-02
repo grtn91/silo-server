@@ -1,6 +1,7 @@
 package backup
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -20,6 +21,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/backup/userdata"
 	"github.com/Silo-Server/silo-server/internal/blobstore"
 	"github.com/Silo-Server/silo-server/internal/catalog"
+	"github.com/Silo-Server/silo-server/internal/config"
 	"github.com/Silo-Server/silo-server/internal/secret"
 	"github.com/Silo-Server/silo-server/internal/sections"
 	"github.com/Silo-Server/silo-server/internal/userstore"
@@ -143,11 +145,12 @@ func seedSelective(t *testing.T, pool *pgxpool.Pool, settings *catalog.Encrypted
 		poster: "library poster", seed.artwork: "uploaded poster", "local/movies/" + seed.items[0] + "/abcd1234/poster/w500.r1.jpg": "uploaded w500",
 		collectionPoster: "collection poster", "collection-images/" + cid + "/poster/w300.abcd.jpg": "collection w300",
 	} {
-		if err := store.Put(ctx, key, []byte(data)); err != nil {
+		if err := store.Put(ctx, key, testImage(t, data)); err != nil {
 			t.Fatal(err)
 		}
 	}
 	setSetting(t, pool, settings, seed.settingKey, "17")
+	setSetting(t, pool, settings, config.AccessUnratedContentSettingKey, config.AccessUnratedContentAllow)
 	setSetting(t, pool, settings, seed.secretKey, "simkl-"+suffix)
 	return seed
 }
@@ -190,6 +193,8 @@ type selectiveFixture struct {
 	calls         []int
 	created       []int
 	failFollowUps bool
+	// beforeSettings runs ahead of each settings write, before its lock.
+	beforeSettings func()
 }
 
 func newSelectiveFixture(t *testing.T) *selectiveFixture {
@@ -205,6 +210,10 @@ func newSelectiveFixture(t *testing.T) *selectiveFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
+	manifestKey, err := secret.BackupManifestKey(masterKey)
+	if err != nil {
+		t.Fatal(err)
+	}
 	store, err := blobstore.NewFilesystem(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -212,7 +221,7 @@ func newSelectiveFixture(t *testing.T) *selectiveFixture {
 	f := &selectiveFixture{pool: pool, store: store, serverID: "selective-" + randomHex(t, 4),
 		settings: catalog.NewEncryptedSettingsRepo(catalog.NewServerSettingsRepo(pool), cipher)}
 	f.svc = New(Options{
-		Pool: pool, DatabaseURL: dsn, Settings: f.settings, Cipher: cipher, KeyCheck: keyCheck,
+		Pool: pool, DatabaseURL: dsn, Settings: f.settings, Cipher: cipher, KeyCheck: keyCheck, ManifestKey: manifestKey,
 		Stores: blobstore.Stores{Assets: store, Operational: store}, Destination: NewStoreDestination(store),
 		Locker:    PostgresLocker{Pool: pool},
 		ServerID:  func(context.Context) (string, error) { return f.serverID, nil },
@@ -221,10 +230,21 @@ func newSelectiveFixture(t *testing.T) *selectiveFixture {
 	f.svc.SetRestoreTargets(RestoreTargets{
 		CheckFolder:  func(_ context.Context, path string) error { _, err := os.Stat(path); return err },
 		TrackArtwork: catalog.NewArtworkRevisionTracker(pool).TrackArtworkRevision,
-		ApplySettings: func(ctx context.Context, tx pgx.Tx, values map[string]string) ([]string, func(context.Context), error) {
-			err := f.settings.UpdateAtomicWithTx(ctx, tx, func(map[string]string, pgx.Tx) (map[string]string, error) { return values, nil })
+		ApplySettings: func(ctx context.Context, tx pgx.Tx, values map[string]string, check func(map[string]string) error) ([]string, func(context.Context), error) {
+			if f.beforeSettings != nil {
+				f.beforeSettings()
+			}
+			err := f.settings.UpdateAtomicWithTx(ctx, tx, func(stored map[string]string, _ pgx.Tx) (map[string]string, error) {
+				if check != nil {
+					if err := check(stored); err != nil {
+						return nil, err
+					}
+				}
+				return values, nil
+			})
 			return nil, func(context.Context) {}, err
 		},
+		LibrarySectionsCreated: func(context.Context, int) error { return nil },
 		LibraryCreated: func(_ context.Context, id int) error {
 			f.calls = append(f.calls, id)
 			if f.failFollowUps {
@@ -254,6 +274,9 @@ func (f *selectiveFixture) lose(t *testing.T, seed selectiveSeed) {
 	if err := f.settings.Set(ctx, seed.secretKey, "changed"); err != nil {
 		t.Fatal(err)
 	}
+	if err := f.settings.Set(ctx, config.AccessUnratedContentSettingKey, config.AccessUnratedContentHide); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func (f *selectiveFixture) restore(t *testing.T, backupID, digest string, selection map[string][]string, fence *testFence) (*SelectiveReport, error) {
@@ -277,6 +300,17 @@ func checkPreviewAfterLoss(t *testing.T, preview *RestorePreview, seed selective
 		if s.Key == seed.secretKey && (!s.Masked || s.BackupValue != "" || s.Status != ItemDiffers) {
 			t.Fatalf("encrypted setting in the preview = %+v, want masked and differing", s)
 		}
+	}
+	// Showing unrated titles to rating-capped profiles again would widen
+	// access: the stricter live value stays.
+	library := previewItem(t, preview, SectionSettings, pageLibrary)
+	for _, s := range library.Settings {
+		if s.Key == config.AccessUnratedContentSettingKey && s.Status != SettingKeptStricter {
+			t.Fatalf("unrated-content setting in the preview = %+v, want kept_stricter", s)
+		}
+	}
+	if library.Selectable || library.Reason != ReasonKeptStricter {
+		t.Fatalf("library settings page = %+v, want unselectable, kept_stricter", library)
 	}
 }
 
@@ -363,6 +397,53 @@ func (f *selectiveFixture) pendingFollowUps(t *testing.T, ids []int) int {
 	return n
 }
 
+// checkMissingFilesRestored: item artwork the catalog still shows, whose
+// file is gone from storage, previews as differing; restoring it writes the
+// file back without touching the catalog, and the next preview finds it
+// the same.
+func (f *selectiveFixture) checkMissingFilesRestored(t *testing.T, seed selectiveSeed, backupID, artworkRef string) {
+	t.Helper()
+	ctx := t.Context()
+	body, _, err := f.store.Get(ctx, seed.artwork)
+	if err != nil {
+		t.Fatal(err)
+	}
+	original, err := io.ReadAll(body)
+	_ = body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.Delete(ctx, []string{seed.artwork}); err != nil {
+		t.Fatal(err)
+	}
+	preview, err := f.svc.Preview(ctx, backupID, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if item := previewItem(t, preview, SectionCollections, artworkRef); item.Status != ItemDiffers || !item.Selectable || item.Reason != ReasonFilesMissingHere {
+		t.Fatalf("artwork whose file is gone = %+v, want differing with %s", item, ReasonFilesMissingHere)
+	}
+	report, err := f.restore(t, backupID, preview.Digest, map[string][]string{SectionCollections: {artworkRef}}, &testFence{pool: f.pool})
+	if err != nil || reportOutcomes(report)[SectionCollections+":"+artworkRef] != OutcomeRestored {
+		t.Fatalf("restoring the missing file = %v (%+v)", err, report.Items)
+	}
+	body, _, err = f.store.Get(ctx, seed.artwork)
+	if err != nil {
+		t.Fatalf("the file was not written back: %v", err)
+	}
+	restored, _ := io.ReadAll(body)
+	_ = body.Close()
+	if !bytes.Equal(restored, original) {
+		t.Fatal("the file written back differs from the backup's")
+	}
+	if preview, err = f.svc.Preview(ctx, backupID, false); err != nil {
+		t.Fatal(err)
+	}
+	if item := previewItem(t, preview, SectionCollections, artworkRef); item.Status != ItemOnThisServer || item.Reason != ReasonSame {
+		t.Fatalf("artwork after its file came back = %+v, want the same", item)
+	}
+}
+
 // checkConflictingBlob restores the item artwork while another object
 // already sits at its key: the item fails, the object and the item are left
 // as they were, and nothing else is affected.
@@ -424,6 +505,130 @@ func (f *selectiveFixture) checkConflictingBlob(t *testing.T, seed selectiveSeed
 //     and the encrypted value are restored, and a before-restore backup is
 //     recorded;
 //   - running the same restore again changes nothing and runs no follow-up.
+//
+// TestRestoreRechecksAccessSettingsUnderTheLockDB: an access setting an
+// admin makes stricter after the restore planned its page, but before the
+// settings write takes its lock, keeps the admin's value. The item starts
+// again from its read and leaves the setting out.
+func TestRestoreRechecksAccessSettingsUnderTheLockDB(t *testing.T) {
+	f := newSelectiveFixture(t)
+	ctx := t.Context()
+	const key = config.AuthRefreshTokenExpirySettingKey
+	setSetting(t, f.pool, f.settings, key, "7d")
+	source, err := backupUnderLock(t, f.svc, KindManual)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.settings.Set(ctx, key, "30d"); err != nil {
+		t.Fatal(err)
+	}
+	preview, err := f.svc.Preview(ctx, source.ID, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	page := previewItem(t, preview, SectionSettings, pageSignIn)
+	if !page.Selectable {
+		t.Fatalf("sign-in page before the edit = %+v, want a stricter value to restore", page)
+	}
+	edited := false
+	f.beforeSettings = func() {
+		if !edited {
+			edited = true
+			if err := f.settings.Set(context.Background(), key, "1d"); err != nil {
+				t.Error(err)
+			}
+		}
+	}
+	report, err := f.restore(t, source.ID, preview.Digest, map[string][]string{SectionSettings: {pageSignIn}}, &testFence{pool: f.pool})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if item := reportItem(t, report, SectionSettings, pageSignIn); item.Outcome != OutcomeLeftOut || item.Reason != ReasonKeptStricter {
+		t.Fatalf("sign-in page = %+v, want left out, kept_stricter", item)
+	}
+	if got, err := f.settings.Get(ctx, key); err != nil || got != "1d" {
+		t.Fatalf("%s = %q, %v; want the admin's 1d", key, got, err)
+	}
+}
+
+// TestRestoreNeverSendsLiveSecretsToARestoredAddressDB: restoring a mail
+// server address the backup has no password for clears the password here
+// and turns email off, rather than sending this server's password to the
+// backup's server; a backup this server cannot verify restores no setting
+// that connects to an outside service at all.
+func TestRestoreNeverSendsLiveSecretsToARestoredAddressDB(t *testing.T) {
+	f := newSelectiveFixture(t)
+	ctx := t.Context()
+	const host, password, enabled = "email.smtp_host", "email.smtp_password", "email.enabled"
+	dbExec(t, f.pool, `DELETE FROM server_settings WHERE key = $1`, password)
+	setSetting(t, f.pool, f.settings, host, "smtp.backup.example")
+	setSetting(t, f.pool, f.settings, enabled, "true")
+	source, err := backupUnderLock(t, f.svc, KindManual)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.settings.Set(ctx, host, "mail.example.com"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.settings.Set(ctx, password, "the live password"); err != nil {
+		t.Fatal(err)
+	}
+	preview, err := f.svc.Preview(ctx, source.ID, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	page := previewItem(t, preview, SectionSettings, pageEmail)
+	cleared := map[string]bool{}
+	for _, s := range page.Settings {
+		cleared[s.Key] = s.Status == SettingCleared
+	}
+	if !page.Selectable || !cleared[password] || !cleared[enabled] {
+		t.Fatalf("email page = %+v, want the password cleared and email turned off", page)
+	}
+	report, err := f.restore(t, source.ID, preview.Digest, map[string][]string{SectionSettings: {pageEmail}}, &testFence{pool: f.pool})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if item := reportItem(t, report, SectionSettings, pageEmail); item.Outcome != OutcomeRestored {
+		t.Fatalf("email page = %+v", item)
+	}
+	for key, want := range map[string]string{host: "smtp.backup.example", password: "", enabled: "false"} {
+		if got, _ := f.settings.Get(ctx, key); got != want {
+			t.Fatalf("%s = %q, want %q", key, got, want)
+		}
+	}
+
+	// The same backup under another key: nothing that reaches a service.
+	manifestKey := objectKey(f.serverID, source.ID, ManifestName)
+	body, _, err := f.store.Get(ctx, manifestKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, _ := io.ReadAll(body)
+	_ = body.Close()
+	m, err := ParseManifest(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.KeyCheck = "9999-8888-7777-6666"
+	if data, err = json.Marshal(m); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.store.Put(ctx, manifestKey, data); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.settings.Set(ctx, host, "mail.example.com"); err != nil {
+		t.Fatal(err)
+	}
+	unverified, err := f.svc.Preview(ctx, source.ID, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if page := previewItem(t, unverified, SectionSettings, pageEmail); page.Selectable || page.Reason != ReasonUnverifiedBackup {
+		t.Fatalf("email page of an unverified backup = %+v, want unselectable, unverified_backup", page)
+	}
+}
+
 func TestSelectiveRestoreDB(t *testing.T) {
 	f := newSelectiveFixture(t)
 	ctx := t.Context()
@@ -434,7 +639,7 @@ func TestSelectiveRestoreDB(t *testing.T) {
 	}
 	libraryRef, library2Ref := strconv.Itoa(seed.libraryID), strconv.Itoa(seed.library2ID)
 	collectionRef, artworkRef := collectionItemID(seed.collectionID), "artwork:"+seed.items[0]+":poster"
-	preview, err := f.svc.Preview(ctx, source.ID)
+	preview, err := f.svc.Preview(ctx, source.ID, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -443,8 +648,9 @@ func TestSelectiveRestoreDB(t *testing.T) {
 			t.Fatalf("%s %s before the loss = %+v, want on this server", c.section, c.id, item)
 		}
 	}
+	f.checkMissingFilesRestored(t, seed, source.ID, artworkRef)
 	f.lose(t, seed)
-	if preview, err = f.svc.Preview(ctx, source.ID); err != nil {
+	if preview, err = f.svc.Preview(ctx, source.ID, false); err != nil {
 		t.Fatal(err)
 	}
 	checkPreviewAfterLoss(t, preview, seed)
@@ -468,8 +674,10 @@ func TestSelectiveRestoreDB(t *testing.T) {
 		t.Fatalf("fenced restore = %v, follow-ups %v done %v, before-restore %q", err, f.calls, f.created, report.BeforeRestoreBackupID)
 	}
 	newLibrary := f.calls[0]
-	if n := f.pendingFollowUps(t, []int{newLibrary}); n != 1 {
-		t.Fatalf("owed follow-ups after the interruption = %d, want 1", n)
+	// The library's set-up and its sections, which wait for the end of the
+	// restore.
+	if n := f.pendingFollowUps(t, []int{newLibrary}); n != 2 {
+		t.Fatalf("owed follow-ups after the interruption = %d, want 2", n)
 	}
 	f.failFollowUps = false
 	if report, err = f.restore(t, source.ID, preview.Digest, selection, &testFence{pool: f.pool}); err != nil {
@@ -511,6 +719,9 @@ func TestSelectiveRestoreDB(t *testing.T) {
 type pagesSeed struct {
 	suffix  string
 	library int
+	// library2 is a second library an admin added to both template
+	// collections' scope.
+	library2 int
 	// customized was created from a template and then changed by the admin;
 	// plain keeps the template's defaults but its description; gone names
 	// a template this server's catalog does not have.
@@ -558,6 +769,7 @@ func seedPages(t *testing.T, f *selectiveFixture) pagesSeed {
 	ctx, pool := t.Context(), f.pool
 	s := pagesSeed{suffix: randomHex(t, 4)}
 	s.library = testLibrary(t, pool, "pages-"+s.suffix)
+	s.library2 = testLibrary(t, pool, "pages2-"+s.suffix)
 	s.items = []string{"bkpg-" + s.suffix + "-1", "bkpg-" + s.suffix + "-2"}
 	for _, id := range s.items {
 		testMovie(t, pool, id, "Page "+id, "", s.library)
@@ -579,8 +791,11 @@ func seedPages(t *testing.T, f *selectiveFixture) pagesSeed {
 	}
 	s.customized = fromTemplate("tmdb_popular_movies", func(in *catalog.CreateLibraryCollectionInput) {
 		in.Title, in.Featured, in.SortOrder, in.Visibility = "My popular "+s.suffix, !in.Featured, 7, "hidden"
+		in.LibraryIDs = []int{s.library, s.library2}
 	})
-	s.plain = fromTemplate("tmdb_top_rated_movies", func(in *catalog.CreateLibraryCollectionInput) { in.Description = "Backup description" })
+	s.plain = fromTemplate("tmdb_top_rated_movies", func(in *catalog.CreateLibraryCollectionInput) {
+		in.Description, in.LibraryIDs = "Backup description", []int{s.library, s.library2}
+	})
 	gone, err := repo.Create(ctx, catalog.CreateLibraryCollectionInput{LibraryID: s.library, Slug: "gone-" + s.suffix, Title: "Gone template", CollectionType: "tmdb",
 		ManagementMode: managementTemplateBundle, ManagementSource: "core_defaults", ManagementKey: TemplateManagementKey("core_defaults", "retired_template", s.library)})
 	if err != nil {
@@ -591,7 +806,7 @@ func seedPages(t *testing.T, f *selectiveFixture) pagesSeed {
 	if err != nil {
 		t.Fatal(err)
 	}
-	dbExec(t, pool, `UPDATE library_collection_libraries SET group_id = $2 WHERE collection_id = $1`, s.customized, group.ID)
+	dbExec(t, pool, `UPDATE library_collection_libraries SET group_id = $2 WHERE collection_id = $1 AND library_id = $3`, s.customized, group.ID, s.library)
 	managed, err := repo.Create(ctx, catalog.CreateLibraryCollectionInput{LibraryID: s.library, Slug: "managed-" + s.suffix, Title: "Managed " + s.suffix,
 		ManagementMode: managementSection, ManagementSource: "sections", ManagementKey: "managed-" + s.suffix})
 	if err != nil {
@@ -643,6 +858,7 @@ func (f *selectiveFixture) losePages(t *testing.T, s pagesSeed) {
 	dbExec(t, f.pool, `DELETE FROM library_collections WHERE id = ANY($1)`, []string{s.customized, s.managedCollection})
 	dbExec(t, f.pool, `UPDATE page_sections SET title = 'Renamed', section_type = 'recently_released' WHERE id = $1`, s.recent)
 	dbExec(t, f.pool, `UPDATE library_collections SET title = 'Renamed later', description = '' WHERE id = $1`, s.plain)
+	dbExec(t, f.pool, `DELETE FROM library_collection_libraries WHERE collection_id = $1 AND library_id = $2`, s.plain, s.library2)
 	dbExec(t, f.pool, `DELETE FROM users WHERE id = $1`, s.account)
 }
 
@@ -676,7 +892,7 @@ func TestTemplateCollectionsAndHomeSectionsDB(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.losePages(t, s)
-	preview, err := f.svc.Preview(ctx, source.ID)
+	preview, err := f.svc.Preview(ctx, source.ID, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -703,6 +919,55 @@ func TestTemplateCollectionsAndHomeSectionsDB(t *testing.T) {
 		t.Fatalf("the retried sync did not finish: synced %v", synced)
 	}
 	checkChangesNothing(t, f.restoreRequest(t, req))
+}
+
+// TestRestoredLibrarySectionsWaitForTheRestoreDB: a library the restore
+// recreates gets its default sections only after the restore wrote its saved
+// ones, and only where it wrote none. A default renamed before the backup
+// then comes back once, not beside a freshly seeded default.
+func TestRestoredLibrarySectionsWaitForTheRestoreDB(t *testing.T) {
+	f := newSelectiveFixture(t)
+	ctx, pool := t.Context(), f.pool
+	wirePageTargets(f, new(bool), &[]string{})
+	seed := func(ctx context.Context, id int) error {
+		return sections.NewRepository(pool).SeedDefaults(ctx, pageScopeLibrary, &id, sections.DefaultLibrarySectionsForType(&id, "movies"))
+	}
+	targets := f.svc.targets
+	targets.LibrarySectionsCreated = seed
+	f.svc.SetRestoreTargets(targets)
+	library := testLibrary(t, pool, "seeded-"+randomHex(t, 4))
+	if err := seed(ctx, library); err != nil {
+		t.Fatal(err)
+	}
+	dbExec(t, pool, `UPDATE page_sections SET title = 'Renamed before the backup'
+		WHERE id = (SELECT id FROM page_sections WHERE library_id = $1 ORDER BY position LIMIT 1)`, library)
+	saved := countRows(t, pool, `SELECT count(*) FROM page_sections WHERE library_id = $1`, library)
+	source, err := backupUnderLock(t, f.svc, KindManual)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dbExec(t, pool, `DELETE FROM media_folders WHERE id = $1`, library)
+	preview, err := f.svc.Preview(ctx, source.ID, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	selection := map[string][]string{SectionLibraries: {strconv.Itoa(library)}}
+	for _, section := range preview.Sections {
+		for _, item := range section.Items {
+			if section.ID == SectionHomeSections && item.Selectable && item.HomeSection != nil && item.HomeSection.Scope == pageScopeLibrary {
+				selection[SectionHomeSections] = append(selection[SectionHomeSections], item.ID)
+			}
+		}
+	}
+	report := f.restoreRequest(t, RestoreRequest{BackupID: source.ID, Digest: preview.Digest, Selection: selection})
+	restored := report.LibraryMap[strconv.Itoa(library)]
+	t.Cleanup(func() { _, _ = pool.Exec(context.Background(), `DELETE FROM media_folders WHERE id = $1`, restored) })
+	if n := countRows(t, pool, `SELECT count(*) FROM page_sections WHERE library_id = $1`, restored); restored == 0 || n != saved {
+		t.Fatalf("restored library %d has %d sections, want the %d saved ones and no seeded defaults beside them", restored, n, saved)
+	}
+	if n := countRows(t, pool, `SELECT count(*) FROM backup_restore_followups WHERE target_id = $1`, restored); n != 0 {
+		t.Fatalf("%d follow-ups left for the restored library", n)
+	}
 }
 
 // TestIdentityTwinsRestoreOneToOneDB: a backup with two library page
@@ -777,7 +1042,7 @@ func TestIdentityTwinsRestoreOneToOneDB(t *testing.T) {
 	}
 	previewAll := func(want string) *RestorePreview {
 		t.Helper()
-		preview, err := f.svc.Preview(ctx, source.ID)
+		preview, err := f.svc.Preview(ctx, source.ID, false)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -891,7 +1156,7 @@ func TestLayoutCollectionsMapAcrossServersDB(t *testing.T) {
 	dbExec(t, pool, `DELETE FROM library_collections WHERE id = ANY($1)`, []string{template.ID, gone.ID})
 	dbExec(t, pool, `DELETE FROM users WHERE id = $1`, account)
 	f.moveToAnotherServer(t, source.ID)
-	preview, err := f.svc.Preview(ctx, source.ID)
+	preview, err := f.svc.Preview(ctx, source.ID, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -920,7 +1185,7 @@ func TestLayoutCollectionsMapAcrossServersDB(t *testing.T) {
 		configCollection(t, overrides, "Mine", userdata.UserCollectionField) != newPersonal || newPersonal == personal {
 		t.Fatalf("restored layout %s; want Popular on %s and Mine on %s, Gone left out", stored, newTemplate, newPersonal)
 	}
-	again, err := f.svc.Preview(ctx, source.ID)
+	again, err := f.svc.Preview(ctx, source.ID, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -966,7 +1231,7 @@ func checkPagesPreview(t *testing.T, p *RestorePreview, s pagesSeed) map[string]
 		t.Fatalf("lost template collection = %+v %+v", customized, customized.Collection)
 	}
 	plain := previewItem(t, p, SectionCollections, templateCollectionItemID(s.plain))
-	if plain.Status != ItemDiffers || !slices.Equal(plain.Collection.Changes, []string{"description"}) {
+	if plain.Status != ItemDiffers || !slices.Equal(plain.Collection.Changes, []string{"description", "libraries"}) {
 		t.Fatalf("changed template collection = %+v %+v", plain, plain.Collection)
 	}
 	if got := previewItem(t, p, SectionHomeSections, homeSectionItemID(s.featured)); !got.Selectable ||
@@ -993,7 +1258,7 @@ func (f *selectiveFixture) checkRestoredPages(t *testing.T, s pagesSeed, report 
 	if err := pool.QueryRow(ctx, `SELECT c.id, c.title, c.visibility, c.featured, c.sort_order, c.poster_from_template, COALESCE(g.slug, '')
 		FROM library_collections c JOIN library_collection_libraries l ON l.collection_id = c.id
 		LEFT JOIN library_collection_groups g ON g.id = l.group_id
-		WHERE c.management_key = $1`, TemplateManagementKey("core_defaults", "tmdb_popular_movies", s.library)).
+		WHERE c.management_key = $1 AND l.library_id = $2`, TemplateManagementKey("core_defaults", "tmdb_popular_movies", s.library), s.library).
 		Scan(&id, &title, &visibility, &featured, &sortOrder, &fromTemplate, &slug); err != nil {
 		t.Fatalf("recreated template collection: %v", err)
 	}
@@ -1004,6 +1269,12 @@ func (f *selectiveFixture) checkRestoredPages(t *testing.T, s pagesSeed, report 
 	if id == s.customized || title != "My popular "+s.suffix || visibility != "hidden" || featured == defaults.Input.Featured || sortOrder != 7 ||
 		fromTemplate != defaults.Input.PosterFromTemplate || slug != "picks-"+s.suffix {
 		t.Fatalf("recreated %s: title %q visibility %q featured %v sort %d from template %v group %q", id, title, visibility, featured, sortOrder, fromTemplate, slug)
+	}
+	for _, c := range []string{id, s.plain} {
+		if n := countRows(t, pool, `SELECT count(*) FROM library_collection_libraries WHERE collection_id = $1 AND library_id = ANY($2)`,
+			c, []int{s.library, s.library2}); n != 2 {
+			t.Fatalf("template collection %s is in %d of its 2 libraries", c, n)
+		}
 	}
 	var plainTitle, plainDescription string
 	if err := pool.QueryRow(ctx, `SELECT title, description FROM library_collections WHERE id = $1`, s.plain).Scan(&plainTitle, &plainDescription); err != nil ||

@@ -42,9 +42,13 @@ func exportKeyed(ctx context.Context, tx pgx.Tx, sql string, owner userdata.Owne
 }
 
 func validateKeyed(kind string, entries []keyedEntry, sum *userdata.Summary) error {
+	seen := userdata.Distinct{}
 	for _, e := range entries {
 		if !userdata.ValidContentID(e.Item) {
 			return fmt.Errorf("%s names an invalid item %q", kind, e.Item)
+		}
+		if err := seen.Add(kind, e.Item); err != nil {
+			return err
 		}
 		sum.Items = append(sum.Items, e.Item)
 	}
@@ -55,6 +59,7 @@ func validateKeyed(kind string, entries []keyedEntry, sum *userdata.Summary) err
 // importKeyed inserts each mapped entry the profile does not have. sql takes
 // user id, profile id, item, and time, and must do nothing on conflict.
 func importKeyed(ctx context.Context, tx pgx.Tx, target userdata.Target, sql string, entries []keyedEntry, res *userdata.Result) error {
+	var rows [][]any
 	for _, e := range entries {
 		local, ok, err := target.Items.Resolve(ctx, e.Item)
 		if err != nil {
@@ -68,17 +73,12 @@ func importKeyed(ctx context.Context, tx pgx.Tx, target userdata.Target, sql str
 		if at.IsZero() {
 			at = target.Now
 		}
-		tag, err := tx.Exec(ctx, sql, target.UserID, target.ProfileID, local, at)
-		if err != nil {
-			return err
-		}
-		if tag.RowsAffected() > 0 {
-			res.Added++
-		} else {
-			res.Unchanged++
-		}
+		rows = append(rows, []any{target.UserID, target.ProfileID, local, at})
 	}
-	return nil
+	added, err := userdata.InsertEach(ctx, tx, sql, rows)
+	res.Added += added
+	res.Unchanged += len(rows) - added
+	return err
 }
 
 func exportDocument(doc any, count int, items []string) (userdata.Export, error) {
@@ -175,9 +175,13 @@ func decodeDismissals(data json.RawMessage) (dismissalsDocument, userdata.Summar
 	if err := userdata.CheckEntries("dismissals", len(doc.Home)+len(doc.NotInterested)+len(doc.DroppedSeries)); err != nil {
 		return doc, sum, err
 	}
+	home := userdata.Distinct{}
 	for _, d := range doc.Home {
 		if (d.Surface != "continue_watching" && d.Surface != "next_up") || !userdata.ValidContentID(d.Item) || (d.Series != nil && !userdata.ValidContentID(*d.Series)) {
 			return doc, sum, fmt.Errorf("a home dismissal of %q is not valid", d.Item)
+		}
+		if err := home.Add("home dismissals", d.Surface+":"+d.Item); err != nil {
+			return doc, sum, err
 		}
 		sum.Items = append(sum.Items, d.Item)
 		if d.Series != nil {

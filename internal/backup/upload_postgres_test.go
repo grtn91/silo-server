@@ -260,7 +260,7 @@ func TestUploadLimitAndSweepDB(t *testing.T) {
 	}
 	held.Release(ctx)
 	var queued *RestoreRequest
-	a.SetRestoreTargets(RestoreTargets{ActiveRestore: func(ctx context.Context) (*RestoreRequest, error) {
+	a.opts.ActiveRestore = func(ctx context.Context) (*RestoreRequest, error) {
 		// A restore being queued now waits for the sweep.
 		if held, err := b.opts.Locker.TryLock(ctx); !errors.Is(err, ErrBusy) {
 			if held != nil {
@@ -269,7 +269,7 @@ func TestUploadLimitAndSweepDB(t *testing.T) {
 			t.Errorf("queueing a restore during the sweep = %v, want ErrBusy", err)
 		}
 		return queued, nil
-	}})
+	}
 	queued = &RestoreRequest{UploadID: completed.ID}
 	if _, warnings := a.sweepUploads(ctx, false, nil); len(warnings) != 0 {
 		t.Fatal(warnings)
@@ -331,7 +331,7 @@ func TestUploadRejectsHostileArchivesDB(t *testing.T) {
 		if keys := uploadObjects(t, store, u.ID); len(keys) != 0 {
 			t.Fatalf("%s: a rejected upload's parts remain: %v", c.name, keys)
 		}
-		if _, err := svc.PreviewUpload(ctx, u.ID); !errors.Is(err, ErrUploadNotReady) {
+		if _, err := svc.PreviewUpload(ctx, u.ID, true); !errors.Is(err, ErrUploadNotReady) {
 			t.Fatalf("%s: preview of a rejected upload = %v", c.name, err)
 		}
 		// Rejected uploads do not count against the limit and go at once.
@@ -385,7 +385,7 @@ func newOtherServer(t *testing.T, f *selectiveFixture) *otherServer {
 	targets.CreateJob = func(context.Context, int, RestoreRequest) (*models.AdminJob, error) {
 		return &models.AdminJob{ID: "queued"}, nil
 	}
-	targets.ActiveRestore = func(context.Context) (*RestoreRequest, error) { return o.queued, nil }
+	o.svc.opts.ActiveRestore = func(context.Context) (*RestoreRequest, error) { return o.queued, nil }
 	o.svc.SetRestoreTargets(targets)
 	return o
 }
@@ -434,7 +434,9 @@ func checkCrossServerPreview(t *testing.T, preview *RestorePreview, u UploadSess
 	}
 	settings := previewItem(t, preview, SectionSettings, "other").Settings
 	for _, s := range settings {
-		if s.Key == seed.secretKey && s.Status == ItemNeedsAnotherKey && s.Masked {
+		// An upload is unverified, so a setting that reaches an outside
+		// service is never restored from it, encrypted or not.
+		if s.Key == seed.secretKey && (s.Status == ItemNeedsAnotherKey || s.Status == SettingUnverifiedBackup) && s.Masked {
 			return
 		}
 	}
@@ -475,14 +477,19 @@ func TestRestoreFromUploadDB(t *testing.T) {
 		t.Fatalf("upload = %+v", u)
 	}
 	f.lose(t, seed)
-	preview, err := other.svc.PreviewUpload(ctx, u.ID)
+	preview, err := other.svc.PreviewUpload(ctx, u.ID, true)
 	if err != nil {
 		t.Fatal(err)
 	}
 	checkCrossServerPreview(t, preview, u, seed)
 
 	libraryRef := strconv.Itoa(seed.libraryID)
-	req := RestoreRequest{UploadID: u.ID, Digest: strings.Repeat("0", 64), Selection: map[string][]string{SectionLibraries: {libraryRef}}}
+	// An upload carries no manifest this server signed: restoring from it
+	// needs the admin's confirmation.
+	if _, err := other.svc.StartRestore(ctx, 1, RestoreRequest{UploadID: u.ID, Digest: u.Digest, Selection: map[string][]string{SectionLibraries: {libraryRef}}}); !errors.Is(err, ErrUnauthenticated) {
+		t.Fatalf("restoring an upload unconfirmed = %v, want ErrUnauthenticated", err)
+	}
+	req := RestoreRequest{UploadID: u.ID, Digest: strings.Repeat("0", 64), Selection: map[string][]string{SectionLibraries: {libraryRef}}, AcceptUnauthenticated: true}
 	if _, err := other.svc.StartRestore(ctx, 1, req); !errors.Is(err, ErrDigestMismatch) {
 		t.Fatalf("queueing with another digest = %v, want ErrDigestMismatch", err)
 	}
@@ -490,7 +497,7 @@ func TestRestoreFromUploadDB(t *testing.T) {
 		t.Fatalf("restore with another digest = %v, want ErrDigestMismatch", err)
 	}
 	req.Digest = u.Digest
-	if _, err := other.svc.StartRestore(ctx, 1, RestoreRequest{UploadID: u.ID, BackupID: source.ID, Digest: u.Digest, Selection: req.Selection}); !errors.As(err, new(*SelectionError)) {
+	if _, err := other.svc.StartRestore(ctx, 1, RestoreRequest{UploadID: u.ID, BackupID: source.ID, Digest: u.Digest, Selection: req.Selection, AcceptUnauthenticated: true}); !errors.As(err, new(*SelectionError)) {
 		t.Fatalf("queueing with two sources = %v, want SelectionError", err)
 	}
 	if _, err := other.svc.StartRestore(ctx, 1, req); err != nil {

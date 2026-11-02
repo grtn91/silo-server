@@ -3,18 +3,20 @@ package backup
 import (
 	"archive/tar"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
 
+	"github.com/jackc/pgx/v5/pgconn"
+
 	"github.com/Silo-Server/silo-server/internal/blobstore"
+	"github.com/Silo-Server/silo-server/internal/secret"
 )
 
 var (
@@ -36,6 +38,11 @@ var (
 type Source struct {
 	Dir      string
 	Manifest *Manifest
+	// private is the directory of the checked copies Validate reads from
+	// (privatize); origin is the folder they came from.
+	private, origin string
+	// authenticated is set once Validate verified the manifest's MAC.
+	authenticated bool
 }
 
 // OpenSource reads a backup folder's manifest.
@@ -67,6 +74,13 @@ type ValidateOptions struct {
 	// applied migrations against it.
 	BinaryMigrations      []int64
 	AcceptLostCredentials bool
+	// ManifestKey is secret.BackupManifestKey of the SECRET_KEY in the
+	// environment: a backup written under that key must carry a manifest
+	// MAC that verifies. Nil checks none.
+	ManifestKey []byte
+	// CopyDir is where Validate makes the private copies a restore reads
+	// (Source.privatize); empty is os.TempDir.
+	CopyDir string
 }
 
 // checkMigrations refuses applied migrations this binary does not carry,
@@ -91,14 +105,20 @@ func (opts ValidateOptions) checkMigrations(applied []int64, where string) error
 // archive's entries, the schema version, and the key.
 func (src *Source) Validate(ctx context.Context, opts ValidateOptions) error {
 	m := src.Manifest
-	for _, name := range []string{DumpName, BlobsName} {
-		entry, ok := m.object(name)
-		if !ok {
-			return fmt.Errorf("the manifest lists no %s", name)
-		}
-		if err := checkFile(src.path(name), entry); err != nil {
-			return err
-		}
+	// First, so nothing below trusts a checksum anyone with write access to
+	// the backup could have changed with its object.
+	authenticated, err := m.checkMAC(opts.ManifestKey, opts.KeyCheck)
+	if err != nil {
+		return err
+	}
+	src.authenticated = authenticated
+	if !authenticated && !opts.AcceptLostCredentials {
+		return unauthenticatedError(m, opts.KeyCheck)
+	}
+	// Everything from here reads checked private copies, never the folder
+	// again.
+	if err := src.privatize(opts.CopyDir); err != nil {
+		return err
 	}
 	if err := src.checkArchive(ctx, nil); err != nil {
 		return err
@@ -111,12 +131,26 @@ func (src *Source) Validate(ctx context.Context, opts ValidateOptions) error {
 	if err := opts.checkMigrations(m.AppliedMigrations, "the backup records"); err != nil {
 		return err
 	}
-	if m.KeyCheck != "" && m.KeyCheck != opts.KeyCheck {
-		if !opts.AcceptLostCredentials {
-			return fmt.Errorf("%w (backup %s, this key %s); encrypted settings and credentials in it cannot be read with this key. Pass --accept-lost-credentials to restore anyway", ErrKeyMismatch, m.KeyCheck, opts.KeyCheck)
-		}
-	}
 	return nil
+}
+
+// ErrUnauthenticatedBackup refuses a backup whose manifest this server
+// cannot authenticate, without the operator's --accept-lost-credentials.
+var ErrUnauthenticatedBackup = errors.New("this backup cannot be verified")
+
+// unauthenticatedError says why m cannot be authenticated and what accepts
+// it. A backup taken with another key is ErrKeyMismatch too: its encrypted
+// settings are lost with it, which is what --accept-lost-credentials
+// accepts, and its MAC was made with that key.
+func unauthenticatedError(m *Manifest, keyCheck string) error {
+	switch {
+	case keyCheck == "":
+		return fmt.Errorf("%w: SECRET_KEY is not set, so its manifest cannot be checked. Set SECRET_KEY, or pass --accept-lost-credentials to restore it unverified", ErrUnauthenticatedBackup)
+	case m.KeyCheck == "":
+		return fmt.Errorf("%w: its manifest records no SECRET_KEY check value, which every Silo backup has, so it may have been changed. Pass --accept-lost-credentials to restore it unverified, encrypted settings and credentials included as lost", ErrUnauthenticatedBackup)
+	}
+	return fmt.Errorf("%w (backup %s, this key %s): %w; encrypted settings and credentials in it cannot be read with this key, and its manifest cannot be verified, so it may have been changed. Pass --accept-lost-credentials to restore it anyway",
+		ErrUnauthenticatedBackup, m.KeyCheck, keyCheck, ErrKeyMismatch)
 }
 
 // checkArchive validates blobs.tar against where its entries would land and
@@ -128,23 +162,6 @@ func (src *Source) checkArchive(ctx context.Context, physical func(store string)
 	}
 	if n != src.Manifest.Blobs.Count {
 		return fmt.Errorf("blobs.tar holds %d files, the manifest records %d", n, src.Manifest.Blobs.Count)
-	}
-	return nil
-}
-
-func checkFile(path string, want ObjectEntry) error {
-	f, err := os.Open(path) //nolint:gosec // G304: an object of the backup folder the operator named
-	if err != nil {
-		return fmt.Errorf("opening %s: %w", filepath.Base(path), err)
-	}
-	defer func() { _ = f.Close() }()
-	h := sha256.New()
-	n, err := io.Copy(h, f)
-	if err != nil {
-		return fmt.Errorf("reading %s: %w", filepath.Base(path), err)
-	}
-	if n != want.Size || hex.EncodeToString(h.Sum(nil)) != want.SHA256 {
-		return fmt.Errorf("%s does not match its checksum in the manifest", want.Name)
 	}
 	return nil
 }
@@ -162,6 +179,67 @@ type DatabaseLoader interface {
 	// from a restored database, so the server started on it binds the stores
 	// it is configured with instead of refusing them.
 	UnbindStorage(ctx context.Context, dbURL string) error
+	// ClearUnreadableSettings deletes the encrypted server_settings rows
+	// cipher cannot open (nil opens none) and returns their keys. Rows are
+	// only deleted: a value is bound to its key name.
+	ClearUnreadableSettings(ctx context.Context, dbURL string, cipher *secret.Cipher) ([]string, error)
+	// DropSubtitles deletes the restored database's provider subtitle rows
+	// (not uploads) whose object exists returns false for, or all of them
+	// when exists is nil, and returns how many it deleted.
+	DropSubtitles(ctx context.Context, dbURL string, exists func(ctx context.Context, key string) (bool, error)) (int, error)
+	// RotateSigningSecrets replaces the restored database's signing keys
+	// (rotatedSettings) with new ones encrypted with cipher, or deletes
+	// them when cipher is nil, and reports whether it wrote new ones.
+	RotateSigningSecrets(ctx context.Context, dbURL string, cipher *secret.Cipher) (bool, error)
+	// CarryCredentials replaces the restored database's long-lived
+	// credentials (secretTables, secretCarried) with liveURL's, or deletes them when
+	// liveURL is "".
+	CarryCredentials(ctx context.Context, dbURL, liveURL string) (CarriedCredentials, error)
+	// KeepStricterSettings writes into dbURL the live server's (liveURL)
+	// value of each access setting the restored data would widen, and
+	// returns those keys.
+	KeepStricterSettings(ctx context.Context, dbURL, liveURL string, cipher *secret.Cipher) ([]string, error)
+	// ServerID reads the server identity (serveridentity.Key) dbURL's
+	// settings hold, or "" when they hold none.
+	ServerID(ctx context.Context, dbURL string) (string, error)
+}
+
+// clearLostSettings removes, from a restored database taken with another
+// SECRET_KEY and restored with --accept-lost-credentials, the encrypted
+// settings this key cannot read: Silo refuses to start on a setting it
+// cannot decrypt, so they are deleted and listed for the admin to enter
+// again. A backup taken with this key changes nothing.
+func clearLostSettings(ctx context.Context, loader DatabaseLoader, dbURL string, m *Manifest, validate ValidateOptions, cipher *secret.Cipher, out io.Writer) error {
+	if !validate.AcceptLostCredentials || m.KeyCheck == "" || m.KeyCheck == validate.KeyCheck {
+		return nil
+	}
+	keys, err := loader.ClearUnreadableSettings(ctx, dbURL, cipher)
+	if err != nil {
+		return fmt.Errorf("clearing the settings this SECRET_KEY cannot read: %w", err)
+	}
+	if len(keys) > 0 {
+		_, _ = fmt.Fprintf(out, "Cleared %d encrypted settings this SECRET_KEY cannot read; enter them again after Silo starts: %s\n", len(keys), strings.Join(keys, ", "))
+	}
+	return nil
+}
+
+// dropOmittedSubtitles removes, when the backup left provider subtitles out
+// (backup.include_subtitles off), the restored rows whose object is not in
+// the stores the restored server uses, so players do not list tracks with
+// no content. Silo downloads them again when asked; uploads are always in
+// the backup. exists nil means none is there.
+func dropOmittedSubtitles(ctx context.Context, loader DatabaseLoader, dbURL string, m *Manifest, exists func(context.Context, string) (bool, error), out io.Writer) error {
+	if m.Blobs.IncludesSubtitles {
+		return nil
+	}
+	n, err := loader.DropSubtitles(ctx, dbURL, exists)
+	if err != nil {
+		return fmt.Errorf("removing the downloaded subtitles the backup left out: %w", err)
+	}
+	if n > 0 {
+		_, _ = fmt.Fprintf(out, "Removed %d downloaded subtitles the backup left out; Silo downloads them again when they are chosen.\n", n)
+	}
+	return nil
 }
 
 // Inspection is what DatabaseLoader.Inspect reads from a database.
@@ -235,13 +313,21 @@ func printMissing(out io.Writer, m *Manifest) {
 // SeparateOptions restores into a new location, touching nothing live.
 type SeparateOptions struct {
 	Validate ValidateOptions
+	// Cipher is this server's SECRET_KEY, which decides the encrypted
+	// settings a restore with another key clears; nil clears them all.
+	Cipher *secret.Cipher
 	// Into is the pre-created empty database to restore into.
 	Into string
 	// BlobsInto is a directory that receives the blobs, laid out as a local
 	// store root. Required unless DatabaseOnly.
 	BlobsInto    string
 	DatabaseOnly bool
-	Out          io.Writer
+	// LiveURL, when known, is the live server's database, which Into must
+	// not be; LiveBlobRoots are its local store directories, which
+	// BlobsInto must not be.
+	LiveURL       string
+	LiveBlobRoots []string
+	Out           io.Writer
 }
 
 // RestoreSeparate runs §10.2 steps 1 and 3 into opts.Into, the verification
@@ -253,6 +339,9 @@ func RestoreSeparate(ctx context.Context, src *Source, loader DatabaseLoader, op
 		return RestoreReport{}, errors.New("--blobs-into is required unless --database-only")
 	}
 	if err := src.Validate(ctx, opts.Validate); err != nil {
+		return RestoreReport{}, err
+	}
+	if err := checkSeparateTargets(opts); err != nil {
 		return RestoreReport{}, err
 	}
 	// Both stores land in one directory.
@@ -269,6 +358,25 @@ func RestoreSeparate(ctx context.Context, src *Source, loader DatabaseLoader, op
 	if err := loader.UnbindStorage(ctx, opts.Into); err != nil {
 		return RestoreReport{}, fmt.Errorf("clearing the restored storage identities: %w", err)
 	}
+	// New signing keys first, so the lost-settings pass does not list them.
+	if err := rotateSigningSecrets(ctx, loader, opts.Into, opts.Cipher, out); err != nil {
+		return RestoreReport{}, err
+	}
+	if err := clearLostSettings(ctx, loader, opts.Into, src.Manifest, opts.Validate, opts.Cipher, out); err != nil {
+		return RestoreReport{}, err
+	}
+	// A copy is not the live server: it gets none of the backup's
+	// credentials and none of the live ones.
+	if err := carryCredentials(ctx, loader, opts.Into, "", out); err != nil {
+		return RestoreReport{}, err
+	}
+	// The copy's files land in an empty directory, so a subtitle the backup
+	// left out is nowhere.
+	if !opts.DatabaseOnly {
+		if err := dropOmittedSubtitles(ctx, loader, opts.Into, src.Manifest, nil, out); err != nil {
+			return RestoreReport{}, err
+		}
+	}
 	report := RestoreReport{Database: opts.Into, MissingBlobs: src.Manifest.MissingBlobs}
 	if opts.DatabaseOnly {
 		_, _ = fmt.Fprintln(out, "Skipped files (--database-only): uploaded artwork, avatars, and branding will be missing.")
@@ -283,6 +391,69 @@ func RestoreSeparate(ctx context.Context, src *Source, loader DatabaseLoader, op
 	printMissing(out, src.Manifest)
 	_, _ = fmt.Fprintln(out, "Restored. Point DATABASE_URL and the artwork storage settings at the new locations, then start Silo.")
 	return report, nil
+}
+
+// checkSeparateTargets refuses, before anything is written, a separate
+// restore aimed at the live server or at files it would overwrite: a copy
+// keeps nothing it replaces. Into must not be the live database (and must
+// be empty, which loading checks), and BlobsInto must be a new or empty
+// directory that is not one of the live server's stores.
+func checkSeparateTargets(opts SeparateOptions) error {
+	if opts.LiveURL != "" && sameDatabase(opts.Into, opts.LiveURL) {
+		return errors.New("--into is this server's own database; create a new, empty database to restore into")
+	}
+	if opts.DatabaseOnly {
+		return nil
+	}
+	dir := resolvedPath(opts.BlobsInto)
+	for _, root := range opts.LiveBlobRoots {
+		if root != "" && resolvedPath(root) == dir {
+			return fmt.Errorf("--blobs-into %s is this server's own file storage; restore files into a new, empty directory", opts.BlobsInto)
+		}
+	}
+	f, err := os.Open(opts.BlobsInto)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("checking --blobs-into: %w", err)
+	}
+	defer func() { _ = f.Close() }()
+	names, err := f.Readdirnames(1)
+	switch {
+	case errors.Is(err, io.EOF):
+		return nil
+	case err != nil:
+		return fmt.Errorf("checking --blobs-into: %w", err)
+	case len(names) > 0:
+		return fmt.Errorf("--blobs-into %s is not empty; restore files into a new, empty directory, so nothing in it is overwritten", opts.BlobsInto)
+	}
+	return nil
+}
+
+// resolvedPath is path made absolute, with symbolic links resolved when it
+// exists.
+func resolvedPath(path string) string {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return filepath.Clean(path)
+	}
+	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+		return resolved
+	}
+	return abs
+}
+
+// sameDatabase reports whether two connection strings reach the same
+// database on the same server, as pgx resolves them; one that does not
+// parse is compared as text.
+func sameDatabase(a, b string) bool {
+	ca, errA := pgconn.ParseConfig(a)
+	cb, errB := pgconn.ParseConfig(b)
+	if errA != nil || errB != nil {
+		return a == b
+	}
+	return ca.Host == cb.Host && ca.Port == cb.Port && ca.Database == cb.Database
 }
 
 // writeSeparateBlobs writes blobs.tar into the directory opts.BlobsInto;
@@ -304,8 +475,8 @@ func VerifyBackup(ctx context.Context, src *Source, loader DatabaseLoader, scrat
 	if err := src.Validate(ctx, validate); err != nil {
 		return err
 	}
-	if src.Manifest.KeyCheck != "" && src.Manifest.KeyCheck != validate.KeyCheck {
-		_, _ = fmt.Fprintln(out, "Warning: this backup was taken with a different SECRET_KEY; its encrypted settings and credentials cannot be read with this one.")
+	if authenticated, _ := src.Manifest.checkMAC(validate.ManifestKey, validate.KeyCheck); !authenticated {
+		_, _ = fmt.Fprintln(out, "Warning: this backup cannot be verified: it was taken with another SECRET_KEY, records none, or SECRET_KEY is not set here. Anyone who could write to its storage could have changed it, and encrypted settings and credentials in it cannot be read.")
 	}
 	if err := loadAndVerify(ctx, src, loader, scratch, validate, out); err != nil {
 		return err

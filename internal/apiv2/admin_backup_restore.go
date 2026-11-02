@@ -16,7 +16,7 @@ import (
 type AdminBackupRestoreSetting struct {
 	Key             string `json:"key"`
 	Class           string `json:"class" enum:"portable,external_service" doc:"external_service: connects to an outside service (mail, requests, metadata providers)"`
-	Status          string `json:"status" enum:"on_this_server,differs,needs_another_key" doc:"on_this_server: same value here; needs_another_key: encrypted with another SECRET_KEY and never written"`
+	Status          string `json:"status" enum:"on_this_server,differs,needs_another_key,kept_stricter,cleared,unverified_backup" doc:"on_this_server: same value here; needs_another_key: encrypted with another SECRET_KEY and never written; kept_stricter: the backup's value would widen access (who can sign in, how long sessions last, what a rating-capped profile sees, mail transport security), so this server keeps its stricter value and a restore never writes it; cleared: the restore changes where a service connects and the backup has no secret this server can read for it, so restoring clears the secret here and turns the service off; unverified_backup: it connects to an outside service, which a backup this server cannot verify never restores"`
 	Masked          bool   `json:"masked" doc:"An encrypted or sensitive setting: both values are omitted"`
 	BackupValue     string `json:"backup_value" doc:"The value in the backup; empty when masked"`
 	CurrentValue    string `json:"current_value" doc:"The value on this server; empty when masked"`
@@ -65,7 +65,7 @@ type AdminBackupRestoreItem struct {
 	Label           string                         `json:"label"`
 	Status          string                         `json:"status" enum:"on_this_server,not_on_this_server,differs,folder_missing,ambiguous,needs_another_key"`
 	Selectable      bool                           `json:"selectable" doc:"Whether the item can be chosen. Items on this server already have nothing to restore."`
-	Reason          string                         `json:"reason,omitempty" enum:"same,path_in_use,folder_missing,library_not_restorable,library_not_mapped,ambiguous_name,needs_another_key,config_needs_another_key,other_version,item_not_on_this_server,file_missing,not_in_backup,changed_since_preview,ambiguous_account,ambiguous_profile,policy_wider,group_not_on_this_server,login_taken,profile_limit,user_store_unsupported,template_not_available,collection_not_mapped"`
+	Reason          string                         `json:"reason,omitempty" enum:"same,path_in_use,folder_missing,library_not_restorable,library_not_mapped,ambiguous_name,needs_another_key,config_needs_another_key,other_version,item_not_on_this_server,file_missing,not_in_backup,changed_since_preview,ambiguous_account,ambiguous_profile,policy_wider,group_not_on_this_server,login_taken,profile_limit,user_store_unsupported,template_not_available,collection_not_mapped,unreadable,files_missing_here,needs_install,kept_stricter,unverified_backup"`
 	Message         string                         `json:"message,omitempty" doc:"What restoring the item does or why it cannot be chosen, for display"`
 	Requires        []string                       `json:"requires" doc:"Items (section:id) that must be chosen with this one: a collection whose library is restored by the same request"`
 	RestartRequired bool                           `json:"restart_required"`
@@ -156,6 +156,7 @@ type AdminBackupRestoreSet struct {
 	CreatedAt     Instant              `json:"created_at"`
 	SameServer    bool                 `json:"same_server"`
 	KeyMatches    bool                 `json:"key_matches" doc:"Whether the backup was taken with this server's SECRET_KEY; when false, encrypted settings and plugin configuration cannot be restored"`
+	Authenticated bool                 `json:"authenticated" doc:"Whether the backup's manifest verified under this server's SECRET_KEY. When false the server cannot tell whether the backup was changed after it was written, and a restore needs accept_unauthenticated"`
 	MissingBlobs  []string             `json:"missing_blobs"`
 	Omitted       []AdminBackupOmitted `json:"omitted" doc:"Items the restore set left out (the dump still holds them), so they are not in any section"`
 	// NeverRestoredSettings lets a client name what a restore leaves alone
@@ -195,6 +196,9 @@ type AdminBackupRestoreProfileSelection struct {
 type AdminBackupRestoreBody struct {
 	Digest    string                      `json:"digest" pattern:"^[0-9a-f]{64}$" doc:"The digest the preview returned"`
 	Selection AdminBackupRestoreSelection `json:"selection"`
+	// AcceptUnauthenticated confirms restoring from a backup the preview
+	// reported as not authenticated.
+	AcceptUnauthenticated bool `json:"accept_unauthenticated,omitempty" doc:"Confirms restoring from a backup whose manifest this server cannot authenticate (authenticated false in the preview); refused without it"`
 }
 
 type AdminBackupRestoreInput struct {
@@ -215,7 +219,7 @@ type AdminBackupRestoreReportItem struct {
 	Kind            string   `json:"kind" enum:"settings_page,plugin,library,collection,template_collection,item_artwork,branding,home_section,account"`
 	Label           string   `json:"label"`
 	Outcome         string   `json:"outcome" enum:"restored,unchanged,left_out,failed"`
-	Reason          string   `json:"reason,omitempty" enum:"same,path_in_use,folder_missing,library_not_restorable,library_not_mapped,ambiguous_name,needs_another_key,config_needs_another_key,other_version,item_not_on_this_server,file_missing,not_in_backup,changed_since_preview,ambiguous_account,ambiguous_profile,policy_wider,group_not_on_this_server,login_taken,profile_limit,user_store_unsupported,template_not_available,collection_not_mapped" doc:"Why a left_out item was left out"`
+	Reason          string   `json:"reason,omitempty" enum:"same,path_in_use,folder_missing,library_not_restorable,library_not_mapped,ambiguous_name,needs_another_key,config_needs_another_key,other_version,item_not_on_this_server,file_missing,not_in_backup,changed_since_preview,ambiguous_account,ambiguous_profile,policy_wider,group_not_on_this_server,login_taken,profile_limit,user_store_unsupported,template_not_available,collection_not_mapped,unreadable,files_missing_here,needs_install,kept_stricter,unverified_backup" doc:"Why a left_out item was left out"`
 	Message         string   `json:"message,omitempty"`
 	Error           string   `json:"error,omitempty" doc:"Why a failed item failed"`
 	RestartRequired bool     `json:"restart_required"`
@@ -286,16 +290,22 @@ type AdminBackupRestoreSource struct {
 	UploadID string `json:"upload_id,omitempty" doc:"The upload restored from; absent for a backup"`
 }
 
+// AdminBackupRestoreSetInput names the backup to preview.
+type AdminBackupRestoreSetInput struct {
+	AdminBackupIDInput
+	AcceptUnauthenticated bool `query:"accept_unauthenticated" default:"false" doc:"Confirms reading a backup whose manifest this server cannot authenticate; without it such a backup answers 409 backup_unauthenticated and nothing inside it is read"`
+}
+
 func registerAdminBackupRestore(reg *Registry, op func(method, path, id, summary string) Operation) {
 	preview := op(http.MethodGet, "/{id}/restore-set", "getAdminBackupRestoreSet",
-		"Read a backup's restore set and compare each section with this server: per-item status, the library mapping, per-setting differences with encrypted values masked, and the digest a restore request must carry. 409 when the backup has no restore set or is from a newer Silo.")
+		"Read a backup's restore set and compare each section with this server: per-item status, the library mapping, per-setting differences with encrypted values masked, and the digest a restore request must carry. 409 when the backup has no restore set or is from a newer Silo, and 409 backup_unauthenticated, before anything inside the restore set is read, when this server cannot authenticate the backup's manifest and accept_unauthenticated is not set.")
 	preview.Errors = []int{http.StatusConflict}
-	Register(reg, preview, func(ctx context.Context, in *AdminBackupIDInput) (*AdminBackupRestoreSetOutput, error) {
+	Register(reg, preview, func(ctx context.Context, in *AdminBackupRestoreSetInput) (*AdminBackupRestoreSetOutput, error) {
 		svc, p := reg.backups()
 		if p != nil {
 			return nil, p
 		}
-		out, err := svc.Preview(ctx, in.ID)
+		out, err := svc.Preview(ctx, in.ID, in.AcceptUnauthenticated)
 		if err != nil {
 			return nil, backupProblem(err)
 		}
@@ -326,7 +336,7 @@ func registerAdminBackupRestore(reg *Registry, op func(method, path, id, summary
 // caller names the source.
 func restoreRequestOf(body AdminBackupRestoreBody) backup.RestoreRequest {
 	sel := body.Selection
-	req := backup.RestoreRequest{Digest: body.Digest, Selection: map[string][]string{}}
+	req := backup.RestoreRequest{Digest: body.Digest, Selection: map[string][]string{}, AcceptUnauthenticated: body.AcceptUnauthenticated}
 	for _, u := range sel.Users {
 		us := backup.UserSelection{Account: u.Account, Target: u.Target}
 		for _, p := range u.Profiles {
@@ -356,7 +366,7 @@ func restoreProblem(err error) error {
 		}
 		return p
 	}
-	if selection, ok := errors.AsType[*backup.SelectionError](err); ok {
+	if selection, ok := errors.AsType[*backup.SelectionError](err); ok && !errors.Is(err, backup.ErrUnauthenticated) {
 		return NewProblem(TypeValidationFailed, selection.Message)
 	}
 	return backupProblem(err)
@@ -366,7 +376,7 @@ func adminBackupRestoreSetOf(p *backup.RestorePreview) AdminBackupRestoreSet {
 	out := AdminBackupRestoreSet{
 		BackupID: p.BackupID, UploadID: p.UploadID, Digest: p.Digest, FormatVersion: p.FormatVersion, ServerID: p.ServerID, ServerName: p.ServerName,
 		SiloVersion: p.SiloVersion, CreatedAt: NewInstant(p.CreatedAt), SameServer: p.SameServer, KeyMatches: p.KeyMatches,
-		MissingBlobs: nonNilStrings(p.MissingBlobs), Omitted: adminBackupOmittedOf(p.Omitted), NeverRestoredSettings: nonNilStrings(p.NeverRestoredSettings),
+		Authenticated: p.Authenticated, MissingBlobs: nonNilStrings(p.MissingBlobs), Omitted: adminBackupOmittedOf(p.Omitted), NeverRestoredSettings: nonNilStrings(p.NeverRestoredSettings),
 		LibraryMap: []AdminBackupLibraryMapping{}, Sections: []AdminBackupRestoreSection{},
 	}
 	for _, l := range p.Libraries {

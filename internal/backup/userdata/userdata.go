@@ -15,9 +15,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
+	"slices"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+
+	"github.com/Silo-Server/silo-server/internal/access"
 )
 
 // Data type ids. They name a profile's data in a restore set, a profile
@@ -69,12 +73,39 @@ type Summary struct {
 	Count int
 	Items []string
 	Blobs []Blob
+	// Profiles are the account's other profiles the data names (a personal
+	// collection shared with them), by their source ids.
+	Profiles []string
 }
 
 // Items resolves a source content id to the catalog item it is here. The
 // resolver records items it could not match, by title, for the report.
 type Items interface {
 	Resolve(ctx context.Context, sourceID string) (localID string, ok bool, err error)
+}
+
+// RecordingItems is an Items that remembers each local item it resolved,
+// so a caller can tell the rest of the server, after its commit, which
+// items a profile's data now names (notification interest, for one).
+type RecordingItems struct {
+	Inner    Items
+	resolved map[string]bool
+}
+
+func (r *RecordingItems) Resolve(ctx context.Context, sourceID string) (string, bool, error) {
+	local, ok, err := r.Inner.Resolve(ctx, sourceID)
+	if err == nil && ok {
+		if r.resolved == nil {
+			r.resolved = map[string]bool{}
+		}
+		r.resolved[local] = true
+	}
+	return local, ok, err
+}
+
+// Resolved lists the local items resolved, sorted.
+func (r *RecordingItems) Resolved() []string {
+	return slices.Sorted(maps.Keys(r.resolved))
 }
 
 // Target is where an import writes, and how references in the document map
@@ -237,12 +268,28 @@ func ResolveAll(ctx context.Context, items Items, ids []string) (map[string]stri
 }
 
 // Prepared is one profile's document of a type, before it is imported.
-// Keep reports whether an export keeps rows about an item: a profile's own
-// export keeps only what the profile may see now. Nil keeps everything.
-type Keep func(item string) bool
+// Keep is what an export keeps: a profile's own export keeps only what the
+// profile may see now. The zero Keep, an administrator backup's, keeps
+// everything.
+type Keep struct {
+	// Item reports whether rows about a catalog item are kept; nil keeps
+	// every item.
+	Item func(item string) bool
+	// MaxContentRating is the profile's rating ceiling for watchlisted
+	// titles outside the library; "" keeps every title (HasTitle).
+	MaxContentRating string
+}
 
-// Has is keep(item); a nil Keep has every item.
-func (k Keep) Has(item string) bool { return k == nil || k(item) }
+// Has reports whether rows about item are kept.
+func (k Keep) Has(item string) bool { return k.Item == nil || k.Item(item) }
+
+// HasTitle reports whether a watchlisted title outside the library, by its
+// stored certification, is kept: by the rule the watchlist shows it with
+// (access.RatingAllowed), so a title without one fails closed under a
+// ceiling.
+func (k Keep) HasTitle(certification string) bool {
+	return access.RatingAllowed(certification, k.MaxContentRating)
+}
 
 type Prepared struct {
 	Owner Owner
@@ -301,6 +348,53 @@ func DecodeStrict(data []byte, into any) error {
 	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
 		return errors.New("trailing data after the document")
 	}
+	return nil
+}
+
+// importBatchSize is how many inserts InsertEach sends in one round trip.
+const importBatchSize = 1000
+
+// InsertEach runs sql once per row of args in the caller's transaction,
+// importBatchSize statements to a round trip, and counts the rows it
+// inserted (an INSERT … ON CONFLICT DO NOTHING inserts none for a row
+// already there). An import's writes are then a few round trips, not one
+// per entry.
+func InsertEach(ctx context.Context, tx pgx.Tx, sql string, args [][]any) (inserted int, err error) {
+	for start := 0; start < len(args); start += importBatchSize {
+		chunk := args[start:min(start+importBatchSize, len(args))]
+		var batch pgx.Batch
+		for _, a := range chunk {
+			batch.Queue(sql, a...)
+		}
+		results := tx.SendBatch(ctx, &batch)
+		for range chunk {
+			tag, err := results.Exec()
+			if err != nil {
+				_ = results.Close()
+				return inserted, err
+			}
+			if tag.RowsAffected() > 0 {
+				inserted++
+			}
+		}
+		if err := results.Close(); err != nil {
+			return inserted, err
+		}
+	}
+	return inserted, nil
+}
+
+// Distinct refuses an entry a document lists twice, by its key. Every
+// document is written from rows with a unique key, so a repeat is a forged
+// one, which would multiply the writes an import does.
+type Distinct map[string]bool
+
+// Add records key, refusing one already seen.
+func (d Distinct) Add(kind, key string) error {
+	if d[key] {
+		return fmt.Errorf("%s lists %q twice", kind, key)
+	}
+	d[key] = true
 	return nil
 }
 

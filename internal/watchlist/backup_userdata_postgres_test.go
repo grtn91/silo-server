@@ -102,18 +102,21 @@ func TestPrepareCreatesAndLocksTitlesDB(t *testing.T) {
 		t.Fatalf("titles %d entries %d, want 2 and 2", titles, entries)
 	}
 
-	checkUntrustedImport(t, pool, userdata.Owner{UserID: user, ProfileID: p2}, x, base+2)
+	checkUntrustedImport(t, pool, userdata.Owner{UserID: user, ProfileID: p2}, x, y, base+2)
 }
 
-// checkUntrustedImport: a profile's own export is untrusted. It links
-// titles this server has (x), writes none of its snapshot to them, and
-// creates none (z).
-func checkUntrustedImport(t *testing.T, pool *pgxpool.Pool, owner userdata.Owner, x, z int) {
+// checkUntrustedImport: a profile's own export is untrusted. A title the
+// profile already lists (own) is unchanged; one another profile lists (x)
+// and one no one does (z) are both left out the same way, so the outcome
+// says nothing about other accounts' watchlists. It writes none of its
+// snapshot to a shared title and creates none.
+func checkUntrustedImport(t *testing.T, pool *pgxpool.Pool, owner userdata.Owner, x, own, z int) {
 	t.Helper()
 	ctx := t.Context()
 	t.Cleanup(func() { _, _ = pool.Exec(context.Background(), `DELETE FROM watchlist_titles WHERE tmdb_id = $1`, z) })
 	forged, _ := json.Marshal(favoritesDocument{Favorites: []keyedEntry{}, Watchlist: []keyedEntry{}, Titles: []watchedTitle{
 		{MediaType: mediaTypeMovie, TMDBID: x, Title: "Forged", Certification: "G", AddedAt: time.Now()},
+		{MediaType: mediaTypeMovie, TMDBID: own, Title: "Forged too", AddedAt: time.Now()},
 		{MediaType: mediaTypeMovie, TMDBID: z, Title: "Invented", AddedAt: time.Now()},
 	}})
 	untrusted, err := pool.Begin(ctx)
@@ -139,7 +142,78 @@ func checkUntrustedImport(t *testing.T, pool *pgxpool.Pool, owner userdata.Owner
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM watchlist_titles WHERE tmdb_id = $1`, z).Scan(&invented); err != nil {
 		t.Fatal(err)
 	}
-	if res.Added != 1 || res.LeftOut != 1 || title != "Soon" || certification != "" || invented != 0 {
+	if res.Added != 0 || res.Unchanged != 1 || res.LeftOut != 2 || title != "Soon" || certification != "" || invented != 0 {
 		t.Fatalf("untrusted import = %+v, title %q %q, invented titles %d", res, title, certification, invented)
+	}
+}
+
+// TestExportLeavesOutTitlesAboveTheCeilingDB: a profile's own export keeps
+// only the watchlisted titles outside the library its watchlist shows under
+// its rating ceiling, a title without a certification failing closed, while
+// an administrator backup (the zero Keep) keeps them all.
+func TestExportLeavesOutTitlesAboveTheCeilingDB(t *testing.T) {
+	dsn := os.Getenv("SILO_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("SILO_TEST_DATABASE_URL is not set")
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+	defer cancel()
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	b := make([]byte, 4)
+	_, _ = rand.Read(b)
+	sfx := hex.EncodeToString(b)
+	var user int
+	if err := pool.QueryRow(ctx, `INSERT INTO users (username, email, password_hash, role, permissions) VALUES ($1::text, $1::text || '@example.test', 'h', 'user', '{}') RETURNING id`, "wlcap-"+sfx).Scan(&user); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = pool.Exec(context.Background(), `DELETE FROM users WHERE id = $1`, user) })
+	profile := "p-" + sfx
+	if _, err := pool.Exec(ctx, `INSERT INTO user_profiles (id, user_id, name, is_primary) VALUES ($1, $2, $1, true)`, profile, user); err != nil {
+		t.Fatal(err)
+	}
+	base := 710000000 + int(time.Now().UnixNano()%1000000)
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), `DELETE FROM watchlist_titles WHERE tmdb_id = ANY($1)`, []int{base, base + 1, base + 2})
+	})
+	for i, cert := range []string{"PG", "R", ""} {
+		var id int64
+		if err := pool.QueryRow(ctx, `INSERT INTO watchlist_titles (id, media_type, tmdb_id, title, certification) VALUES ($1::bigint, 'movie', $1::int, $2, $3) RETURNING id`,
+			base+i, "Title "+cert, cert).Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pool.Exec(ctx, `INSERT INTO user_watchlist_titles (user_id, profile_id, title_id) VALUES ($1, $2, $3)`, user, profile, id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	exported := func(keep userdata.Keep) []string {
+		t.Helper()
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = tx.Rollback(context.Background()) }()
+		exp, err := BackupData{}.Export(ctx, tx, userdata.Owner{UserID: user, ProfileID: profile}, keep)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var doc favoritesDocument
+		if err := json.Unmarshal(exp.Data, &doc); err != nil {
+			t.Fatal(err)
+		}
+		var certs []string
+		for _, title := range doc.Titles {
+			certs = append(certs, title.Certification)
+		}
+		return certs
+	}
+	if got := exported(userdata.Keep{MaxContentRating: "PG-13"}); len(got) != 1 || got[0] != "PG" {
+		t.Fatalf("profile export under PG-13 = %q, want only the PG title", got)
+	}
+	if got := exported(userdata.Keep{}); len(got) != 3 {
+		t.Fatalf("administrator backup = %q, want every title", got)
 	}
 }

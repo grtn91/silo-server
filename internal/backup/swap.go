@@ -30,7 +30,18 @@ type ControlDB interface {
 	AllowConnections(ctx context.Context, name string, allow bool) error
 	// Terminate ends every session on name other than this command's.
 	Terminate(ctx context.Context, name string) error
+	// LockRestore takes the lock one full restore or recovery of live
+	// holds from before its preflight until it returns, without waiting:
+	// another holder answers ErrRestoreRunning.
+	LockRestore(ctx context.Context, live string) (unlock func(context.Context), err error)
 }
+
+// ErrRestoreRunning refuses a full restore or a recovery while another one
+// of the same database runs. Two at once would both pass preflight (each
+// control connection is on the maintenance database, where neither sees the
+// other on the live one), overwrite the same files, and could each rename the
+// database the other installed.
+var ErrRestoreRunning = errors.New("another restore or recovery of this database is running")
 
 // ErrSwapUnresolved reports databases whose names match no state the swap
 // can be in. Nothing more is changed; the databases stay closed.
@@ -97,20 +108,18 @@ func timedOut(err error) string {
 // the databases closed until the original is whole again.
 func RestoreSwap(ctx context.Context, src *Source, loader DatabaseLoader, ctl ControlDB, opts SwapOptions) error {
 	out := writerOrDiscard(opts.Out)
-	now := time.Now
-	if opts.Now != nil {
-		now = opts.Now
-	}
 	m := src.Manifest
-	// Step 1.
-	if err := src.Validate(ctx, opts.Validate); err != nil {
-		return err
-	}
-	live, err := databaseName(opts.LiveURL)
+	live, unlock, err := lockLive(ctx, ctl, opts.LiveURL)
 	if err != nil {
 		return err
 	}
-	stamp := now().UTC().Format("20060102t150405z")
+	defer unlock(ctx)
+	// Step 1.
+	sameDeployment, err := validateForSwap(ctx, src, loader, opts, out)
+	if err != nil {
+		return err
+	}
+	stamp := opts.now().UTC().Format("20060102t150405z")
 	restored, before := "silo_restore_"+stamp, "silo_before_restore_"+stamp
 	opened, sealedStores, err := openSwapStores(ctx, src, opts, stamp)
 	if err != nil {
@@ -158,6 +167,23 @@ func RestoreSwap(ctx context.Context, src *Source, loader DatabaseLoader, ctl Co
 		}
 		if err := blobstore.CheckRecordedLocation(recorded, identityOf(opened.Assets), privateIdentity(opened)); err != nil {
 			return discard(fmt.Errorf("the backup records another storage location than this deployment uses: %w", err))
+		}
+	}
+	// New signing keys first, so the lost-settings pass does not list them.
+	if err := rotateSigningSecrets(ctx, loader, restoredURL, opts.Cipher, out); err != nil {
+		return discard(err)
+	}
+	if err := clearLostSettings(ctx, loader, restoredURL, m, opts.Validate, opts.Cipher, out); err != nil {
+		return discard(err)
+	}
+	if err := carryLiveState(ctx, ctl, live, loader, restoredURL, opts, sameDeployment, out); err != nil {
+		return discard(err)
+	}
+	// A subtitle the backup left out may still be in the live storage the
+	// restored server keeps using.
+	if !opts.DatabaseOnly {
+		if err := dropOmittedSubtitles(ctx, loader, restoredURL, m, storedIn(opened.Assets), out); err != nil {
+			return discard(err)
 		}
 	}
 	if err := ctl.AllowConnections(ctx, restored, false); err != nil {
@@ -208,6 +234,104 @@ func openSwapStores(ctx context.Context, src *Source, opts SwapOptions, stamp st
 		return blobstore.Stores{}, nil, err
 	}
 	return opened, sealed, nil
+}
+
+// ErrLiveInUse stops a restore when a client connected to the live database
+// after its preflight: whatever it changed there would be lost, and the
+// credentials the restore carries from the live server could be stale.
+var ErrLiveInUse = errors.New("a client connected to the live database during the restore")
+
+// lockLive takes the full-restore lock of the database liveURL names
+// (ControlDB.LockRestore) and returns that name.
+func lockLive(ctx context.Context, ctl ControlDB, liveURL string) (string, func(context.Context), error) {
+	live, err := databaseName(liveURL)
+	if err != nil {
+		return "", nil, err
+	}
+	unlock, err := ctl.LockRestore(ctx, live)
+	return live, unlock, err
+}
+
+// carryLiveState carries the live server's credentials into the restored
+// database, and keeps its stricter access settings and security switches.
+// They are as they will be at the swap only while no other client is on the
+// live database: one that connected since preflight stops the restore here,
+// and the swap checks again once the live database is closed (swap.run).
+func carryLiveState(ctx context.Context, ctl ControlDB, live string, loader DatabaseLoader, restoredURL string, opts SwapOptions, sameDeployment bool, out io.Writer) error {
+	if err := checkLiveIdle(ctx, ctl, live); err != nil {
+		return err
+	}
+	// What is tied to an account, a profile, or an installation is the live
+	// server's only on the deployment the backup came from: elsewhere the
+	// same ids are other people.
+	carryFrom := opts.LiveURL
+	if !sameDeployment {
+		carryFrom = ""
+	}
+	if err := carryCredentials(ctx, loader, restoredURL, carryFrom, out); err != nil {
+		return err
+	}
+	return keepStricterSettings(ctx, loader, restoredURL, opts.LiveURL, opts.Cipher, out)
+}
+
+// now is the swap's clock.
+func (opts SwapOptions) now() time.Time {
+	if opts.Now != nil {
+		return opts.Now()
+	}
+	return time.Now()
+}
+
+// validateForSwap is step 1: the backup's own checks, then whether it is
+// this deployment's (checkDeployment).
+func validateForSwap(ctx context.Context, src *Source, loader DatabaseLoader, opts SwapOptions, out io.Writer) (bool, error) {
+	if err := src.Validate(ctx, opts.Validate); err != nil {
+		return false, err
+	}
+	return checkDeployment(ctx, src, loader, opts, out)
+}
+
+// ErrOtherDeployment refuses a backup from another deployment, or one whose
+// manifest cannot be verified, without --accept-lost-credentials: none of
+// this server's credentials can be carried into it.
+var ErrOtherDeployment = errors.New("this backup is not this deployment's")
+
+// checkDeployment reports whether the backup's authenticated manifest names
+// this deployment's server id. When it does not, the restore carries no
+// live credential, security switch, or destination tied to an id, and needs
+// the operator's --accept-lost-credentials; it says so before anything
+// changes.
+func checkDeployment(ctx context.Context, src *Source, loader DatabaseLoader, opts SwapOptions, out io.Writer) (bool, error) {
+	here, err := loader.ServerID(ctx, opts.LiveURL)
+	if err != nil {
+		return false, fmt.Errorf("reading this server's identity: %w", err)
+	}
+	if src.authenticated && here != "" && here == src.Manifest.ServerID {
+		return true, nil
+	}
+	why := fmt.Sprintf("it was taken on server %s and this is %s", src.Manifest.ServerID, here)
+	if !src.authenticated {
+		why = "its manifest cannot be verified, so the server it names cannot be trusted"
+	}
+	const lost = "account and installation ids in it are not this server's, so none of this server's API keys, invitations, sign-in links, push and notification destinations, webhooks, or other credentials are carried into it: the restored server has none of them, everyone signs in again, and admins create keys, invitations, and links again"
+	if !opts.Validate.AcceptLostCredentials {
+		return false, fmt.Errorf("%w: %s. The %s. Pass --accept-lost-credentials to restore it so", ErrOtherDeployment, why, lost)
+	}
+	_, _ = fmt.Fprintf(out, "This backup is not this deployment's (%s). The %s.\n", why, lost)
+	return false, nil
+}
+
+// checkLiveIdle requires that no client other than this command is on the
+// live database.
+func checkLiveIdle(ctx context.Context, ctl ControlDB, live string) error {
+	others, err := ctl.OtherConnections(ctx, live)
+	if err != nil {
+		return fmt.Errorf("checking for other connections: %w", err)
+	}
+	if others > 0 {
+		return fmt.Errorf("%w: %d other clients are connected to %s, so changes they made since the restore began, credentials included, would be lost. Stop Silo on every server, turn off automatic restarts, and run the restore again", ErrLiveInUse, others, live)
+	}
+	return nil
 }
 
 // swapPreflight is §10.2 step 2: no other client on the live database, the
@@ -272,6 +396,17 @@ func storesOf(s blobstore.Stores) blobStores {
 		stores[storeOperational] = s.Operational
 	}
 	return stores
+}
+
+// storedIn reports whether an object is in store.
+func storedIn(store blobstore.Store) func(context.Context, string) (bool, error) {
+	return func(ctx context.Context, key string) (bool, error) {
+		_, err := store.Stat(ctx, key)
+		if errors.Is(err, blobstore.ErrNotFound) {
+			return false, nil
+		}
+		return err == nil, err
+	}
 }
 
 func identityOf(store blobstore.Store) string {
@@ -364,6 +499,11 @@ func (s *swap) run(ctx context.Context, src *Source, databaseOnly bool) error {
 		return s.settle(ctx, fmt.Errorf("closing %s: %w", h.LiveDatabase, err))
 	}
 	if err := s.j.step(ctx, stepLiveClosed); err != nil {
+		return s.settle(ctx, err)
+	}
+	// A client still connected now joined after the credentials were
+	// carried: ending its session would lose what it changed since.
+	if err := checkLiveIdle(ctx, s.ctl, h.LiveDatabase); err != nil {
 		return s.settle(ctx, err)
 	}
 	if err := s.ctl.Terminate(ctx, h.LiveDatabase); err != nil {
@@ -624,6 +764,11 @@ func RecoverSwap(ctx context.Context, journalPath string, ctl ControlDB, cipher 
 		return err
 	}
 	defer j.close()
+	unlock, err := ctl.LockRestore(ctx, j.header.LiveDatabase)
+	if err != nil {
+		return err
+	}
+	defer unlock(ctx)
 	s := &swap{ctl: ctl, j: j, out: out, stores: blobStores{}}
 	state, err := s.observe(ctx)
 	if err != nil {
