@@ -50,6 +50,13 @@ while its reads are presigned (`public_url_auth` `presigned`). Under `public` or
 index or demuxed instead. The blob collector and sweep reach them in whichever
 store holds them (`blobgc.Namespace.Store`).
 
+On a local backend every namespace shares one root, so the signed artwork
+route (`/api/v2/artwork/…`) and the artwork signer refuse keys under
+`backups/`, `diagnostics/`, and `catalog-seeds/`
+(`blobstore.UnservedNamespaces`): their own routes serve them to whoever may
+read them, and no stored path, however it was written, can turn one into an
+artwork link.
+
 Artwork keys start with a metadata provider segment, so they do not collide with
 the reserved prefixes. That is convention rather than enforcement:
 `PluginProvider.Slug()` returns a plugin's capability ID unvalidated, so a

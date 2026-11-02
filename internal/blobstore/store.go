@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"strings"
 	"time"
 
 	"github.com/Silo-Server/silo-server/internal/s3client"
@@ -33,6 +34,23 @@ const (
 // preserved objects. No artwork or operational pass reads, copies, or
 // deletes under it; a storage transition leaves it where it is.
 const BackupNamespace = "backups"
+
+// UnservedNamespaces are the top-level prefixes no signed artwork link may
+// name: backups, diagnostic bundles, and admin job artifacts. Their own
+// routes serve them to whoever may read them; on a local backend they share
+// a root with artwork, so the artwork route must refuse them by name.
+var UnservedNamespaces = []string{BackupNamespace, "diagnostics", "catalog-seeds"}
+
+// Unserved reports whether key is under an UnservedNamespaces prefix.
+func Unserved(key string) bool {
+	top, _, _ := strings.Cut(strings.TrimPrefix(key, "/"), "/")
+	for _, ns := range UnservedNamespaces {
+		if top == ns {
+			return true
+		}
+	}
+	return false
+}
 
 // IdentitySettingKey is the server_settings row that records the storage the
 // catalog's keys belong to. The first successful write records the store's
