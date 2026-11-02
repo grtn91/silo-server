@@ -209,6 +209,10 @@ type DatabaseLoader interface {
 	// credentials (secretTables, secretCarried) with liveURL's, or deletes them when
 	// liveURL is "".
 	CarryCredentials(ctx context.Context, dbURL, liveURL string) (CarriedCredentials, error)
+	// KeepStricterSettings writes into dbURL the live server's (liveURL)
+	// value of each access setting the restored data would widen, and
+	// returns those keys.
+	KeepStricterSettings(ctx context.Context, dbURL, liveURL string, cipher *secret.Cipher) ([]string, error)
 }
 
 // clearLostSettings removes, from a restored database taken with another

@@ -241,6 +241,9 @@ func (l fakeLoader) DropSubtitles(context.Context, string, func(context.Context,
 func (l fakeLoader) RotateSigningSecrets(context.Context, string, *secret.Cipher) (bool, error) {
 	return true, nil
 }
+func (l fakeLoader) KeepStricterSettings(context.Context, string, string, *secret.Cipher) ([]string, error) {
+	return nil, nil
+}
 func (l fakeLoader) CarryCredentials(context.Context, string, string) (CarriedCredentials, error) {
 	if l.ctl.joinOnCarry {
 		l.ctl.dbs[liveDB].sessions++

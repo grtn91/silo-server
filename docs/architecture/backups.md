@@ -963,6 +963,19 @@ neither list.
   (`users.role`, `is_owner`, access group and per-account permissions) are
   restored as the backup has them; the credential carry above refuses
   credentials whose account gains authority that way.
+- It also keeps the live value of each access setting the backup would
+  widen (`accessSettings` in `settings_access.go`, the one classification
+  the selective restore uses too): who may sign in and how (local password
+  sign-in, email auto-match, sign-up, self-service password reset, the
+  Jellyfin and Audiobookshelf sign-in surfaces), session, token, and
+  provider re-check lifetimes and the provider outage policy, what a
+  rating-capped profile sees (`access.unrated_content`), private-network
+  destinations, trusted proxies (a list that trusts any network the live
+  one does not is wider), mail transport security, and the sign-in rate
+  limits (`ratelimit.enabled`, `ratelimit.auth.*`, `ratelimit.ip.*`). The
+  live row is copied as stored, so an encrypted value stays bound to its
+  key name; values are compared decrypted, and one that does not decrypt
+  counts as wider. The command lists each setting it kept.
 - Separate mode (`--into`) restores a copy, not the live server: it deletes
   the backup's carried credentials and carries none.
 
