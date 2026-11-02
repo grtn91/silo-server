@@ -374,6 +374,14 @@ func (s *Service) backup(ctx context.Context, prep backupPrep, kind Kind, starte
 	}
 	excluded := excludedTableData(includeFingerprints)
 
+	// The dump streams into the destination while the snapshot holds a pool
+	// connection; a store recording its identity on that first write would
+	// need another one.
+	if recorder, ok := t.Destination.(interface{ RecordIdentity(context.Context) error }); ok {
+		if err := recorder.RecordIdentity(ctx); err != nil {
+			return RunResult{}, fmt.Errorf("recording the destination storage: %w", err)
+		}
+	}
 	progress(5, "Opening a database snapshot")
 	conn, err := s.opts.Pool.Acquire(ctx)
 	if err != nil {
