@@ -65,9 +65,13 @@ func decodeRatings(data json.RawMessage) (ratingsDocument, userdata.Summary, err
 		return doc, userdata.Summary{}, err
 	}
 	sum := userdata.Summary{Count: len(doc.Ratings)}
+	seen := userdata.Distinct{}
 	for _, e := range doc.Ratings {
 		if !userdata.ValidContentID(e.Item) || e.Rating < 1 || e.Rating > 5 {
 			return doc, sum, fmt.Errorf("rating of %q is not valid", e.Item)
+		}
+		if err := seen.Add("ratings", e.Item); err != nil {
+			return doc, sum, err
 		}
 		sum.Items = append(sum.Items, e.Item)
 	}
@@ -85,6 +89,7 @@ func (RatingsBackupData) Import(ctx context.Context, tx pgx.Tx, target userdata.
 		return userdata.Result{}, err
 	}
 	var res userdata.Result
+	var rows [][]any
 	for _, e := range doc.Ratings {
 		local, ok, err := target.Items.Resolve(ctx, e.Item)
 		if err != nil {
@@ -98,18 +103,14 @@ func (RatingsBackupData) Import(ctx context.Context, tx pgx.Tx, target userdata.
 		if ratedAt.IsZero() {
 			ratedAt = target.Now
 		}
-		tag, err := tx.Exec(ctx, `
-			INSERT INTO user_ratings (user_id, profile_id, media_item_id, rating, rated_at) VALUES ($1, $2, $3, $4, $5)
-			ON CONFLICT (user_id, profile_id, media_item_id) DO NOTHING`,
-			target.UserID, target.ProfileID, local, e.Rating, ratedAt)
-		if err != nil {
-			return res, fmt.Errorf("restoring a rating: %w", err)
-		}
-		if tag.RowsAffected() > 0 {
-			res.Added++
-		} else {
-			res.Unchanged++
-		}
+		rows = append(rows, []any{target.UserID, target.ProfileID, local, e.Rating, ratedAt})
+	}
+	added, err := userdata.InsertEach(ctx, tx, `
+		INSERT INTO user_ratings (user_id, profile_id, media_item_id, rating, rated_at) VALUES ($1, $2, $3, $4, $5)
+		ON CONFLICT (user_id, profile_id, media_item_id) DO NOTHING`, rows)
+	res.Added, res.Unchanged = added, len(rows)-added
+	if err != nil {
+		return res, fmt.Errorf("restoring ratings: %w", err)
 	}
 	return res, nil
 }

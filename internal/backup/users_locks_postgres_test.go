@@ -138,7 +138,9 @@ func TestProfileImportLockOrderDB(t *testing.T) {
 		waitDone(t, errs)
 	})
 
-	t.Run("titles before library watchlist entries", func(t *testing.T) {
+	t.Run("an import takes no title lock", func(t *testing.T) {
+		// A profile's own export links no watchlist title (it would tell
+		// which titles other accounts list), so it never waits on one.
 		dbExec(t, pool, `DELETE FROM user_watchlist WHERE user_id = $1 AND profile_id = $2`, user, dst)
 		dbExec(t, pool, `DELETE FROM user_watchlist_titles WHERE user_id = $1 AND profile_id = $2`, user, dst)
 		holder, err := pool.Begin(ctx)
@@ -149,28 +151,10 @@ func TestProfileImportLockOrderDB(t *testing.T) {
 		if _, err := holder.Exec(ctx, `SELECT 1 FROM watchlist_titles WHERE id = $1 FOR UPDATE`, titleID); err != nil {
 			t.Fatal(err)
 		}
-		errs := run()
-		blockedImporter(t, pool, user)
-		// The promotion's library write, on its own connection while the
-		// title lock is held, must not wait on the import.
-		promoter, err := pool.Begin(ctx)
-		if err != nil {
-			t.Fatal(err)
+		waitDone(t, run())
+		if n := countRows(t, pool, `SELECT count(*) FROM user_watchlist_titles WHERE user_id = $1 AND profile_id = $2`, user, dst); n != 0 {
+			t.Fatalf("the import linked %d titles the profile did not list", n)
 		}
-		if _, err := promoter.Exec(ctx, `SET LOCAL lock_timeout = '3s'`); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := promoter.Exec(ctx, `INSERT INTO user_watchlist (user_id, profile_id, media_item_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`, user, dst, movie); err != nil {
-			_ = promoter.Rollback(context.Background())
-			_ = holder.Rollback(context.Background())
-			<-errs
-			t.Fatalf("the library write waited on the import: %v", err)
-		}
-		if err := promoter.Commit(ctx); err != nil {
-			t.Fatal(err)
-		}
-		_ = holder.Rollback(ctx)
-		waitDone(t, errs)
 	})
 }
 

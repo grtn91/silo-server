@@ -135,15 +135,23 @@ func decodeFavorites(data json.RawMessage) (favoritesDocument, userdata.Summary,
 	if err := userdata.CheckEntries("favorites", sum.Count); err != nil {
 		return doc, sum, err
 	}
-	for _, list := range [][]keyedEntry{doc.Favorites, doc.Watchlist} {
+	for kind, list := range map[string][]keyedEntry{"favorites": doc.Favorites, "the watchlist": doc.Watchlist} {
+		seen := userdata.Distinct{}
 		for _, e := range list {
 			if !userdata.ValidContentID(e.Item) {
 				return doc, sum, fmt.Errorf("favorites name an invalid item %q", e.Item)
 			}
+			if err := seen.Add(kind, e.Item); err != nil {
+				return doc, sum, err
+			}
 			sum.Items = append(sum.Items, e.Item)
 		}
 	}
+	titles := userdata.Distinct{}
 	for _, w := range doc.Titles {
+		if err := titles.Add("watchlist titles", w.MediaType+":"+strconv.Itoa(w.TMDBID)); err != nil {
+			return doc, sum, err
+		}
 		if (w.MediaType != mediaTypeMovie && w.MediaType != mediaTypeSeries) || w.TMDBID <= 0 || w.TVDBID < 0 ||
 			!userdata.ValidText(w.Title, 1024) || !userdata.ValidText(w.IMDbID, 64) || !userdata.ValidText(w.PosterPath, 1024) ||
 			!userdata.ValidText(w.Certification, 64) {
@@ -165,8 +173,8 @@ func (BackupData) Validate(data json.RawMessage) (userdata.Summary, error) {
 // entry and then waited on the title would close a cycle across three
 // connections that Postgres cannot see.
 //
-// An untrusted document (a profile's own export) creates no title: its
-// titles are only locked where they exist (LockTitlesInTx).
+// An untrusted document (a profile's own export) creates and links no
+// title, so it locks none (importTitles).
 func (BackupData) Prepare(ctx context.Context, tx pgx.Tx, docs []userdata.Prepared) error {
 	var snaps []Snapshot
 	untrusted := false
@@ -182,7 +190,7 @@ func (BackupData) Prepare(ctx context.Context, tx pgx.Tx, docs []userdata.Prepar
 		untrusted = untrusted || d.Untrusted
 	}
 	if untrusted {
-		return LockTitlesInTx(ctx, tx, snaps)
+		return nil
 	}
 	return EnsureTitlesInTx(ctx, tx, snaps, now)
 }
@@ -206,21 +214,28 @@ func (BackupData) Import(ctx context.Context, tx pgx.Tx, target userdata.Target,
 	return res, nil
 }
 
+// importTitles restores the watchlist titles that are not in the library.
+// A trusted document (a server restore) adds each. An untrusted one (a
+// profile's own export) adds none: a title the profile already lists is
+// unchanged and every other is left out for the same reason, so the outcome
+// depends only on the profile's own watchlist, never on whether another
+// account has listed the title.
 func importTitles(ctx context.Context, tx pgx.Tx, target userdata.Target, titles []watchedTitle, res *userdata.Result) error {
 	missing := 0
 	for _, w := range titles {
-		var added bool
-		var err error
 		if target.Untrusted {
-			var found bool
-			found, added, err = LinkExistingTitleInTx(ctx, tx, target.UserID, target.ProfileID, w.snapshot(), w.AddedAt, target.Now)
-			if err == nil && !found {
-				missing++
-				continue
+			has, err := ProfileHasTitleInTx(ctx, tx, target.UserID, target.ProfileID, w.snapshot())
+			if err != nil {
+				return fmt.Errorf("reading the profile's watchlist: %w", err)
 			}
-		} else {
-			added, err = AddSnapshotInTx(ctx, tx, target.UserID, target.ProfileID, w.snapshot(), w.AddedAt, target.Now)
+			if has {
+				res.Unchanged++
+			} else {
+				missing++
+			}
+			continue
 		}
+		added, err := AddSnapshotInTx(ctx, tx, target.UserID, target.ProfileID, w.snapshot(), w.AddedAt, target.Now)
 		if err != nil {
 			return fmt.Errorf("restoring a watchlist title: %w", err)
 		}
@@ -232,7 +247,7 @@ func importTitles(ctx context.Context, tx pgx.Tx, target userdata.Target, titles
 	}
 	if missing > 0 {
 		res.LeftOut += missing
-		res.Notes = append(res.Notes, fmt.Sprintf("%d watchlist titles this server has never listed were left out; add them again from search.", missing))
+		res.Notes = append(res.Notes, fmt.Sprintf("%d watchlist titles that are not in this server's library were left out; add them again from search.", missing))
 	}
 	return nil
 }
@@ -240,6 +255,7 @@ func importTitles(ctx context.Context, tx pgx.Tx, target userdata.Target, titles
 // importKeyed inserts each mapped entry the profile does not have. sql takes
 // user id, profile id, item, and time, and must do nothing on conflict.
 func importKeyed(ctx context.Context, tx pgx.Tx, target userdata.Target, sql string, entries []keyedEntry, res *userdata.Result) error {
+	var rows [][]any
 	for _, e := range entries {
 		local, ok, err := target.Items.Resolve(ctx, e.Item)
 		if err != nil {
@@ -253,17 +269,12 @@ func importKeyed(ctx context.Context, tx pgx.Tx, target userdata.Target, sql str
 		if at.IsZero() {
 			at = target.Now
 		}
-		tag, err := tx.Exec(ctx, sql, target.UserID, target.ProfileID, local, at)
-		if err != nil {
-			return err
-		}
-		if tag.RowsAffected() > 0 {
-			res.Added++
-		} else {
-			res.Unchanged++
-		}
+		rows = append(rows, []any{target.UserID, target.ProfileID, local, at})
 	}
-	return nil
+	added, err := userdata.InsertEach(ctx, tx, sql, rows)
+	res.Added += added
+	res.Unchanged += len(rows) - added
+	return err
 }
 
 // Pending counts what Import would add: watchlist titles the profile has

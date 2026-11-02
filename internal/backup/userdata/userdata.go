@@ -351,6 +351,53 @@ func DecodeStrict(data []byte, into any) error {
 	return nil
 }
 
+// importBatchSize is how many inserts InsertEach sends in one round trip.
+const importBatchSize = 1000
+
+// InsertEach runs sql once per row of args in the caller's transaction,
+// importBatchSize statements to a round trip, and counts the rows it
+// inserted (an INSERT … ON CONFLICT DO NOTHING inserts none for a row
+// already there). An import's writes are then a few round trips, not one
+// per entry.
+func InsertEach(ctx context.Context, tx pgx.Tx, sql string, args [][]any) (inserted int, err error) {
+	for start := 0; start < len(args); start += importBatchSize {
+		chunk := args[start:min(start+importBatchSize, len(args))]
+		var batch pgx.Batch
+		for _, a := range chunk {
+			batch.Queue(sql, a...)
+		}
+		results := tx.SendBatch(ctx, &batch)
+		for range chunk {
+			tag, err := results.Exec()
+			if err != nil {
+				_ = results.Close()
+				return inserted, err
+			}
+			if tag.RowsAffected() > 0 {
+				inserted++
+			}
+		}
+		if err := results.Close(); err != nil {
+			return inserted, err
+		}
+	}
+	return inserted, nil
+}
+
+// Distinct refuses an entry a document lists twice, by its key. Every
+// document is written from rows with a unique key, so a repeat is a forged
+// one, which would multiply the writes an import does.
+type Distinct map[string]bool
+
+// Add records key, refusing one already seen.
+func (d Distinct) Add(kind, key string) error {
+	if d[key] {
+		return fmt.Errorf("%s lists %q twice", kind, key)
+	}
+	d[key] = true
+	return nil
+}
+
 // CheckEntries refuses a document with more entries than MaxEntries.
 func CheckEntries(kind string, n int) error {
 	if n > MaxEntries {
