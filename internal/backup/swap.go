@@ -160,6 +160,10 @@ func RestoreSwap(ctx context.Context, src *Source, loader DatabaseLoader, ctl Co
 			return discard(fmt.Errorf("the backup records another storage location than this deployment uses: %w", err))
 		}
 	}
+	// New signing keys first, so the lost-settings pass does not list them.
+	if err := rotateSigningSecrets(ctx, loader, restoredURL, opts.Cipher, out); err != nil {
+		return discard(err)
+	}
 	if err := clearLostSettings(ctx, loader, restoredURL, m, opts.Validate, opts.Cipher, out); err != nil {
 		return discard(err)
 	}

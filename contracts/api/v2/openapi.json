@@ -4223,7 +4223,8 @@
               "user_store_unsupported",
               "template_not_available",
               "collection_not_mapped",
-              "unreadable"
+              "unreadable",
+              "files_missing_here"
             ],
             "type": "string"
           },
@@ -4733,7 +4734,8 @@
               "user_store_unsupported",
               "template_not_available",
               "collection_not_mapped",
-              "unreadable"
+              "unreadable",
+              "files_missing_here"
             ],
             "type": "string"
           },

@@ -7,10 +7,12 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/Silo-Server/silo-server/internal/blobstore"
 	"github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/config"
 	"github.com/Silo-Server/silo-server/internal/plugins"
@@ -675,30 +677,88 @@ func (p *planner) planArtwork(ctx context.Context, a ItemArtworkEntry) (PreviewI
 		return item, fmt.Errorf("reading artwork of %s: %w", a.ContentID, err)
 	}
 	if path == a.Path && source == a.Source {
-		item.Status, item.Reason = ItemOnThisServer, ReasonSame
-		return item, nil
+		return p.sameUnlessMissing(ctx, item, p.rs.blobFamily(a.Path))
 	}
 	item.Status, item.Selectable = ItemDiffers, true
 	return item, nil
 }
 
-func (p *planner) planBranding(stored map[string]string, b BrandingEntry) PreviewItem {
+// sameUnlessMissing is item shown here as it is in the backup: the same,
+// unless one of keys, the files the backup carries for it, is missing from
+// this server's assets storage. Then restoring it writes them back
+// (applier.writeBlob, which never replaces an object) and changes nothing
+// else.
+func (p *planner) sameUnlessMissing(ctx context.Context, item PreviewItem, keys []string) (PreviewItem, error) {
+	missing, err := p.s.missingHere(ctx, storeAssets, keys)
+	if err != nil {
+		return item, err
+	}
+	if len(missing) == 0 {
+		item.Status, item.Reason = ItemOnThisServer, ReasonSame
+		return item, nil
+	}
+	item.Status, item.Selectable, item.Reason = ItemDiffers, true, ReasonFilesMissingHere
+	item.Message = fmt.Sprintf("%d of its files are missing on this server. Restoring writes them back.", len(missing))
+	return item, nil
+}
+
+// missingHereConcurrency bounds the objects missingHere checks at once.
+const missingHereConcurrency = 8
+
+// missingHere lists the keys missing from the named store, checking at
+// most missingHereConcurrency at a time. A server without that store has
+// none of them.
+func (s *Service) missingHere(ctx context.Context, storeName string, keys []string) ([]string, error) {
+	store := s.stores[storeName]
+	if store == nil {
+		return keys, nil
+	}
+	gone := make([]bool, len(keys))
+	errs := make([]error, len(keys))
+	sem := make(chan struct{}, missingHereConcurrency)
+	var wg sync.WaitGroup
+	for i, key := range keys {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer func() { <-sem; wg.Done() }()
+			_, err := store.Stat(ctx, key)
+			gone[i] = errors.Is(err, blobstore.ErrNotFound)
+			if err != nil && !gone[i] {
+				errs[i] = fmt.Errorf("checking %s here: %w", key, err)
+			}
+		}()
+	}
+	wg.Wait()
+	if err := errors.Join(errs...); err != nil {
+		return nil, err
+	}
+	var missing []string
+	for i, key := range keys {
+		if gone[i] {
+			missing = append(missing, key)
+		}
+	}
+	return missing, nil
+}
+
+func (p *planner) planBranding(ctx context.Context, stored map[string]string, b BrandingEntry) (PreviewItem, error) {
 	item := PreviewItem{ID: b.itemID(), Kind: KindBranding, Label: b.Key}
 	if !p.rs.HasBlob(b.Blob) {
 		item.Status, item.Reason, item.MissingBlobs = ItemNotOnThisServer, ReasonFileMissing, []string{b.Blob}
 		item.Message = "The image was missing when the backup was taken."
-		return item
+		return item, nil
 	}
 	current := strings.TrimSpace(stored[b.Key])
 	switch current {
 	case b.Ref:
-		item.Status, item.Reason = ItemOnThisServer, ReasonSame
+		return p.sameUnlessMissing(ctx, item, []string{b.Blob})
 	case "":
 		item.Status, item.Selectable = ItemNotOnThisServer, true
 	default:
 		item.Status, item.Selectable = ItemDiffers, true
 	}
-	return item
+	return item, nil
 }
 
 // ---- Preview ----
@@ -858,7 +918,11 @@ func (p *planner) planCollectionsSection(ctx context.Context, libMap map[int]int
 		return nil, err
 	}
 	for _, b := range p.rs.Collections.Branding {
-		out = append(out, p.planBranding(stored, b))
+		item, err := p.planBranding(ctx, stored, b)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, item)
 	}
 	return out, nil
 }

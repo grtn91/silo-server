@@ -21,6 +21,7 @@ import (
 
 	"github.com/Silo-Server/silo-server/internal/access"
 	"github.com/Silo-Server/silo-server/internal/blobstore"
+	"github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/secret"
 )
 
@@ -207,6 +208,9 @@ func (l fakeLoader) ClearUnreadableSettings(context.Context, string, *secret.Cip
 }
 func (l fakeLoader) DropSubtitles(context.Context, string, func(context.Context, string) (bool, error)) (int, error) {
 	return 0, nil
+}
+func (l fakeLoader) RotateSigningSecrets(context.Context, string, *secret.Cipher) (bool, error) {
+	return true, nil
 }
 func (l fakeLoader) CarryCredentials(context.Context, string, string) (CarriedCredentials, error) {
 	return CarriedCredentials{}, nil
@@ -801,4 +805,27 @@ func TestAuthorityWiderThan(t *testing.T) {
 func with(p profileLimits, change func(*profileLimits)) profileLimits {
 	change(&p)
 	return p
+}
+
+// TestSensitiveSettingsAreClassified: every sensitive setting is either a
+// signing key a restore replaces or a credential it restores, so a new
+// signing key cannot come back from a backup without someone deciding so.
+func TestSensitiveSettingsAreClassified(t *testing.T) {
+	restored := map[string]bool{}
+	for _, key := range restoredSecretSettings {
+		restored[key] = true
+		if _, rotated := rotatedSettings[key]; rotated {
+			t.Errorf("%s is both rotated and restored", key)
+		}
+	}
+	for key := range catalog.SensitiveSettingKeys {
+		if _, rotated := rotatedSettings[key]; !rotated && !restored[key] {
+			t.Errorf("sensitive setting %s is neither in rotatedSettings nor in restoredSecretSettings", key)
+		}
+	}
+	for _, key := range append(rotatedSettingKeys(), restoredSecretSettings...) {
+		if !catalog.SensitiveSettingKeys[key] {
+			t.Errorf("%s is classified but is not a sensitive setting", key)
+		}
+	}
 }

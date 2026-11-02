@@ -555,7 +555,14 @@ admin chose since stays, and a re-run repairs a membership left ungrouped. Items
 are left out. Uploaded item and season artwork is published for the same
 content id, whose blob key is the same on every server, as an upload does,
 with the images lock. Branding assets write their blob and then their setting
-through the admin settings write path.
+through the admin settings write path. Item artwork or a branding asset this
+server already shows as the backup has it is the same only when its files
+(the artwork's stored family, the branding blob) are in the assets store,
+checked with `Stat`, eight at a time. When any is missing it differs
+(`files_missing_here`), and restoring it writes the missing files back with
+the exclusive create every restore uses and changes nothing else; the next
+preview finds it the same. Library posters and collection images of a library
+or collection matched here are not restored onto it, so they are not checked.
 
 ### Template collections
 
@@ -1018,6 +1025,20 @@ that holds a bearer secret or a public capability, each one way:
 `TestSecretTablesAreClassifiedDB` scans the schema for secret-like column
 names and fails on a table missing from the list, so a new credential
 table needs a decision before it ships.
+
+Sensitive settings (`catalog.SensitiveSettingKeys`) are classified the same
+way in `internal/backup/settings_secrets.go`. The signing keys Silo
+generates for the tokens it issues (`auth.jwt_secret`, which signs sessions,
+download and artwork links, backup object links, OAuth state, and cursors,
+and `audiobooks.abs.jwt_secret`) are replaced on every restore, swap or
+separate, before the lost-settings pass: a fresh random value written
+encrypted with this server's `SECRET_KEY`, bound to its key name as the
+settings store writes it, or, without a key, deleted so the server generates
+one when it starts. A key leaked and rotated after the backup therefore
+never signs again; every session ends with a restore anyway. The other
+sensitive settings are credentials for other services and are restored.
+`TestSensitiveSettingsAreClassified` fails on a sensitive setting in
+neither list.
 
 - A full restore (swap mode) keeps the live server's carried credentials as
   they are right before the swap. After verification, in the same step
