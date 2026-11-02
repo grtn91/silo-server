@@ -450,6 +450,9 @@ func (s *Service) backup(ctx context.Context, prep backupPrep, kind Kind, starte
 	}
 	result := RunResult{ID: id, Kind: kind, Status: manifest.Status(), SizeBytes: manifest.Size(), MissingBlobs: manifest.MissingBlobs}
 	result.Rotated, result.Swept, result.Warnings = s.rotate(ctx, t, serverID, pinned)
+	if manifest.MissingBlobsTotal > 0 {
+		result.Warnings = append(result.Warnings, fmt.Sprintf("%d stored files were missing; the manifest lists the first %d", manifest.MissingBlobsTotal, len(manifest.MissingBlobs)))
+	}
 	result.DurationMs = s.opts.Now().Sub(started).Milliseconds()
 	progress(100, "Backed up "+id)
 	return result, nil
@@ -461,9 +464,15 @@ func writeManifest(ctx context.Context, t target, m *Manifest) error {
 	if m.MissingBlobs == nil {
 		m.MissingBlobs = []MissingBlob{}
 	}
+	if len(m.MissingBlobs) > maxRecordedMissingBlobs {
+		m.MissingBlobsTotal, m.MissingBlobs = len(m.MissingBlobs), m.MissingBlobs[:maxRecordedMissingBlobs]
+	}
 	data, err := json.MarshalIndent(m, "", "  ")
 	if err != nil {
 		return err
+	}
+	if len(data) > MaxManifestBytes {
+		return fmt.Errorf("the manifest would be %d bytes, more than a reader takes (%d)", len(data), MaxManifestBytes)
 	}
 	if err := t.Put(ctx, objectKey(m.ServerID, m.ID, ManifestName), bytes.NewReader(data)); err != nil {
 		return fmt.Errorf("writing the manifest: %w", err)
@@ -721,7 +730,7 @@ func readManifest(ctx context.Context, t target, key string) (*Manifest, error) 
 		return nil, err
 	}
 	defer func() { _ = body.Close() }()
-	data, err := io.ReadAll(io.LimitReader(body, 16<<20))
+	data, err := io.ReadAll(io.LimitReader(body, MaxManifestBytes))
 	if err != nil {
 		return nil, err
 	}

@@ -118,7 +118,7 @@ func (l PGLoader) ClearUnreadableSettings(ctx context.Context, dbURL string, cip
 // PGControl is the swap's control connection to the maintenance database.
 type PGControl struct {
 	Conn *pgx.Conn
-	// Like is the database whose encoding and libc locale a created
+	// Like is the database whose encoding and locale a created
 	// database copies, so the restored catalog sorts as the live one did.
 	Like string
 }
@@ -188,17 +188,53 @@ func (c *PGControl) CheckPrivileges(ctx context.Context, live string) error {
 }
 
 func (c *PGControl) Create(ctx context.Context, name string) error {
-	var encoding, collate, ctype, provider string
-	err := c.Conn.QueryRow(ctx, `SELECT pg_encoding_to_char(encoding), datcollate, datctype, datlocprovider::text FROM pg_database WHERE datname = $1`, c.Like).Scan(&encoding, &collate, &ctype, &provider)
+	want, err := c.locale(ctx, c.Like)
 	if err != nil {
 		return fmt.Errorf("reading %s's locale: %w", c.Like, err)
 	}
-	sql := "CREATE DATABASE " + ident(name) + " TEMPLATE template0 ENCODING " + quoteLiteral(encoding)
-	if provider == "c" {
-		sql += " LOCALE_PROVIDER libc LC_COLLATE " + quoteLiteral(collate) + " LC_CTYPE " + quoteLiteral(ctype)
+	sql := "CREATE DATABASE " + ident(name) + " TEMPLATE template0 ENCODING " + quoteLiteral(want.encoding) +
+		" LC_COLLATE " + quoteLiteral(want.collate) + " LC_CTYPE " + quoteLiteral(want.ctype)
+	switch want.provider {
+	case "c":
+		sql += " LOCALE_PROVIDER libc"
+	case "i":
+		sql += " LOCALE_PROVIDER icu ICU_LOCALE " + quoteLiteral(want.locale)
+		if want.icuRules != "" {
+			sql += " ICU_RULES " + quoteLiteral(want.icuRules)
+		}
+	case "b":
+		sql += " LOCALE_PROVIDER builtin BUILTIN_LOCALE " + quoteLiteral(want.locale)
+	default:
+		return fmt.Errorf("%s uses locale provider %q, which a restore cannot copy", c.Like, want.provider)
 	}
-	_, err = c.Conn.Exec(ctx, sql)
-	return err
+	if _, err := c.Conn.Exec(ctx, sql); err != nil {
+		return err
+	}
+	// Sorting and case rules (citext logins, names) must match the live
+	// database's, or the swap would change them.
+	got, err := c.locale(ctx, name)
+	if err != nil {
+		return fmt.Errorf("reading %s's locale: %w", name, err)
+	}
+	if got != want {
+		return fmt.Errorf("%s was created with locale %+v, not %s's %+v", name, got, c.Like, want)
+	}
+	return nil
+}
+
+// dbLocale is what decides a database's text sorting and case rules.
+type dbLocale struct {
+	encoding, collate, ctype, provider, locale, icuRules string
+}
+
+// locale reads a database's locale. The ICU or builtin locale column is
+// datlocale from PostgreSQL 17 and daticulocale before, read by name.
+func (c *PGControl) locale(ctx context.Context, name string) (dbLocale, error) {
+	var l dbLocale
+	err := c.Conn.QueryRow(ctx, `SELECT pg_encoding_to_char(d.encoding), d.datcollate, d.datctype, d.datlocprovider::text,
+			COALESCE(to_jsonb(d)->>'datlocale', to_jsonb(d)->>'daticulocale', ''), COALESCE(to_jsonb(d)->>'daticurules', '')
+		FROM pg_database d WHERE d.datname = $1`, name).Scan(&l.encoding, &l.collate, &l.ctype, &l.provider, &l.locale, &l.icuRules)
+	return l, err
 }
 
 func (c *PGControl) Drop(ctx context.Context, name string) error {

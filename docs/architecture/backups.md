@@ -66,6 +66,9 @@ SHA-256 of its stored bytes, the `SECRET_KEY` check value, how the table of cont
 set, `restore_set`: its format version and the item count of each section.
 The objects are exactly `db.dump` and `blobs.tar`, plus `restore-set.tar`
 when `restore_set` is present.
+A manifest is at most 16 MiB, the most a reader reads: `missing_blobs` lists
+at most 10,000 entries, with `missing_blobs_total` counting them all when
+there are more, and a manifest that would still be larger is not written.
 
 The inventory covers `users`, `user_profiles`, `media_folders`, `media_items`,
 `media_files`, `server_settings`, `plugin_installations`,
@@ -726,6 +729,12 @@ Redis: the live deployment may still be running on it, and which Redis a
 server on the restored database will use is not known here. The command
 says to run `FLUSHDB` on that Redis database, or use an empty one, before
 starting Silo on the restored database.
+
+A database URL given on the command line (`--into`, `silo backup verify
+--scratch`) must not carry a password: any account on the host can read a
+running command's arguments. The command refuses one and points to
+`PGPASSWORD` or a password file (`~/.pgpass`, `PGPASSFILE`), which both the
+command and `pg_restore` read.
 
 ### Swap mode: never destroy first
 
