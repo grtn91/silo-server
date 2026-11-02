@@ -401,14 +401,17 @@ closes the database as an extra guard.
 8. The old database stays closed and the overwritten-blobs folder stays. The
    command prints how to drop them once the restored server works, or how to
    go back.
-9. Clear Redis, unless `--keep-redis`: `FLUSHDB` on the database the live
-   deployment is configured with (`REDIS_URL` when set, otherwise the
-   `redis.url` and `redis.db` settings read from the live database before
-   step 2), never `FLUSHALL`, so no server serves sessions, caches, or
+9. Clear Redis, unless `--keep-redis`: `FLUSHDB` on the database the
+   restored server will use (`REDIS_URL` when set, otherwise the
+   `redis.url` and `redis.db` settings read from the restored database now
+   live), never `FLUSHALL`, so no server serves sessions, caches, or
    coordination state from before the restore. A deployment without Redis
    skips this. The restore has finished by now, so a Redis that cannot be
    reached or cleared does not fail it: the command warns and prints the
-   `redis-cli -n <db> FLUSHDB` to run before starting Silo.
+   `redis-cli -n <db> FLUSHDB` to run before starting Silo. When the
+   restored settings cannot be read, it clears nothing, since the Redis the
+   database named before the swap may not be the restored server's, and
+   warns the operator to clear the one Silo uses.
 
 A failure in step 6, or before the second rename completes, rolls back with
 connections blocked throughout and the live database reopened last:
