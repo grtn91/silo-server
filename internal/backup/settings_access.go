@@ -179,7 +179,7 @@ func AccessSettingKeys() []string {
 // wider.
 func (l PGLoader) KeepStricterSettings(ctx context.Context, dbURL, liveURL string, cipher *secret.Cipher) ([]string, error) {
 	keys := AccessSettingKeys()
-	live, err := readSettingRows(ctx, liveURL, keys)
+	live, err := readSettingsAt(ctx, liveURL, keys)
 	if err != nil {
 		return nil, fmt.Errorf("reading the live server's settings: %w", err)
 	}
@@ -229,8 +229,8 @@ func plainSetting(cipher *secret.Cipher, key, value string) (string, bool) {
 	return plain, err == nil
 }
 
-// readSettingRows reads keys' rows of the database at url.
-func readSettingRows(ctx context.Context, url string, keys []string) (map[string]string, error) {
+// readSettingsAt reads keys' rows of the database at url.
+func readSettingsAt(ctx context.Context, url string, keys []string) (map[string]string, error) {
 	conn, err := pgx.Connect(ctx, url)
 	if err != nil {
 		return nil, err
