@@ -106,14 +106,17 @@ showing either key.
 3. Run `pg_dump --format=custom --compress=zstd:3 --snapshot=<id>` with
    `--exclude-table-data-and-children` for `activity_log`, `operational_logs`,
    `policy_decisions`, `catalog_search_index_events`, `backup_status` (its row
-   describes the backup being taken), the sign-in tables (`auth_sessions`,
-   `device_login_requests`, `jellycompat_sessions`, `abs_sessions`,
-   `oauth_session`, `password_reset_tokens`), and, unless
+   describes the backup being taken), the sign-in tables (login sessions and
+   refresh tokens, Jellyfin and Audiobookshelf sessions, device-code, OIDC,
+   account-link, password-reset, email-verification, Discord-link, and
+   watch-provider sign-in flows; `signInTables` in
+   `internal/backup/snapshot.go` lists them), and, unless
    `backup.include_intro_fingerprints`, `media_intro_fingerprints`. The schema
    is always dumped. Leaving sign-in state out means a restore never brings
    back a session or token revoked after the backup: after a full restore
-   every client, Jellyfin-protocol ones included, signs in again. API keys
-   are kept. The password moves from the URL into `PGPASSWORD` so it
+   every client, Jellyfin-protocol ones included, signs in again. Long-lived
+   credentials stay in the dump, and a restore replaces them (see
+   [Credentials](#credentials)). The password moves from the URL into `PGPASSWORD` so it
    never appears in a process listing.
 4. Stream `pg_dump`'s stdout straight into the destination with no local
    spool, hashing the stored bytes. `pg_restore --list` reads a tee of the
@@ -976,6 +979,35 @@ encrypted `server_settings` row this key cannot open and prints their key
 names (never values) for the admin to enter again. Rows are only deleted,
 never renamed: a value is bound to its key name.
 
+### Credentials
+
+A restore never brings back the backup's long-lived credentials: API keys,
+pending invitations, invite codes, and autoscan webhook tokens
+(`credentialTables` in `internal/backup/credentials.go`). A key revoked
+after the backup would otherwise work again, and one created since would
+stop working. API keys stay in the dump because `marker_edit_audit` refers
+to them.
+
+- A full restore (swap mode) keeps the live server's credentials as they are
+  right before the swap. After verification, in the same step that clears
+  unreadable settings, it reads them from the live database (preflight has
+  found no other client on it, so they cannot change before the swap) and
+  writes them into the restored database in one transaction, before it
+  becomes live. A restored credential identical to a live one (same id,
+  owner, and hash) is updated in place, so what refers to it stays linked;
+  the others are deleted. Accepted and revoked invitations are the restored
+  history and stay. A live credential whose account, access group, or
+  autoscan source is not in the restored data is dropped, and the command
+  lists it by id and label, never key material. Identity sequences move past
+  the ids written. Live rows are encrypted with this server's key, so they
+  stay readable after `--accept-lost-credentials`.
+- Separate mode (`--into`) restores a copy, not the live server: it deletes
+  the backup's credentials and carries none.
+
+Outbound credentials and connection settings (provider tokens, notification
+webhook secrets, Plex and Jellyfin webhook connections) are configuration the
+restore brings back with the rest of the data.
+
 ### Separate mode
 
 `silo backup restore --from <backup> --into <database URL> --blobs-into <dir>`
@@ -987,7 +1019,9 @@ migrations, and the table inventory against the manifest. It then deletes
 the recorded storage identities (`artwork.storage_identity`,
 `storage.operational_identity`) from the target: they name the backed-up
 server's stores, so a server started on the copy would refuse the stores it
-is configured with. That server records its own on its first start or write.
+is configured with. That server records its own on its first start or write. The copy
+gets no API keys, pending invitations, invite codes, or autoscan webhook
+tokens ([Credentials](#credentials)).
 The target stays open for the operator to point `DATABASE_URL` and the
 artwork storage settings at. `--database-only` replaces `--blobs-into` and warns that uploaded
 artwork, avatars, and branding will be missing. Separate mode clears no
@@ -1022,7 +1056,8 @@ closes the database as an extra guard.
 4. Verify it: schema version, applied migrations, and inventory match the
    manifest, no applied migration is one this binary does not carry, and the
    restored settings record the storage location the live stores are. Then
-   close it to connections and end the command's sessions on it.
+   replace its credentials with the live ones ([Credentials](#credentials)),
+   close it to connections, and end the command's sessions on it.
 5. Quiesce the live database: `ALLOW_CONNECTIONS false`, then end any session
    that appeared since step 2. The journal starts just before this, in
    `silo-restore-<time>.journal` in the working directory (each record
@@ -1044,14 +1079,17 @@ closes the database as an extra guard.
 8. The old database stays closed and the overwritten-blobs folder stays. The
    command prints how to drop them once the restored server works, or how to
    go back.
-9. Clear Redis, unless `--keep-redis`: `FLUSHDB` on the database the live
-   deployment is configured with (`REDIS_URL` when set, otherwise the
-   `redis.url` and `redis.db` settings read from the live database before
-   step 2), never `FLUSHALL`, so no server serves sessions, caches, or
+9. Clear Redis, unless `--keep-redis`: `FLUSHDB` on the database the
+   restored server will use (`REDIS_URL` when set, otherwise the
+   `redis.url` and `redis.db` settings read from the restored database now
+   live), never `FLUSHALL`, so no server serves sessions, caches, or
    coordination state from before the restore. A deployment without Redis
    skips this. The restore has finished by now, so a Redis that cannot be
    reached or cleared does not fail it: the command warns and prints the
-   `redis-cli -n <db> FLUSHDB` to run before starting Silo.
+   `redis-cli -n <db> FLUSHDB` to run before starting Silo. When the
+   restored settings cannot be read, it clears nothing, since the Redis the
+   database named before the swap may not be the restored server's, and
+   warns the operator to clear the one Silo uses.
 
 A failure in step 6, or before the second rename completes, rolls back with
 connections blocked throughout and the live database reopened last:

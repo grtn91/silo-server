@@ -206,25 +206,17 @@ func runBackupRestore(ctx context.Context, args []string, out io.Writer) error {
 	if err != nil {
 		return err
 	}
-	// The live deployment's storage and Redis, read from its configuration
-	// before anything changes; this connection closes before the preflight
-	// checks that no other client is connected. The journal keeps the
-	// storage so --recover never reopens a database to find it.
+	// The live deployment's storage, read from its configuration before
+	// anything changes; this connection closes before the preflight checks
+	// that no other client is connected. The journal keeps the storage so
+	// --recover never reopens a database to find it.
 	var storeConfig backup.StoreConfig
-	afterRedis := redisPlan{keep: f.keepRedis}
-	if !f.databaseOnly || (!f.keepRedis && os.Getenv("REDIS_URL") == "") {
+	if !f.databaseOnly {
 		cfg, err := liveConfigFromDatabase(ctx, liveURL, cipher)
-		switch {
-		case err != nil && !f.databaseOnly:
+		if err != nil {
 			return fmt.Errorf("reading the live blob storage settings: %w", err)
-		case err != nil:
-			afterRedis.readErr = err
-		default:
-			storeConfig = backupStoreConfig(cfg)
-			afterRedis.config = liveRedisConfig(cfg)
 		}
-	} else {
-		afterRedis.config = liveRedisConfig(&config.Config{})
+		storeConfig = backupStoreConfig(cfg)
 	}
 	ctl, err := backup.ConnectControl(ctx, liveURL)
 	if err != nil {
@@ -243,27 +235,30 @@ func runBackupRestore(ctx context.Context, args []string, out io.Writer) error {
 	}); err != nil {
 		return err
 	}
-	afterRedis = restoredRedisPlan(ctx, afterRedis, liveURL, cipher)
-	clearRedisAfterRestore(ctx, afterRedis, dialRedis, out)
+	clearRedisAfterRestore(ctx, restoredRedisPlan(ctx, f.keepRedis, liveURL, cipher), dialRedis, out)
 	return nil
 }
 
-// restoredRedisPlan reads the Redis the restored database names, which the
-// servers started on it will use; the live one was read before the swap
-// only to fall back on when this read fails. REDIS_URL, when set, wins
-// over both, as it does at startup.
-func restoredRedisPlan(ctx context.Context, plan redisPlan, liveURL string, cipher *secret.Cipher) redisPlan {
-	if plan.keep || os.Getenv("REDIS_URL") != "" {
-		return plan
+// restoredRedisPlan picks the Redis to clear once the restored database is
+// live: the one the servers started on it will use. REDIS_URL, when set,
+// wins, as it does at startup; otherwise the restored database names it.
+// When that read fails the plan clears nothing and says so, because the
+// Redis the live database named before the swap need not be the restored
+// server's.
+func restoredRedisPlan(ctx context.Context, keep bool, liveURL string, cipher *secret.Cipher) redisPlan {
+	if keep {
+		return redisPlan{keep: true}
+	}
+	if os.Getenv("REDIS_URL") != "" {
+		return redisPlan{config: liveRedisConfig(&config.Config{})}
 	}
 	readCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 	defer cancel()
 	cfg, err := liveConfigFromDatabase(readCtx, liveURL, cipher)
 	if err != nil {
-		return plan
+		return redisPlan{readErr: err}
 	}
-	plan.config, plan.readErr = liveRedisConfig(cfg), nil
-	return plan
+	return redisPlan{config: liveRedisConfig(cfg)}
 }
 
 // closeControl closes the control connection after the command's context

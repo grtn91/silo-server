@@ -45,17 +45,27 @@ func excludedTableData(includeIntroFingerprints bool) []string {
 	return tables
 }
 
-// signInTables hold login sessions, refresh tokens, and the tokens that
-// lead to them. A restore brings none back: a session revoked after the
-// backup would otherwise be valid again, so after a full restore every
-// client signs in again. Their schema is kept.
+// signInTables hold login sessions, refresh tokens, and the short-lived
+// tokens that lead to them. A restore brings none back: a session revoked
+// after the backup would otherwise be valid again, so after a full restore
+// every client signs in again. Their schema is kept. Long-lived credentials
+// stay in the dump, and a full restore replaces them with the live server's
+// (credentialTables).
 var signInTables = []string{
-	"auth_sessions",         // web and native sign-ins and their refresh tokens
-	"device_login_requests", // device-code sign-ins, which name auth_sessions
-	"jellycompat_sessions",  // Jellyfin-protocol access tokens
-	"abs_sessions",          // Audiobookshelf-protocol sessions
-	"oauth_session",         // OIDC sign-ins in progress
-	"password_reset_tokens", // a token used after the backup would work again
+	"auth_sessions",                    // web and native sign-ins and their refresh tokens
+	"device_login_requests",            // device-code sign-ins, which name auth_sessions
+	"jellycompat_sessions",             // Jellyfin-protocol access tokens
+	"jellycompat_device_profiles",      // keyed by those access tokens
+	"abs_sessions",                     // Audiobookshelf-protocol sessions
+	"oauth_sessions",                   // OIDC sign-ins in progress
+	"oauth_completions",                // OIDC sign-ins waiting to be redeemed
+	"oauth_native_starts",              // native-app OIDC sign-ins in progress
+	"oauth_link_tickets",               // account-link tickets
+	"oauth_pending_links",              // account links waiting to be confirmed
+	"password_reset_tokens",            // a token used after the backup would work again
+	"notification_email_verifications", // email-address verification tokens
+	"notification_discord_link_state",  // Discord link flows in progress
+	"watch_provider_auth_sessions",     // watch-provider device-code sign-ins in progress
 }
 
 // blobRef is one blob the snapshot references.
@@ -245,8 +255,8 @@ func brandingKeys(ctx context.Context, q queryer) ([]string, error) {
 	return keys, rows.Err()
 }
 
-func collectStrings(ctx context.Context, q queryer, sql string) ([]string, error) {
-	rows, err := q.Query(ctx, sql)
+func collectStrings(ctx context.Context, q queryer, sql string, args ...any) ([]string, error) {
+	rows, err := q.Query(ctx, sql, args...)
 	if err != nil {
 		return nil, err
 	}
