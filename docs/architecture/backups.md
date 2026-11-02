@@ -360,7 +360,8 @@ that holds a bearer secret or a public capability, each one way:
 - Carried from the live server: long-lived credentials that clients and
   other services present to Silo (API keys, pending invitations, invite
   codes, autoscan webhook tokens, audiobook RSS feed links, Plex and
-  Jellyfin webhook sync secrets with their profile mappings), and the
+  Jellyfin webhook sync secrets with their profile mappings, external
+  sign-in links and sign-in providers), and the
   destinations that receive notifications without a session (browser and
   mobile push registrations, notification webhooks, notification email
   addresses, Discord links, server notification channels): one removed
@@ -374,11 +375,15 @@ that holds a bearer secret or a public capability, each one way:
   URL slugs, worker leases, delivery histories, account passwords and
   profile PINs with their accounts).
 
-`TestSecretTablesAreClassifiedDB` scans the schema for secret-like column
-names (tokens, secrets, slugs, hashes, codes) and destination-like ones
-(push endpoints and keys, subscriptions, webhooks, callbacks, encrypted
-URLs, channel ids) and fails on a table missing from the list, so a new
-credential or destination table needs a decision before it ships.
+Every other table is classified too (`internal/backup/tables.go`): the
+logs and queues the dump leaves out (`loggedTables`), the server's data
+(`restoredDataTables`), and the running server's own state, restored as it
+is and rebuilt or reconciled by the server (`serverStateTables`: caches,
+queues, job, lease, and lock state, revisions, samples).
+`TestEveryTableIsClassifiedDB` reads every table after the migrations and
+fails on one in no list or in two, and on a listed name that is not a table,
+so a new table needs a decision before it ships; a layer that adds one
+classifies it.
 
 Sensitive settings (`catalog.SensitiveSettingKeys`) are classified the same
 way in `internal/backup/settings_secrets.go`. The signing keys Silo

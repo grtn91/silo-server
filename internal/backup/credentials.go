@@ -94,6 +94,10 @@ func grantCarried(table string) string {
 	return `EXISTS (SELECT 1 FROM carried_grants g WHERE g.tbl = '` + table + `' AND g.id = r.id)`
 }
 
+// pluginInstalled is the SQL condition, over the live row r, that its
+// plugin installation is in the restored data.
+const pluginInstalled = `EXISTS (SELECT 1 FROM plugin_installations i WHERE i.id = r.plugin_installation_id)`
+
 // profileExists is the SQL condition, over the live row r, that its
 // profile is in the restored data.
 const profileExists = `EXISTS (SELECT 1 FROM user_profiles p WHERE p.id = r.profile_id)`
@@ -134,6 +138,7 @@ var secretTables = []secretTable{
 	{name: "watch_together_rooms", handling: secretLeftOut, why: watchTogether},
 	{name: "watch_together_suggestions", handling: secretLeftOut, why: watchTogether},
 	{name: "watch_together_votes", handling: secretLeftOut, why: watchTogether},
+	{name: "history_import_run_credentials", handling: secretLeftOut, why: "the provider credentials of a history import in progress"},
 	{name: "backup_status", handling: secretLeftOut, why: "describes the backup being taken, which would read as a stale run after a restore"},
 
 	{name: tableAPIKeys, handling: secretCarried, why: "API keys", carry: &carrySpec{
@@ -179,6 +184,18 @@ var secretTables = []secretTable{
 		owned: `EXISTS (SELECT 1 FROM webhook_sync_connections c WHERE c.id = r.connection_id)
 			AND (r.silo_profile_id IS NULL OR EXISTS (SELECT 1 FROM user_profiles p WHERE p.id = r.silo_profile_id))`,
 		describe: `format('webhook sync mapping %s of connection %s', r.id, r.connection_id)`,
+	}},
+
+	// Links and providers that sign people in: one removed since the backup
+	// would let its external account sign in again.
+	{name: "plugin_auth_identities", handling: secretCarried, why: "external sign-in links (OIDC, LDAP) of accounts", carry: &carrySpec{
+		key: "id", same: []string{"id", "plugin_installation_id", "external_subject", columnUserID}, credential: everyRow,
+		owners: []string{columnUserID}, owned: ownerCarried(columnUserID) + ` AND ` + pluginInstalled,
+		describe: `format('sign-in link %s %L (account %s)', r.id, r.username, r.user_id)`,
+	}},
+	{name: "plugin_auth_bindings", handling: secretCarried, why: "sign-in providers", carry: &carrySpec{
+		key: "id", same: []string{"id", "plugin_installation_id", "capability_id"}, credential: everyRow, owned: pluginInstalled,
+		describe: `format('sign-in provider %s (%s)', r.id, r.capability_id)`,
 	}},
 
 	// Destinations that receive notifications without a session: one removed
@@ -269,7 +286,8 @@ func leftOutTables() []string {
 
 // carriedKinds is what the restore output calls the carried tables.
 const carriedKinds = "API keys, pending invitations, invite codes, autoscan webhook tokens, audiobook RSS feed links, " +
-	"Plex and Jellyfin webhook sync secrets, and notification destinations (push registrations, webhooks, email addresses, Discord links, server channels)"
+	"Plex and Jellyfin webhook sync secrets, external sign-in links and providers, and notification destinations " +
+	"(push registrations, webhooks, email addresses, Discord links, server channels)"
 
 // CarriedCredentials is what DatabaseLoader.CarryCredentials did.
 type CarriedCredentials struct {
