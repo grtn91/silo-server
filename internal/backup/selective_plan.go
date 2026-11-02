@@ -14,9 +14,7 @@ import (
 
 	"github.com/Silo-Server/silo-server/internal/blobstore"
 	"github.com/Silo-Server/silo-server/internal/catalog"
-	"github.com/Silo-Server/silo-server/internal/config"
 	"github.com/Silo-Server/silo-server/internal/plugins"
-	"github.com/Silo-Server/silo-server/internal/secret"
 )
 
 // PreviewItem is one item of a section, as it compares with this server.
@@ -97,13 +95,15 @@ type planner struct {
 	rs         *RestoreSet
 	q          queryer
 	keyMatches bool
+	// authenticated is set when the backup's manifest verified here.
+	authenticated bool
 	// claimed maps "kind:local id" to the item of this restore that wrote
 	// it; nil for a preview.
 	claimed map[string]string
 }
 
 func (s *Service) newPlanner(rs *RestoreSet, q queryer) *planner {
-	return &planner{s: s, rs: rs, q: q, keyMatches: s.keyMatches(rs)}
+	return &planner{s: s, rs: rs, q: q, keyMatches: s.keyMatches(rs), authenticated: !rs.unverified}
 }
 
 // keyMatches reports whether rs was written under this server's SECRET_KEY,
@@ -307,6 +307,13 @@ func (p *planner) planPlugin(doc PluginDocument, locals map[string]localPlugin) 
 		item.Status, item.Reason, item.Message = ItemOnThisServer, ReasonSame, ""
 		return item
 	}
+	// A plugin's configuration can name services and the tokens it sends
+	// them: it comes only from a backup this server verified.
+	if !p.authenticated {
+		item.Status, item.Reason, item.Message = ItemDiffers, ReasonUnverifiedBackup,
+			"Its configuration can connect to outside services, so it is not restored from a backup this server cannot verify."
+		return item
+	}
 	if !p.keyMatches || p.s.targets.Plugins == nil {
 		item.Status, item.Reason = ItemNeedsAnotherKey, ReasonNeedsAnotherKey
 		item.Message = "Its configuration was encrypted with another SECRET_KEY and cannot be read here."
@@ -336,152 +343,6 @@ func (p *planner) planPlugin(doc PluginDocument, locals map[string]localPlugin) 
 	}
 	item.Status, item.Selectable = ItemDiffers, true
 	return item
-}
-
-// ---- Settings ----
-
-func readStoredSettings(ctx context.Context, q queryer) (map[string]string, error) {
-	rows, err := q.Query(ctx, `SELECT key, value FROM server_settings`)
-	if err != nil {
-		return nil, fmt.Errorf("reading settings: %w", err)
-	}
-	defer rows.Close()
-	out := map[string]string{}
-	for rows.Next() {
-		var key, value string
-		if err := rows.Scan(&key, &value); err != nil {
-			return nil, err
-		}
-		out[key] = value
-	}
-	return out, rows.Err()
-}
-
-// settingPlan is one backup setting against this server: its plaintext when
-// readable.
-type settingPlan struct {
-	preview PreviewSetting
-	page    string
-	value   string
-}
-
-// planSettings compares each setting this server's table offers. An
-// encrypted value is read only with a matching key; otherwise it needs
-// another key and is never written.
-func (p *planner) planSettings(ctx context.Context) ([]settingPlan, error) {
-	stored, err := readStoredSettings(ctx, p.q)
-	if err != nil {
-		return nil, err
-	}
-	cipher := p.s.opts.Cipher
-	var out []settingPlan
-	for _, e := range p.rs.Settings.Settings {
-		rule, ok := RestorableSetting(e.Key)
-		if !ok {
-			continue
-		}
-		plan := settingPlan{page: rule.page, preview: PreviewSetting{Key: e.Key, Class: rule.class, RestartRequired: config.RestartRequired(e.Key),
-			Masked: e.Encrypted || catalog.SensitiveSettingKeys[e.Key]}}
-		value := e.Value
-		if e.Encrypted {
-			if !p.keyMatches || cipher == nil {
-				plan.preview.Status = ItemNeedsAnotherKey
-				out = append(out, plan)
-				continue
-			}
-			if value, err = cipher.Decrypt(e.Value, secret.SettingsAAD(e.Key)); err != nil {
-				plan.preview.Status = ItemNeedsAnotherKey
-				out = append(out, plan)
-				continue
-			}
-		}
-		plan.value = value
-		current, have := stored[e.Key]
-		if have && cipher != nil {
-			if plain, err := cipher.DecryptIfEncrypted(current, secret.SettingsAAD(e.Key)); err == nil {
-				current = plain
-			} else {
-				have = false
-			}
-		}
-		live := current
-		if !have {
-			live = ""
-		}
-		switch _, wider := config.AccessSettingWider(e.Key, value, live); {
-		case have && current == value:
-			plan.preview.Status = ItemOnThisServer
-		case wider:
-			// A restore never widens access: the live value stays.
-			plan.preview.Status = SettingKeptStricter
-		default:
-			plan.preview.Status = ItemDiffers
-		}
-		if !plan.preview.Masked {
-			plan.preview.BackupValue, plan.preview.CurrentValue = value, current
-		}
-		out = append(out, plan)
-	}
-	return out, nil
-}
-
-// keptStricterNote says that n settings keep the live, stricter value.
-func keptStricterNote(n int) string {
-	if n == 1 {
-		return "1 setting would widen access, so this server keeps its stricter current value."
-	}
-	return fmt.Sprintf("%d settings would widen access, so this server keeps its stricter current values.", n)
-}
-
-// settingsPageItems groups settings by page in display order.
-func settingsPageItems(plans []settingPlan) []PreviewItem {
-	byPage := map[string][]settingPlan{}
-	for _, plan := range plans {
-		byPage[plan.page] = append(byPage[plan.page], plan)
-	}
-	var out []PreviewItem
-	for _, page := range SettingsPages() {
-		list := byPage[page.ID]
-		if len(list) == 0 {
-			continue
-		}
-		sort.Slice(list, func(i, j int) bool { return list[i].preview.Key < list[j].preview.Key })
-		item := PreviewItem{ID: page.ID, Kind: KindSettingsPage, Label: page.Title, Status: ItemOnThisServer, Reason: ReasonSame}
-		differs, needsKey, stricter := 0, 0, 0
-		for _, plan := range list {
-			item.Settings = append(item.Settings, plan.preview)
-			switch plan.preview.Status {
-			case ItemDiffers:
-				differs++
-				item.RestartRequired = item.RestartRequired || plan.preview.RestartRequired
-				item.ExternalService = item.ExternalService || plan.preview.Class == SettingExternalService
-			case ItemNeedsAnotherKey:
-				needsKey++
-			case SettingKeptStricter:
-				stricter++
-			}
-		}
-		var notes []string
-		if needsKey > 0 && differs > 0 {
-			notes = append(notes, fmt.Sprintf("%d encrypted settings on this page were encrypted with another SECRET_KEY and are left out.", needsKey))
-		}
-		if stricter > 0 && (differs > 0 || needsKey > 0) {
-			notes = append(notes, keptStricterNote(stricter))
-		}
-		switch {
-		case differs > 0:
-			item.Status, item.Reason, item.Selectable = ItemDiffers, "", true
-		case needsKey > 0:
-			item.Status, item.Reason = ItemNeedsAnotherKey, ReasonNeedsAnotherKey
-			notes = append([]string{"The settings that differ were encrypted with another SECRET_KEY."}, notes...)
-		case stricter > 0:
-			item.Status, item.Reason = ItemDiffers, ReasonKeptStricter
-			notes = []string{"Every setting that differs would widen access, so this server keeps its stricter current values."}
-		}
-		item.Message = strings.Join(notes, " ")
-		out = append(out, item)
-	}
-	return out
 }
 
 // ---- Collections and artwork ----
@@ -877,6 +738,7 @@ func (s *Service) preview(ctx context.Context, src restoreSource, acceptUnauthen
 	}
 	serverID, _ := s.serverID(ctx)
 	p := s.newPlanner(rs, s.opts.Pool)
+	p.authenticated = authenticated
 	out := &RestorePreview{BackupID: src.backupID, Digest: rs.Digest, FormatVersion: rs.Index.Version, ServerID: rs.Index.ServerID,
 		ServerName: rs.Index.ServerName, SiloVersion: rs.Index.SiloVersion, CreatedAt: rs.Index.CreatedAt,
 		SameServer: rs.Index.ServerID == serverID, KeyMatches: p.keyMatches, Authenticated: authenticated, MissingBlobs: append([]string{}, rs.MissingBlobs...),

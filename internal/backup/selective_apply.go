@@ -22,7 +22,6 @@ import (
 	"github.com/Silo-Server/silo-server/internal/backup/userdata"
 	"github.com/Silo-Server/silo-server/internal/blobstore"
 	"github.com/Silo-Server/silo-server/internal/catalog"
-	"github.com/Silo-Server/silo-server/internal/config"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/plugins"
 	"github.com/Silo-Server/silo-server/internal/sections"
@@ -94,6 +93,7 @@ func (s *Service) ExecuteRestore(ctx context.Context, run RestoreRun) (any, erro
 	if err != nil {
 		return fail(err)
 	}
+	rs.unverified = !located.authenticated
 	defer rs.Cleanup()
 	if rs.Digest != req.Digest {
 		return fail(ErrDigestMismatch)
@@ -288,7 +288,7 @@ func (a *applier) applyWithRetry(ctx context.Context, tx pgx.Tx, section, id str
 // from its read: a deadlock or serialization failure, or a section whose
 // references changed under it.
 func retryableItemError(err error) bool {
-	if errors.Is(err, sections.ErrReferencesChanged) || errors.Is(err, errAccessTightened) {
+	if errors.Is(err, sections.ErrReferencesChanged) || errors.Is(err, errSettingsChanged) {
 		return true
 	}
 	pgErr, ok := errors.AsType[*pgconn.PgError](err)
@@ -656,6 +656,9 @@ func (a *applier) applyPlugin(ctx context.Context, tx pgx.Tx, id string) (applie
 		return leftOut(item, ReasonNotInBackup, "The backup has no such plugin."), nil
 	}
 	item.Label = doc.PluginID + " " + doc.Version
+	if a.rs.unverified {
+		return leftOut(item, ReasonUnverifiedBackup, "Its configuration can connect to outside services, so it is not restored from a backup this server cannot verify."), nil
+	}
 	if a.s.targets.Plugins == nil {
 		return applied{}, plugins.ErrRestoreUnavailable
 	}
@@ -696,83 +699,6 @@ func needsInstallMessage(doc PluginDocument) string {
 		return msg + " to apply its settings. A restore never installs a plugin from a backup."
 	}
 	return msg + ". A restore never installs a plugin from a backup."
-}
-
-// ---- Settings ----
-
-func (a *applier) applySettingsPage(ctx context.Context, tx pgx.Tx, id string) (applied, error) {
-	page, known := settingsPageByID(id)
-	item := ReportItem{Kind: KindSettingsPage, Label: id}
-	if !known {
-		return leftOut(item, ReasonNotInBackup, "There is no such settings page."), nil
-	}
-	item.Label = page.Title
-	plans, err := a.s.newPlanner(a.rs, tx).planSettings(ctx)
-	if err != nil {
-		return applied{}, err
-	}
-	values, needKey, stricter := map[string]string{}, 0, 0
-	for _, p := range plans {
-		if p.page != id {
-			continue
-		}
-		switch p.preview.Status {
-		case ItemDiffers:
-			values[p.preview.Key] = p.value
-		case ItemNeedsAnotherKey:
-			needKey++
-		case SettingKeptStricter:
-			stricter++
-		}
-	}
-	if needKey > 0 {
-		item.Notes = append(item.Notes, fmt.Sprintf("%d settings encrypted with another SECRET_KEY were left out.", needKey))
-	}
-	if stricter > 0 {
-		item.Notes = append(item.Notes, keptStricterNote(stricter))
-	}
-	if len(values) == 0 {
-		switch {
-		case needKey > 0:
-			return leftOut(item, ReasonNeedsAnotherKey, "Every setting that differs was encrypted with another SECRET_KEY."), nil
-		case stricter > 0:
-			return leftOut(item, ReasonKeptStricter, "Every setting that differs would widen access, so this server kept its stricter current values."), nil
-		}
-		return unchanged(item), nil
-	}
-	if a.s.targets.ApplySettings == nil {
-		return applied{}, errors.New("settings restore is not available on this server")
-	}
-	restartKeys, after, err := a.s.targets.ApplySettings(ctx, tx, values, accessUnchanged(values))
-	if err != nil {
-		return applied{}, err
-	}
-	keys := slices.Sorted(maps.Keys(values))
-	item.Outcome = OutcomeRestored
-	item.Message = "Restored " + strings.Join(keys, ", ") + "."
-	item.RestartKeys = restartKeys
-	item.RestartRequired = len(restartKeys) > 0
-	return applied{item: item, after: after}, nil
-}
-
-// errAccessTightened stops a settings write whose access setting the
-// stored value, read under the settings lock, now makes wider: an admin made
-// it stricter since the item was planned. The item starts again from its
-// read and keeps the stricter value.
-var errAccessTightened = errors.New("an access setting was made stricter since the restore read it")
-
-// accessUnchanged checks, under the settings lock, that no access setting
-// of values grants more than the stored value (config.AccessSettingWider),
-// as planSettings checked before the lock.
-func accessUnchanged(values map[string]string) func(stored map[string]string) error {
-	return func(stored map[string]string) error {
-		for key, value := range values {
-			if _, wider := config.AccessSettingWider(key, value, stored[key]); wider {
-				return fmt.Errorf("%w: %s", errAccessTightened, key)
-			}
-		}
-		return nil
-	}
 }
 
 // ---- Collections and artwork ----

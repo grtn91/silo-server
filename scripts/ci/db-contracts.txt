@@ -784,6 +784,7 @@
 ./internal/backup TestEveryTableIsClassifiedDB
 ./internal/backup TestSelectiveRestoreDB
 ./internal/backup TestRestoreRechecksAccessSettingsUnderTheLockDB
+./internal/backup TestRestoreNeverSendsLiveSecretsToARestoredAddressDB
 ./internal/backup TestTemplateCollectionsAndHomeSectionsDB
 ./internal/backup TestIdentityTwinsRestoreOneToOneDB
 ./internal/plugins TestRestoreInstallationDB

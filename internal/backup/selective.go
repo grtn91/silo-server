@@ -33,6 +33,13 @@ const (
 	// SettingKeptStricter is a setting whose backup value would widen
 	// access (config.AccessSettingWider): a restore keeps the live value.
 	SettingKeptStricter = "kept_stricter"
+	// SettingCleared is a service secret a restore clears, or the service's
+	// switch it turns off: the restore changes where the service connects,
+	// and the backup has no secret this server can read for it.
+	SettingCleared = "cleared"
+	// SettingUnverifiedBackup is a setting that connects to an outside
+	// service, which a backup this server cannot verify never restores.
+	SettingUnverifiedBackup = "unverified_backup"
 )
 
 // Reasons an item cannot be chosen, is restored only in part, or was left
@@ -71,6 +78,10 @@ const (
 	// ReasonKeptStricter: every setting of the page that differs would
 	// widen access, so the live values stay.
 	ReasonKeptStricter = "kept_stricter"
+	// ReasonUnverifiedBackup: what the item would restore connects to
+	// outside services, which a backup this server cannot verify never
+	// restores.
+	ReasonUnverifiedBackup = "unverified_backup"
 )
 
 // Report outcomes.

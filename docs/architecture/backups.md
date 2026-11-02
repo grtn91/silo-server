@@ -546,7 +546,20 @@ grouped by the admin page that edits each key: a key or prefix with its class.
   settings lock (`accessUnchanged`, the admin settings write path's guard),
   so a stricter value an admin saves after the plan is kept: the item starts
   again from its read. `TestAccessSettingsAreComparedOnRestore` requires
-  every access setting to be offered, so none is compared in vain.
+  every access setting to be offered, so none is compared in vain. Mail's
+  transport security (`email.smtp_security`) is compared the same way: a
+  restore never weakens it to `none`.
+- A service's address and its secrets restore together (`settingRoutes`:
+  the SMTP host and password, the AI, speech, subtitle-AI, and embedding
+  base URLs and their keys). When a restore changes the address, each secret
+  must come from the backup and decrypt here; otherwise the restore clears
+  it and turns the service off (`email.enabled`) instead of sending this
+  server's secret to the backup's address. The preview marks those settings
+  `cleared`, and the secrets are expected unchanged under the settings lock.
+- A backup this server cannot authenticate restores no setting that
+  connects to an outside service (class `external_service`) and no plugin
+  configuration, whatever the admin confirmed: the preview marks them
+  `unverified_backup`.
 
 A key the table does not match is never offered. `TestEverySettingIsClassified`
 fails for any admin setting default, sensitive setting, or branding asset key

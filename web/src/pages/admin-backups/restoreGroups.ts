@@ -98,6 +98,7 @@ const BLOCKED_PHRASES: Record<RestoreReason, string> = {
   files_missing_here: "their files are missing on this server",
   needs_install: "they need to be installed from a plugin catalog first",
   kept_stricter: "they would widen access, so this server keeps its stricter values",
+  unverified_backup: "they connect to outside services and this server can't verify the backup",
 };
 
 /** For an item the server gave a status but no reason. */

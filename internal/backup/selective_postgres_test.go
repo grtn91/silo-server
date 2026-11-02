@@ -549,6 +549,84 @@ func TestRestoreRechecksAccessSettingsUnderTheLockDB(t *testing.T) {
 	}
 }
 
+// TestRestoreNeverSendsLiveSecretsToARestoredAddressDB: restoring a mail
+// server address the backup has no password for clears the password here
+// and turns email off, rather than sending this server's password to the
+// backup's server; a backup this server cannot verify restores no setting
+// that connects to an outside service at all.
+func TestRestoreNeverSendsLiveSecretsToARestoredAddressDB(t *testing.T) {
+	f := newSelectiveFixture(t)
+	ctx := t.Context()
+	const host, password, enabled = "email.smtp_host", "email.smtp_password", "email.enabled"
+	dbExec(t, f.pool, `DELETE FROM server_settings WHERE key = $1`, password)
+	setSetting(t, f.pool, f.settings, host, "smtp.backup.example")
+	setSetting(t, f.pool, f.settings, enabled, "true")
+	source, err := backupUnderLock(t, f.svc, KindManual)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.settings.Set(ctx, host, "mail.example.com"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.settings.Set(ctx, password, "the live password"); err != nil {
+		t.Fatal(err)
+	}
+	preview, err := f.svc.Preview(ctx, source.ID, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	page := previewItem(t, preview, SectionSettings, pageEmail)
+	cleared := map[string]bool{}
+	for _, s := range page.Settings {
+		cleared[s.Key] = s.Status == SettingCleared
+	}
+	if !page.Selectable || !cleared[password] || !cleared[enabled] {
+		t.Fatalf("email page = %+v, want the password cleared and email turned off", page)
+	}
+	report, err := f.restore(t, source.ID, preview.Digest, map[string][]string{SectionSettings: {pageEmail}}, &testFence{pool: f.pool})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if item := reportItem(t, report, SectionSettings, pageEmail); item.Outcome != OutcomeRestored {
+		t.Fatalf("email page = %+v", item)
+	}
+	for key, want := range map[string]string{host: "smtp.backup.example", password: "", enabled: "false"} {
+		if got, _ := f.settings.Get(ctx, key); got != want {
+			t.Fatalf("%s = %q, want %q", key, got, want)
+		}
+	}
+
+	// The same backup under another key: nothing that reaches a service.
+	manifestKey := objectKey(f.serverID, source.ID, ManifestName)
+	body, _, err := f.store.Get(ctx, manifestKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, _ := io.ReadAll(body)
+	_ = body.Close()
+	m, err := ParseManifest(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.KeyCheck = "9999-8888-7777-6666"
+	if data, err = json.Marshal(m); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.store.Put(ctx, manifestKey, data); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.settings.Set(ctx, host, "mail.example.com"); err != nil {
+		t.Fatal(err)
+	}
+	unverified, err := f.svc.Preview(ctx, source.ID, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if page := previewItem(t, unverified, SectionSettings, pageEmail); page.Selectable || page.Reason != ReasonUnverifiedBackup {
+		t.Fatalf("email page of an unverified backup = %+v, want unselectable, unverified_backup", page)
+	}
+}
+
 func TestSelectiveRestoreDB(t *testing.T) {
 	f := newSelectiveFixture(t)
 	ctx := t.Context()

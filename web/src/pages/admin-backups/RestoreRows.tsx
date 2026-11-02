@@ -56,6 +56,20 @@ function settingValues(setting: RestoreSetting): { now: string; backup: string }
       backup: "Encrypted with another key",
     };
   }
+  if (setting.status === "cleared") {
+    return {
+      now: setting.masked ? "Set" : setting.current_value || "Empty",
+      backup: setting.masked
+        ? "Cleared: not in the backup"
+        : `${setting.backup_value || "Empty"} (turned off)`,
+    };
+  }
+  if (setting.status === "unverified_backup") {
+    return {
+      now: setting.masked ? "Set" : setting.current_value || "Empty",
+      backup: "Not restored: unverified backup",
+    };
+  }
   if (setting.status === "kept_stricter") {
     return {
       now: `${setting.current_value || "Empty"} (kept: stricter)`,

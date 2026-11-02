@@ -14445,7 +14445,8 @@ export interface components {
         | "unreadable"
         | "files_missing_here"
         | "needs_install"
-        | "kept_stricter";
+        | "kept_stricter"
+        | "unverified_backup";
       /** @description Items (section:id) that must be chosen with this one: a collection whose library is restored by the same request */
       requires: string[];
       restart_required: boolean;
@@ -14548,7 +14549,8 @@ export interface components {
         | "unreadable"
         | "files_missing_here"
         | "needs_install"
-        | "kept_stricter";
+        | "kept_stricter"
+        | "unverified_backup";
       restart_keys: string[];
       restart_required: boolean;
       /** @enum {string} */
@@ -14619,10 +14621,16 @@ export interface components {
       /** @description The setting applies after a restart */
       restart_required: boolean;
       /**
-       * @description on_this_server: same value here; needs_another_key: encrypted with another SECRET_KEY and never written; kept_stricter: the backup's value would widen access (who can sign in, how long sessions last, what a rating-capped profile sees), so this server keeps its stricter value and a restore never writes it
+       * @description on_this_server: same value here; needs_another_key: encrypted with another SECRET_KEY and never written; kept_stricter: the backup's value would widen access (who can sign in, how long sessions last, what a rating-capped profile sees, mail transport security), so this server keeps its stricter value and a restore never writes it; cleared: the restore changes where a service connects and the backup has no secret this server can read for it, so restoring clears the secret here and turns the service off; unverified_backup: it connects to an outside service, which a backup this server cannot verify never restores
        * @enum {string}
        */
-      status: "on_this_server" | "differs" | "needs_another_key" | "kept_stricter";
+      status:
+        | "on_this_server"
+        | "differs"
+        | "needs_another_key"
+        | "kept_stricter"
+        | "cleared"
+        | "unverified_backup";
     };
     AdminBackupRestoreSource: {
       /** @description The backup restored from */

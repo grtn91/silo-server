@@ -74,6 +74,10 @@ type RestoreSet struct {
 	// blobs maps each blob key in the archive to its extracted file, or to
 	// "" when the read did not extract.
 	blobs map[string]string
+	// unverified marks a set a restore job read from a backup this server
+	// cannot authenticate; a preview's shared set leaves it unset and says
+	// so to its planner.
+	unverified bool
 	// blobSizes is each blob's size in bytes, extracted or not.
 	blobSizes map[string]int64
 	dir       string

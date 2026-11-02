@@ -24,6 +24,10 @@ func TestAccessSettingWider(t *testing.T) {
 		{"auth.access_token_expiry", "1h", "", false},
 		{"jellyfin_compat.session_ttl", "87601h", "", true},
 		{AuthRefreshTokenExpirySettingKey, "forever", "30d", true}, // unreadable keeps the live value
+		{"email.smtp_security", "none", "starttls", true},
+		{"email.smtp_security", "none", "", true}, // the default is starttls
+		{"email.smtp_security", "tls", "none", false},
+		{"email.smtp_security", "starttls", "tls", false},
 	} {
 		access, wider := AccessSettingWider(tc.key, tc.restored, tc.live)
 		if !access || wider != tc.wider {

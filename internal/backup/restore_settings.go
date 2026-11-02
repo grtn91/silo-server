@@ -40,7 +40,7 @@ var settingsPages = []SettingsPage{
 	{"general", "General"}, {pageAppearance, "Appearance"}, {"storage", "Storage"}, {"logging", "Logging"},
 	{pageSignIn, "Sign-in"}, {"security", "Security"}, {pageLibrary, "Library & Metadata"}, {"search", "Search"},
 	{"playback", "Playback"}, {"downloads", "Downloads"}, {"requests", "Requests"}, {"providers", "Providers"},
-	{"ai", "AI Services"}, {"email", "Email"}, {"notifications", "Notifications"}, {"compatibility", "Compatibility"},
+	{"ai", "AI Services"}, {pageEmail, "Email"}, {"notifications", "Notifications"}, {"compatibility", "Compatibility"},
 	{"recommendations", "Recommendations"}, {"nodes", "Nodes"}, {pageBackups, "Backups"}, {pageOther, "Other settings"},
 }
 
@@ -60,6 +60,7 @@ const (
 	pageBackups    = "backups"
 	pageLibrary    = "library"
 	pageSignIn     = "sign-in"
+	pageEmail      = "email"
 )
 
 type settingRule struct {
@@ -171,13 +172,16 @@ var settingRulesByPage = []struct {
 		"ai.text_provider_id":   SettingServerSpecific,
 		"ai.speech_provider_id": SettingServerSpecific,
 		"ai.api_key":            SettingExternalService,
+		"ai.base_url":           SettingExternalService,
+		"ai.asr_base_url":       SettingExternalService,
+		"subtitle_ai.base_url":  SettingExternalService,
 		"ai.asr_api_key":        SettingExternalService,
 		"subtitle_ai.api_key":   SettingExternalService,
 		"ai.":                   SettingPortable,
 		"subtitle_ai.":          SettingPortable,
 		"metadata_ai.":          SettingPortable,
 	}},
-	{"email", map[string]SettingClass{
+	{pageEmail, map[string]SettingClass{
 		"email.": SettingExternalService,
 	}},
 	{"notifications", map[string]SettingClass{
@@ -195,8 +199,10 @@ var settingRulesByPage = []struct {
 		"jellyfin_compat.public_url":      SettingServerSpecific,
 		"jellyfin_compat.web_install_dir": SettingServerSpecific,
 		"jellyfin_compat.server_id":       SettingServerSpecific,
-		"jellyfin_compat.":                SettingPortable,
-		"audiobookshelf_compat.":          SettingPortable,
+		// Where the server downloads the Jellyfin web client it serves.
+		"jellyfin_compat.web_source_url": SettingExternalService,
+		"jellyfin_compat.":               SettingPortable,
+		"audiobookshelf_compat.":         SettingPortable,
 	}},
 	{"recommendations", map[string]SettingClass{
 		"recommendations.embedding_provider_id": SettingServerSpecific,
@@ -206,6 +212,7 @@ var settingRulesByPage = []struct {
 		"recommendations.policy_marked_generation": SettingServerSpecific,
 		"recommendations.embedding_auth_token":     SettingExternalService,
 		"recommendations.openai_api_key":           SettingExternalService,
+		"recommendations.embedding_base_url":       SettingExternalService,
 		"recommendations.":                         SettingPortable,
 	}},
 	{"nodes", map[string]SettingClass{
