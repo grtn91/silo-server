@@ -41,6 +41,8 @@ type Source struct {
 	// private is the directory of the checked copies Validate reads from
 	// (privatize); origin is the folder they came from.
 	private, origin string
+	// authenticated is set once Validate verified the manifest's MAC.
+	authenticated bool
 }
 
 // OpenSource reads a backup folder's manifest.
@@ -109,6 +111,7 @@ func (src *Source) Validate(ctx context.Context, opts ValidateOptions) error {
 	if err != nil {
 		return err
 	}
+	src.authenticated = authenticated
 	if !authenticated && !opts.AcceptLostCredentials {
 		return unauthenticatedError(m, opts.KeyCheck)
 	}
@@ -196,6 +199,9 @@ type DatabaseLoader interface {
 	// value of each access setting the restored data would widen, and
 	// returns those keys.
 	KeepStricterSettings(ctx context.Context, dbURL, liveURL string, cipher *secret.Cipher) ([]string, error)
+	// ServerID reads the server identity (serveridentity.Key) dbURL's
+	// settings hold, or "" when they hold none.
+	ServerID(ctx context.Context, dbURL string) (string, error)
 }
 
 // clearLostSettings removes, from a restored database taken with another

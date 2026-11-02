@@ -75,9 +75,12 @@ func (src *Source) Close() error {
 	if src == nil || src.private == "" {
 		return nil
 	}
-	err := os.RemoveAll(src.private)
+	dir := src.private
+	if err := os.RemoveAll(dir); err != nil {
+		return fmt.Errorf("removing %s: %w", dir, err)
+	}
 	src.Dir, src.private = src.origin, ""
-	return err
+	return nil
 }
 
 // copyChecked copies from to a new 0600 file to, hashing what it writes,
