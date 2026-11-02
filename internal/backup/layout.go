@@ -4,6 +4,8 @@ import (
 	"errors"
 	"strings"
 	"time"
+
+	"github.com/Silo-Server/silo-server/internal/blobstore"
 )
 
 // Kind says why a backup was taken.
@@ -24,7 +26,7 @@ func (k Kind) valid() bool {
 
 const (
 	// RootPrefix holds every server's backups at a destination.
-	RootPrefix = "backups/"
+	RootPrefix = blobstore.BackupNamespace + "/"
 
 	ManifestName = "manifest.json"
 	DumpName     = "db.dump"

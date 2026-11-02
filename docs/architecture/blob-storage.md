@@ -278,7 +278,10 @@ artwork is not copied by either policy; refresh metadata for affected libraries
 after restart and artwork reconciliation. Backfill Metadata Images does not
 process local sidecar sources. `migrate_all` copies all data from each source
 location that changes. PostgreSQL catalog metadata is retained and the old
-storage is never deleted automatically.
+storage is never deleted automatically. No policy copies anything under
+`backups/` (`blobstore.BackupNamespace`) in any pass: local backups are
+unencrypted dumps that must never reach a bucket, and a bucket's backups
+belong to it. They stay where they are ([backups.md](backups.md#destinations)).
 
 Admission serializes stage selection and job creation across API nodes. A lost
 job-creation response retains the stage until a separate read confirms that no

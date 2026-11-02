@@ -28,6 +28,12 @@ const (
 	BackendS3    = "s3"
 )
 
+// BackupNamespace is the top-level prefix backups own in a store
+// (backup.RootPrefix): dumps, restore sets, uploads, and a restore's
+// preserved objects. No artwork or operational pass reads, copies, or
+// deletes under it; a storage transition leaves it where it is.
+const BackupNamespace = "backups"
+
 // IdentitySettingKey is the server_settings row that records the storage the
 // catalog's keys belong to. The first successful write records the store's
 // Identity; Open refuses a store whose Identity differs. The row keeps its
