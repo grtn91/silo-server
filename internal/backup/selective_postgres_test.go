@@ -511,6 +511,9 @@ func TestSelectiveRestoreDB(t *testing.T) {
 type pagesSeed struct {
 	suffix  string
 	library int
+	// library2 is a second library an admin added to both template
+	// collections' scope.
+	library2 int
 	// customized was created from a template and then changed by the admin;
 	// plain keeps the template's defaults but its description; gone names
 	// a template this server's catalog does not have.
@@ -558,6 +561,7 @@ func seedPages(t *testing.T, f *selectiveFixture) pagesSeed {
 	ctx, pool := t.Context(), f.pool
 	s := pagesSeed{suffix: randomHex(t, 4)}
 	s.library = testLibrary(t, pool, "pages-"+s.suffix)
+	s.library2 = testLibrary(t, pool, "pages2-"+s.suffix)
 	s.items = []string{"bkpg-" + s.suffix + "-1", "bkpg-" + s.suffix + "-2"}
 	for _, id := range s.items {
 		testMovie(t, pool, id, "Page "+id, "", s.library)
@@ -579,8 +583,11 @@ func seedPages(t *testing.T, f *selectiveFixture) pagesSeed {
 	}
 	s.customized = fromTemplate("tmdb_popular_movies", func(in *catalog.CreateLibraryCollectionInput) {
 		in.Title, in.Featured, in.SortOrder, in.Visibility = "My popular "+s.suffix, !in.Featured, 7, "hidden"
+		in.LibraryIDs = []int{s.library, s.library2}
 	})
-	s.plain = fromTemplate("tmdb_top_rated_movies", func(in *catalog.CreateLibraryCollectionInput) { in.Description = "Backup description" })
+	s.plain = fromTemplate("tmdb_top_rated_movies", func(in *catalog.CreateLibraryCollectionInput) {
+		in.Description, in.LibraryIDs = "Backup description", []int{s.library, s.library2}
+	})
 	gone, err := repo.Create(ctx, catalog.CreateLibraryCollectionInput{LibraryID: s.library, Slug: "gone-" + s.suffix, Title: "Gone template", CollectionType: "tmdb",
 		ManagementMode: managementTemplateBundle, ManagementSource: "core_defaults", ManagementKey: TemplateManagementKey("core_defaults", "retired_template", s.library)})
 	if err != nil {
@@ -591,7 +598,7 @@ func seedPages(t *testing.T, f *selectiveFixture) pagesSeed {
 	if err != nil {
 		t.Fatal(err)
 	}
-	dbExec(t, pool, `UPDATE library_collection_libraries SET group_id = $2 WHERE collection_id = $1`, s.customized, group.ID)
+	dbExec(t, pool, `UPDATE library_collection_libraries SET group_id = $2 WHERE collection_id = $1 AND library_id = $3`, s.customized, group.ID, s.library)
 	managed, err := repo.Create(ctx, catalog.CreateLibraryCollectionInput{LibraryID: s.library, Slug: "managed-" + s.suffix, Title: "Managed " + s.suffix,
 		ManagementMode: managementSection, ManagementSource: "sections", ManagementKey: "managed-" + s.suffix})
 	if err != nil {
@@ -643,6 +650,7 @@ func (f *selectiveFixture) losePages(t *testing.T, s pagesSeed) {
 	dbExec(t, f.pool, `DELETE FROM library_collections WHERE id = ANY($1)`, []string{s.customized, s.managedCollection})
 	dbExec(t, f.pool, `UPDATE page_sections SET title = 'Renamed', section_type = 'recently_released' WHERE id = $1`, s.recent)
 	dbExec(t, f.pool, `UPDATE library_collections SET title = 'Renamed later', description = '' WHERE id = $1`, s.plain)
+	dbExec(t, f.pool, `DELETE FROM library_collection_libraries WHERE collection_id = $1 AND library_id = $2`, s.plain, s.library2)
 	dbExec(t, f.pool, `DELETE FROM users WHERE id = $1`, s.account)
 }
 
@@ -966,7 +974,7 @@ func checkPagesPreview(t *testing.T, p *RestorePreview, s pagesSeed) map[string]
 		t.Fatalf("lost template collection = %+v %+v", customized, customized.Collection)
 	}
 	plain := previewItem(t, p, SectionCollections, templateCollectionItemID(s.plain))
-	if plain.Status != ItemDiffers || !slices.Equal(plain.Collection.Changes, []string{"description"}) {
+	if plain.Status != ItemDiffers || !slices.Equal(plain.Collection.Changes, []string{"description", "libraries"}) {
 		t.Fatalf("changed template collection = %+v %+v", plain, plain.Collection)
 	}
 	if got := previewItem(t, p, SectionHomeSections, homeSectionItemID(s.featured)); !got.Selectable ||
@@ -993,7 +1001,7 @@ func (f *selectiveFixture) checkRestoredPages(t *testing.T, s pagesSeed, report 
 	if err := pool.QueryRow(ctx, `SELECT c.id, c.title, c.visibility, c.featured, c.sort_order, c.poster_from_template, COALESCE(g.slug, '')
 		FROM library_collections c JOIN library_collection_libraries l ON l.collection_id = c.id
 		LEFT JOIN library_collection_groups g ON g.id = l.group_id
-		WHERE c.management_key = $1`, TemplateManagementKey("core_defaults", "tmdb_popular_movies", s.library)).
+		WHERE c.management_key = $1 AND l.library_id = $2`, TemplateManagementKey("core_defaults", "tmdb_popular_movies", s.library), s.library).
 		Scan(&id, &title, &visibility, &featured, &sortOrder, &fromTemplate, &slug); err != nil {
 		t.Fatalf("recreated template collection: %v", err)
 	}
@@ -1004,6 +1012,12 @@ func (f *selectiveFixture) checkRestoredPages(t *testing.T, s pagesSeed, report 
 	if id == s.customized || title != "My popular "+s.suffix || visibility != "hidden" || featured == defaults.Input.Featured || sortOrder != 7 ||
 		fromTemplate != defaults.Input.PosterFromTemplate || slug != "picks-"+s.suffix {
 		t.Fatalf("recreated %s: title %q visibility %q featured %v sort %d from template %v group %q", id, title, visibility, featured, sortOrder, fromTemplate, slug)
+	}
+	for _, c := range []string{id, s.plain} {
+		if n := countRows(t, pool, `SELECT count(*) FROM library_collection_libraries WHERE collection_id = $1 AND library_id = ANY($2)`,
+			c, []int{s.library, s.library2}); n != 2 {
+			t.Fatalf("template collection %s is in %d of its 2 libraries", c, n)
+		}
 	}
 	var plainTitle, plainDescription string
 	if err := pool.QueryRow(ctx, `SELECT title, description FROM library_collections WHERE id = $1`, s.plain).Scan(&plainTitle, &plainDescription); err != nil ||

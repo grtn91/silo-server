@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -34,6 +35,9 @@ type templatePlan struct {
 	custom templateCustomization
 	// groups is how many memberships here go back into their group.
 	groups int
+	// scope is the backup's library scope mapped here, its library first;
+	// addLibraries the ones the collection here lacks.
+	scope, addLibraries []int
 }
 
 // localTemplateCollection is the fields a customization compares.
@@ -94,20 +98,20 @@ func (p *planner) planTemplateCollection(ctx context.Context, t TemplateCollecti
 	if _, ok := p.s.targets.TemplateTitle(t.TemplateID); !ok {
 		return notAvailable(fmt.Sprintf("This server's collection templates do not include %q.", t.TemplateID))
 	}
-	local, ok := libMap[t.LibraryID]
-	if !ok {
-		if restorable[t.LibraryID] {
-			plan.item.Status, plan.item.Selectable = ItemNotOnThisServer, true
-			plan.item.Requires = []string{libraryRef(t.LibraryID)}
-			plan.item.Message = "Created from its template with its library, then synced."
-			return plan, nil
-		}
+	var ok bool
+	if plan.scope, plan.item.Requires, ok = templateScope(t, libMap, restorable); !ok {
 		plan.item.Status, plan.item.Reason = ItemNotOnThisServer, ReasonLibraryNotRestorable
-		plan.item.Message = "Its library is not on this server and cannot be restored."
+		plan.item.Message = "A library of it is not on this server and cannot be restored."
 		return plan, nil
 	}
+	if len(plan.item.Requires) > 0 {
+		plan.item.Status, plan.item.Selectable = ItemNotOnThisServer, true
+		plan.item.Message = "Created from its template with its libraries, then synced."
+		return plan, nil
+	}
+	local := plan.scope[0]
 	plan.library = local
-	plan.item.Collection.LibraryIDs = []int{local}
+	plan.item.Collection.LibraryIDs = plan.scope
 	// Two of the backup's libraries that became one here would give two of
 	// its collections one management key.
 	if twins := p.templateTwins(t, local, libMap); twins > 1 {
@@ -146,8 +150,14 @@ func (p *planner) planTemplateCollection(ctx context.Context, t TemplateCollecti
 	if plan.groups, err = ungroupedMemberships(ctx, p.q, plan.local.id, asCollection, libMap); err != nil {
 		return plan, err
 	}
+	if plan.addLibraries, err = missingScope(ctx, p.q, plan.local.id, plan.scope); err != nil {
+		return plan, err
+	}
 	plan.item.Collection.Changes = plan.custom.changes
-	if plan.custom.empty() && plan.groups == 0 {
+	if len(plan.addLibraries) > 0 {
+		plan.item.Collection.Changes = append(slices.Clone(plan.item.Collection.Changes), "libraries")
+	}
+	if plan.custom.empty() && plan.groups == 0 && len(plan.addLibraries) == 0 {
 		plan.item.Status, plan.item.Reason = ItemOnThisServer, ReasonSame
 		return plan, nil
 	}
@@ -158,6 +168,9 @@ func (p *planner) planTemplateCollection(ctx context.Context, t TemplateCollecti
 	}
 	if plan.groups > 0 {
 		parts = append(parts, fmt.Sprintf("puts it back in %d groups", plan.groups))
+	}
+	if len(plan.addLibraries) > 0 {
+		parts = append(parts, fmt.Sprintf("adds it to %d more libraries", len(plan.addLibraries)))
 	}
 	plan.item.Message = "The collection here " + strings.Join(parts, " and ") + "."
 	return plan, nil
@@ -309,6 +322,8 @@ func (a *applier) applyTemplateCollection(ctx context.Context, tx pgx.Tx, id str
 	}
 	input := plan.defaults.Input
 	input.ID = newID
+	// The backup's scope, as an admin set it, not the template's one library.
+	input.LibraryIDs = plan.scope
 	if input.Slug, err = freeSlug(ctx, tx, plan.library, input.Slug); err != nil {
 		return applied{}, err
 	}
@@ -352,11 +367,15 @@ func (a *applier) updateTemplateCollection(ctx context.Context, tx pgx.Tx, t Tem
 	if err := catalog.UpdateLibraryCollectionColumnsInTx(ctx, tx, u); err != nil {
 		return applied{}, err
 	}
+	added, err := catalog.AddLibraryCollectionLibrariesInTx(ctx, tx, plan.local.id, plan.addLibraries)
+	if err != nil {
+		return applied{}, err
+	}
 	grouped, err := restoreGroups(ctx, tx, plan.local.id, asCollection, libMap)
 	if err != nil {
 		return applied{}, err
 	}
-	if plan.custom.empty() && grouped == 0 {
+	if plan.custom.empty() && grouped == 0 && added == 0 {
 		return unchanged(item), nil
 	}
 	item.Outcome, item.Message = OutcomeRestored, plan.item.Message
@@ -422,4 +441,47 @@ func (a *applier) templateImages(ctx context.Context, t TemplateCollectionEntry,
 		}
 	}
 	return nil
+}
+
+// missingScope lists the libraries of scope the collection here is not in.
+func missingScope(ctx context.Context, q queryer, collectionID string, scope []int) ([]int, error) {
+	rows, err := q.Query(ctx, `SELECT library_id FROM library_collection_libraries WHERE collection_id = $1`, collectionID)
+	if err == nil {
+		var have []int
+		if have, err = pgx.CollectRows(rows, pgx.RowTo[int]); err == nil {
+			return missingFrom(scope, have), nil
+		}
+	}
+	return nil, fmt.Errorf("reading the collection's libraries: %w", err)
+}
+
+func missingFrom(scope, have []int) []int {
+	var missing []int
+	for _, id := range scope {
+		if !slices.Contains(have, id) {
+			missing = append(missing, id)
+		}
+	}
+	return missing
+}
+
+// templateScope maps a template collection's library scope, as an admin set
+// it, its library first: every library must be here or restored with it, as
+// for any collection (planCollection). ok is false when one can be neither.
+func templateScope(t TemplateCollectionEntry, libMap map[int]int, restorable map[int]bool) (scope []int, requires []string, ok bool) {
+	for _, id := range append([]int{t.LibraryID}, libraryIDsOf(t.Libraries)...) {
+		if local, mapped := libMap[id]; mapped {
+			if !slices.Contains(scope, local) {
+				scope = append(scope, local)
+			}
+			continue
+		}
+		if !restorable[id] {
+			return nil, nil, false
+		}
+		if ref := libraryRef(id); !slices.Contains(requires, ref) {
+			requires = append(requires, ref)
+		}
+	}
+	return scope, requires, true
 }

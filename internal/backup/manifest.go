@@ -67,8 +67,12 @@ type Manifest struct {
 	// while streaming, or "read_back" from the stored object.
 	TOCCheck string `json:"toc_check"`
 
-	Blobs        BlobSummary   `json:"blobs"`
-	MissingBlobs []MissingBlob `json:"missing_blobs"`
+	Blobs BlobSummary `json:"blobs"`
+	// MissingBlobs lists at most maxRecordedMissingBlobs of the blobs the
+	// backup found gone; MissingBlobsTotal counts them all when it lists
+	// fewer.
+	MissingBlobs      []MissingBlob `json:"missing_blobs"`
+	MissingBlobsTotal int           `json:"missing_blobs_total,omitempty"`
 	// Tables is the core table inventory from the backup's snapshot. Full
 	// restore compares the restored database with it, presence and counts.
 	Tables []TableCount `json:"tables"`
@@ -147,6 +151,15 @@ func (m *Manifest) object(name string) (ObjectEntry, bool) {
 // ParseManifest decodes manifest.json and refuses a format it cannot read or
 // a manifest whose contents a restore could not check against: a restore's
 // verification is only as strong as the inventory and checksums here.
+// MaxManifestBytes bounds a manifest: what readers read of one, and what
+// a backup may write.
+const MaxManifestBytes = 16 << 20
+
+// maxRecordedMissingBlobs bounds the missing blobs a manifest lists, so a
+// store that lost most of its objects cannot grow the manifest past
+// MaxManifestBytes.
+const maxRecordedMissingBlobs = 10_000
+
 func ParseManifest(data []byte) (*Manifest, error) {
 	var m Manifest
 	if err := json.Unmarshal(data, &m); err != nil {
