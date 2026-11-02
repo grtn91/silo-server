@@ -2,6 +2,7 @@ package backup
 
 import (
 	"slices"
+	"strings"
 	"testing"
 )
 
@@ -61,6 +62,49 @@ func TestLibpqTargetMovesThePasswordToTheEnvironment(t *testing.T) {
 	for _, bad := range []string{"host=db password='unterminated", "host", "=db"} {
 		if _, _, err := libpqTarget(bad, ""); err == nil {
 			t.Errorf("libpqTarget(%q) accepted a malformed connection string", bad)
+		}
+	}
+}
+
+// TestWithDatabase: a URL derived for another database names only that
+// database, however the original named its own, and the name read back is
+// the one libpq and pgx connect to. A connection service is refused.
+func TestWithDatabase(t *testing.T) {
+	cases := []struct {
+		name, in, live, out string
+	}{
+		{name: "path", in: "postgres://silo@db/live?sslmode=disable", live: "live",
+			out: "postgres://silo@db/other?sslmode=disable"},
+		{name: "query", in: "postgres://silo@db?dbname=live", live: "live", out: "postgres://silo@db/other"},
+		{name: "query overrides path", in: "postgres://silo@db/path?dbname=live&host=db2", live: "live",
+			out: "postgres://silo@db/other?host=db2"},
+		{name: "key value", in: "host=db dbname=first dbname='live one'", live: "live one",
+			out: "host='db' dbname='other'"},
+		{name: "key value without database", in: "host=db", out: "host='db' dbname='other'"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if live, err := databaseName(tc.in); tc.live != "" && (err != nil || live != tc.live) {
+				t.Errorf("databaseName = %q, %v; want %q", live, err, tc.live)
+			}
+			out, err := WithDatabase(tc.in, "other")
+			if err != nil || out != tc.out {
+				t.Fatalf("WithDatabase = %q, %v; want %q", out, err, tc.out)
+			}
+			if name, err := databaseName(out); err != nil || name != "other" {
+				t.Errorf("databaseName of the result = %q, %v; want other", name, err)
+			}
+		})
+	}
+	for _, bad := range []string{"postgres://silo@db/live?service=prod", "postgres:///?servicefile=/etc/pg_service.conf",
+		"service=prod dbname=live", "postgres://silo@db/a?dbname=b&dbname=c"} {
+		if _, err := databaseName(bad); err == nil {
+			t.Errorf("databaseName(%q) accepted it", bad)
+		}
+	}
+	for _, bad := range []string{"postgres://silo@db/live?service=prod", "service=prod dbname=live"} {
+		if _, err := WithDatabase(bad, "other"); err == nil || !strings.Contains(err.Error(), "service") {
+			t.Errorf("WithDatabase(%q) = %v, want a refusal naming the service", bad, err)
 		}
 	}
 }

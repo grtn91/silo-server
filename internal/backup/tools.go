@@ -115,8 +115,13 @@ var pgxOnlyParams = []string{"pool_", "statement_cache_capacity", "description_c
 // pgx-only parameters removed, an optional database name substituted, and the
 // password moved out of the command line (where ps shows it) into PGPASSWORD.
 func libpqTarget(databaseURL, dbname string) (conn string, env []string, err error) {
+	if dbname != "" {
+		if databaseURL, err = WithDatabase(databaseURL, dbname); err != nil {
+			return "", nil, err
+		}
+	}
 	if !strings.Contains(databaseURL, "://") {
-		return libpqKeyValueTarget(databaseURL, dbname)
+		return libpqKeyValueTarget(databaseURL)
 	}
 	u, err := url.Parse(databaseURL)
 	if err != nil {
@@ -139,10 +144,6 @@ func libpqTarget(databaseURL, dbname string) (conn string, env []string, err err
 		}
 	}
 	u.RawQuery = query.Encode()
-	if dbname != "" {
-		u.Path = "/" + dbname
-		u.RawPath = ""
-	}
 	return u.String(), env, nil
 }
 
@@ -165,28 +166,32 @@ func HasPassword(databaseURL string) bool {
 }
 
 // libpqKeyValueTarget is libpqTarget for a key=value DSN: it is rewritten
-// without the password and the pgx-only parameters, with dbname replaced
-// when one is given.
-func libpqKeyValueTarget(dsn, dbname string) (conn string, env []string, err error) {
+// without the password and the pgx-only parameters.
+func libpqKeyValueTarget(dsn string) (conn string, env []string, err error) {
 	pairs, err := parseKeyValueDSN(dsn)
 	if err != nil {
 		return "", nil, err
 	}
-	parts := make([]string, 0, len(pairs)+1)
+	var kept []dsnPair
 	for _, p := range pairs {
 		switch {
 		case p.key == "password":
 			env = append(env, "PGPASSWORD="+p.value)
-		case pgxOnlyParam(p.key), p.key == "dbname" && dbname != "":
-			// Dropped: libpq rejects the first, and the second is replaced.
+		case pgxOnlyParam(p.key):
+			// libpq rejects it.
 		default:
-			parts = append(parts, p.key+"="+quoteDSNValue(p.value))
+			kept = append(kept, p)
 		}
 	}
-	if dbname != "" {
-		parts = append(parts, "dbname="+quoteDSNValue(dbname))
+	return joinKeyValueDSN(kept), env, nil
+}
+
+func joinKeyValueDSN(pairs []dsnPair) string {
+	parts := make([]string, len(pairs))
+	for i, p := range pairs {
+		parts[i] = p.key + "=" + quoteDSNValue(p.value)
 	}
-	return strings.Join(parts, " "), env, nil
+	return strings.Join(parts, " ")
 }
 
 func pgxOnlyParam(key string) bool {
@@ -255,16 +260,40 @@ func parseKeyValueDSN(dsn string) ([]dsnPair, error) {
 
 const dsnSpace = " \t\n\r\f\v"
 
+// dbnameParam is the connection parameter naming the database.
+const dbnameParam = "dbname"
+
+// serviceParams name a connection service, whose file can name the
+// database: a URL using one does not say which database it reaches, so the
+// restore cannot name another or know the live one.
+var serviceParams = []string{"service", "servicefile"}
+
+func errServiceParam(key string) error {
+	return fmt.Errorf("the database URL uses a connection service (%s=); give the host, port, user, and database in the URL instead, so the restore can tell which database it names", key)
+}
+
 // WithDatabase returns databaseURL pointing at another database on the same
-// server, for pgx connections.
+// server. The database is set once, replacing every place it can be named:
+// the URL path and a dbname query parameter, which libpq and pgx let
+// override the path, or each dbname of a key=value DSN. A URL using a
+// connection service is refused (serviceParams). Other parameters, host
+// and port overrides included, are kept: they pick the server, which stays
+// the same.
 func WithDatabase(databaseURL, dbname string) (string, error) {
 	if !strings.Contains(databaseURL, "://") {
-		return databaseURL + " dbname=" + quoteDSNValue(dbname), nil
+		pairs, err := keyValuePairs(databaseURL)
+		if err != nil {
+			return "", err
+		}
+		pairs = slices.DeleteFunc(pairs, func(p dsnPair) bool { return p.key == dbnameParam })
+		return joinKeyValueDSN(append(pairs, dsnPair{key: dbnameParam, value: dbname})), nil
 	}
-	u, err := url.Parse(databaseURL)
+	u, query, err := parseDatabaseURL(databaseURL)
 	if err != nil {
-		return "", fmt.Errorf("parsing the database URL: %w", err)
+		return "", err
 	}
+	query.Del(dbnameParam)
+	u.RawQuery = query.Encode()
 	u.Path = "/" + dbname
 	u.RawPath = ""
 	return u.String(), nil
@@ -274,25 +303,72 @@ func quoteDSNValue(value string) string {
 	return "'" + strings.NewReplacer(`\`, `\\`, `'`, `\'`).Replace(value) + "'"
 }
 
-// databaseName is the database a URL names.
+// databaseName is the database a URL connects to, read as libpq and pgx
+// read it: a dbname query parameter over the URL path, and the last dbname
+// of a key=value DSN.
 func databaseName(databaseURL string) (string, error) {
+	name, err := effectiveDatabase(databaseURL)
+	if err == nil && name == "" {
+		err = errors.New("the database URL names no database")
+	}
+	return name, err
+}
+
+func effectiveDatabase(databaseURL string) (string, error) {
 	if !strings.Contains(databaseURL, "://") {
-		for _, field := range strings.Fields(databaseURL) {
-			if name, ok := strings.CutPrefix(field, "dbname="); ok {
-				return strings.Trim(name, `'`), nil
+		pairs, err := keyValuePairs(databaseURL)
+		if err != nil {
+			return "", err
+		}
+		name := ""
+		for _, p := range pairs {
+			if p.key == dbnameParam {
+				name = p.value
 			}
 		}
-		return "", errors.New("the database URL names no database")
+		return name, nil
 	}
+	u, query, err := parseDatabaseURL(databaseURL)
+	if err != nil {
+		return "", err
+	}
+	switch names := query[dbnameParam]; len(names) {
+	case 0:
+		return strings.TrimPrefix(u.Path, "/"), nil
+	case 1:
+		return names[0], nil
+	}
+	return "", errors.New("the database URL names its database more than once")
+}
+
+// keyValuePairs parses a key=value DSN, refusing a connection service.
+func keyValuePairs(dsn string) ([]dsnPair, error) {
+	pairs, err := parseKeyValueDSN(dsn)
+	if err != nil {
+		return nil, err
+	}
+	for _, p := range pairs {
+		if slices.Contains(serviceParams, p.key) {
+			return nil, errServiceParam(p.key)
+		}
+	}
+	return pairs, nil
+}
+
+// parseDatabaseURL parses a database URL and its query, refusing a
+// connection service.
+func parseDatabaseURL(databaseURL string) (*url.URL, url.Values, error) {
 	u, err := url.Parse(databaseURL)
 	if err != nil {
-		return "", fmt.Errorf("parsing the database URL: %w", err)
+		return nil, nil, fmt.Errorf("parsing the database URL: %w", err)
 	}
-	name := strings.TrimPrefix(u.Path, "/")
-	if name == "" {
-		return "", errors.New("the database URL names no database")
+	query := u.Query()
+	for _, key := range serviceParams {
+		if query.Has(key) {
+			return nil, nil, errServiceParam(key)
+		}
 	}
-	return name, nil
+	return u, query, nil
 }
 
 // CheckRestoreTools refuses a pg_restore older than the pg_dump that wrote

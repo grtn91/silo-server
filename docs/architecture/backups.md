@@ -393,6 +393,15 @@ running command's arguments. The command refuses one and points to
 `PGPASSWORD` or a password file (`~/.pgpass`, `PGPASSFILE`), which both the
 command and `pg_restore` read.
 
+A swap reaches the maintenance database and the databases it creates through
+URLs derived from `DATABASE_URL` with only the database changed. The
+database is replaced wherever the URL can name it: the path and a `dbname`
+query parameter (which overrides the path in libpq and pgx), or every
+`dbname` of a key=value string. The live database's name is read the same
+way. A URL using a connection service (`service`, `servicefile`) is refused,
+since the service file can name the database; host and port overrides are
+kept, because they pick the server, which stays the same.
+
 ### Swap mode: never destroy first
 
 `silo backup restore --from <dir>` replaces the live database and restores
