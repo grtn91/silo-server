@@ -66,3 +66,31 @@ func TestEverySettingIsClassified(t *testing.T) {
 		}
 	}
 }
+
+// TestEverySwitchSettingIsDecided: a setting whose default is a boolean, a
+// switch, is a stricter setting, a server-specific one, or restored with its
+// reason (restoredFlagSettings), so a new switch cannot reach a restore
+// without someone deciding whether it grants or sends anything.
+func TestEverySwitchSettingIsDecided(t *testing.T) {
+	for _, key := range settingRegistry() {
+		def := settingDefault(key)
+		if def != "true" && def != "false" {
+			continue
+		}
+		kind, _ := SettingKindOf(key)
+		_, restored := restoredFlagSettings[key]
+		switch {
+		case kind == SettingKindStricter || kind == SettingKindServerSpecific:
+			if restored {
+				t.Errorf("switch %s is %s and in restoredFlagSettings", key, kind)
+			}
+		case !restored:
+			t.Errorf("switch %s is restored as the backup has it with no reason: add it to accessSettings or restoredFlagSettings", key)
+		}
+	}
+	for key := range restoredFlagSettings {
+		if def := settingDefault(key); def != "true" && def != "false" {
+			t.Errorf("restoredFlagSettings names %s, which is not a switch setting", key)
+		}
+	}
+}

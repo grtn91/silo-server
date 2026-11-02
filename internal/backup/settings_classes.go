@@ -63,6 +63,48 @@ var restoredSettings = strings.Fields(`
 	watchsync. taskmanager. autoscan.
 `)
 
+// Reasons a switch setting is restored as the backup has it.
+const (
+	whyCapacity = "transcoding capacity"
+	whyLocal    = "local processing"
+	whyTuning   = "playback tuning"
+)
+
+// restoredFlagSettings are the switch settings (a boolean default) a
+// restore brings back as the backup has them, each with why that is safe:
+// none grants access, sends anything off the server, or reaches a
+// destination. TestEverySwitchSettingIsDecided fails on a switch setting in
+// neither this list nor accessSettings.
+var restoredFlagSettings = map[string]string{
+	"allow_4k_transcode":                                   whyCapacity,
+	"catalog.scope_versions_to_library":                    "presentation",
+	"catalog.search.meilisearch.binary_quantized":          "search index tuning",
+	"download.local_transcode_fallback":                    "how a permitted download is prepared",
+	"enable_transcode_throttle":                            whyCapacity,
+	"markers.detect_credits":                               whyLocal,
+	"markers.detect_intros":                                whyLocal,
+	"markers.lazy_playback":                                whyLocal,
+	"matcher.enable_tv_series_group_queue":                 "local matching",
+	"matcher.enable_tv_series_root_queue":                  "local matching",
+	"metadata.cache_images":                                "local caching",
+	"notifications.discord.allow_per_episode":              "message granularity on a channel its own switch gates",
+	"notifications.email.allow_per_episode":                "message granularity on a channel its own switch gates",
+	"notifications.server_channels.mention_requesters":     "message content on channels their own switch gates",
+	"overlays.enabled":                                     "presentation",
+	"playback.allow_hevc_encoding":                         whyCapacity,
+	"playback.bandwidth_probe_automatic":                   whyTuning,
+	"playback.chapter_thumbnail_software_tone_map_enabled": whyLocal,
+	"playback.copy_keyframe_playlist":                      whyTuning,
+	"playback.prefer_lower_version_transcode":              whyTuning,
+	"playback.transcode_enabled":                           "transcoding capacity: it changes how a permitted stream plays, not who may play",
+	"playback.transcode_hardware_tone_map_enabled":         whyLocal,
+	"playback.transcode_software_tone_map_enabled":         whyLocal,
+	"policy.editor_enabled":                                "the admin policy editor; admins only",
+	"scanner.empty_trash_after_scan":                       "catalog upkeep",
+	"scanner.realtime_monitoring":                          whyLocal,
+	"subtitles.auto_sync":                                  whyLocal,
+}
+
 // SettingKindOf is key's kind: a stricter or route setting by its table,
 // else the exact key, else the longest matching prefix. ok is false for a
 // key none names.

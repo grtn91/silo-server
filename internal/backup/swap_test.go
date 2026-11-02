@@ -71,6 +71,10 @@ type fakeControl struct {
 	// while the restore loads the dump, or right after it carries the
 	// credentials, as a server started meanwhile would.
 	joinOnLoad, joinOnCarry bool
+	// liveServerID is the live server's identity; "" is the manifest's.
+	// carriedFrom records the live URL each credential carry read from.
+	liveServerID string
+	carriedFrom  []string
 	// restoreLocks is the restore lock table, shared by every control of
 	// one server; held names the databases locked.
 	restoreLocks *fakeRestoreLocks
@@ -244,7 +248,14 @@ func (l fakeLoader) RotateSigningSecrets(context.Context, string, *secret.Cipher
 func (l fakeLoader) KeepStricterSettings(context.Context, string, string, *secret.Cipher) ([]string, error) {
 	return nil, nil
 }
-func (l fakeLoader) CarryCredentials(context.Context, string, string) (CarriedCredentials, error) {
+func (l fakeLoader) ServerID(context.Context, string) (string, error) {
+	if l.ctl.liveServerID != "" {
+		return l.ctl.liveServerID, nil
+	}
+	return l.m.ServerID, nil
+}
+func (l fakeLoader) CarryCredentials(_ context.Context, _, liveURL string) (CarriedCredentials, error) {
+	l.ctl.carriedFrom = append(l.ctl.carriedFrom, liveURL)
 	if l.ctl.joinOnCarry {
 		l.ctl.dbs[liveDB].sessions++
 	}
@@ -797,6 +808,34 @@ func TestSwapWaitsForNoOtherRestore(t *testing.T) {
 		t.Fatalf("recover = %v (crashed %v)\n%s", err, crashed, f.output.String())
 	}
 	f.wantRolledBack()
+}
+
+// TestSwapCarriesOnlyForTheSameDeployment: the live server's credentials,
+// switches, and destinations are tied to its ids, so a restore carries them
+// only from the deployment the backup's manifest names. A backup from
+// another needs --accept-lost-credentials, refused before anything changes
+// without it, and then carries none.
+func TestSwapCarriesOnlyForTheSameDeployment(t *testing.T) {
+	f := newSwapFixture(t)
+	if err, _ := f.restore(); err != nil {
+		t.Fatalf("%v\n%s", err, f.output.String())
+	}
+	if !slices.Equal(f.ctl.carriedFrom, []string{"postgres://silo@db.invalid/" + liveDB}) {
+		t.Fatalf("the same deployment carried from %q, want the live database", f.ctl.carriedFrom)
+	}
+
+	f = newSwapFixture(t)
+	f.ctl.liveServerID = "another-deployment"
+	if err, _ := f.restore(); !errors.Is(err, ErrOtherDeployment) || len(f.ctl.calls) != 0 {
+		t.Fatalf("another deployment's backup = %v, calls %v; want ErrOtherDeployment before any change", err, f.ctl.calls)
+	}
+	f.validate.AcceptLostCredentials = true
+	if err, _ := f.restore(); err != nil {
+		t.Fatalf("%v\n%s", err, f.output.String())
+	}
+	if !slices.Equal(f.ctl.carriedFrom, []string{""}) || !strings.Contains(f.output.String(), "is not this deployment's") {
+		t.Fatalf("another deployment carried from %q, want nothing; output:\n%s", f.ctl.carriedFrom, f.output.String())
+	}
 }
 
 // TestSwapStopsWhenAClientJoinsTheLiveDatabase: the credentials a restore

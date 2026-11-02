@@ -185,7 +185,8 @@ func runBackupRestore(ctx context.Context, args []string, out io.Writer) error {
 	}
 	// Validation copies the objects it checks to a private directory and
 	// every step reads those; they go when the command ends, failed or not.
-	defer func() { _ = src.Close() }()
+	// A restore that went ahead stays a success when they cannot be removed.
+	defer func() { _ = closeSource(src, out) }()
 	loader := backup.PGLoader{Tools: tools}
 	if f.into != "" {
 		return runSeparateRestore(ctx, f, src, loader, validate, masterKey, out)
@@ -356,8 +357,8 @@ func runBackupVerify(ctx context.Context, args []string, out io.Writer) error {
 	if err != nil {
 		return err
 	}
-	defer func() { _ = src.Close() }()
-	return backup.VerifyBackup(ctx, src, backup.PGLoader{Tools: tools}, *scratch, validate, out)
+	verified := backup.VerifyBackup(ctx, src, backup.PGLoader{Tools: tools}, *scratch, validate, out)
+	return errors.Join(verified, closeSource(src, out))
 }
 
 // liveDatabaseURL reads DATABASE_URL, the database a replace or recovery
@@ -385,6 +386,16 @@ func backupMasterKey(required bool) ([]byte, string, error) {
 
 // findBackupTools discovers pg_dump and pg_restore; tests replace it.
 var findBackupTools = backup.FindTools
+
+// closeSource removes the private copies validation made of src, warning
+// prominently, with the directory to delete, when it cannot.
+func closeSource(src *backup.Source, out io.Writer) error {
+	err := src.Close()
+	if err != nil {
+		_, _ = fmt.Fprintf(out, "\nWARNING: could not remove the private copies of the backup's database dump and files: %v\nThey hold the backup's data; delete that directory now.\n", err)
+	}
+	return err
+}
 
 // openBackupSource opens the backup folder at from, the tools that restore
 // it, and the checks a restore runs: masterKey and keyCheck are this

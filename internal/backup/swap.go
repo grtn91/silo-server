@@ -108,10 +108,6 @@ func timedOut(err error) string {
 // the databases closed until the original is whole again.
 func RestoreSwap(ctx context.Context, src *Source, loader DatabaseLoader, ctl ControlDB, opts SwapOptions) error {
 	out := writerOrDiscard(opts.Out)
-	now := time.Now
-	if opts.Now != nil {
-		now = opts.Now
-	}
 	m := src.Manifest
 	live, unlock, err := lockLive(ctx, ctl, opts.LiveURL)
 	if err != nil {
@@ -119,10 +115,11 @@ func RestoreSwap(ctx context.Context, src *Source, loader DatabaseLoader, ctl Co
 	}
 	defer unlock(ctx)
 	// Step 1.
-	if err := src.Validate(ctx, opts.Validate); err != nil {
+	sameDeployment, err := validateForSwap(ctx, src, loader, opts, out)
+	if err != nil {
 		return err
 	}
-	stamp := now().UTC().Format("20060102t150405z")
+	stamp := opts.now().UTC().Format("20060102t150405z")
 	restored, before := "silo_restore_"+stamp, "silo_before_restore_"+stamp
 	opened, sealedStores, err := openSwapStores(ctx, src, opts, stamp)
 	if err != nil {
@@ -179,7 +176,7 @@ func RestoreSwap(ctx context.Context, src *Source, loader DatabaseLoader, ctl Co
 	if err := clearLostSettings(ctx, loader, restoredURL, m, opts.Validate, opts.Cipher, out); err != nil {
 		return discard(err)
 	}
-	if err := carryLiveState(ctx, ctl, live, loader, restoredURL, opts, out); err != nil {
+	if err := carryLiveState(ctx, ctl, live, loader, restoredURL, opts, sameDeployment, out); err != nil {
 		return discard(err)
 	}
 	// A subtitle the backup left out may still be in the live storage the
@@ -260,14 +257,68 @@ func lockLive(ctx context.Context, ctl ControlDB, liveURL string) (string, func(
 // They are as they will be at the swap only while no other client is on the
 // live database: one that connected since preflight stops the restore here,
 // and the swap checks again once the live database is closed (swap.run).
-func carryLiveState(ctx context.Context, ctl ControlDB, live string, loader DatabaseLoader, restoredURL string, opts SwapOptions, out io.Writer) error {
+func carryLiveState(ctx context.Context, ctl ControlDB, live string, loader DatabaseLoader, restoredURL string, opts SwapOptions, sameDeployment bool, out io.Writer) error {
 	if err := checkLiveIdle(ctx, ctl, live); err != nil {
 		return err
 	}
-	if err := carryCredentials(ctx, loader, restoredURL, opts.LiveURL, out); err != nil {
+	// What is tied to an account, a profile, or an installation is the live
+	// server's only on the deployment the backup came from: elsewhere the
+	// same ids are other people.
+	carryFrom := opts.LiveURL
+	if !sameDeployment {
+		carryFrom = ""
+	}
+	if err := carryCredentials(ctx, loader, restoredURL, carryFrom, out); err != nil {
 		return err
 	}
 	return keepStricterSettings(ctx, loader, restoredURL, opts.LiveURL, opts.Cipher, out)
+}
+
+// now is the swap's clock.
+func (opts SwapOptions) now() time.Time {
+	if opts.Now != nil {
+		return opts.Now()
+	}
+	return time.Now()
+}
+
+// validateForSwap is step 1: the backup's own checks, then whether it is
+// this deployment's (checkDeployment).
+func validateForSwap(ctx context.Context, src *Source, loader DatabaseLoader, opts SwapOptions, out io.Writer) (bool, error) {
+	if err := src.Validate(ctx, opts.Validate); err != nil {
+		return false, err
+	}
+	return checkDeployment(ctx, src, loader, opts, out)
+}
+
+// ErrOtherDeployment refuses a backup from another deployment, or one whose
+// manifest cannot be verified, without --accept-lost-credentials: none of
+// this server's credentials can be carried into it.
+var ErrOtherDeployment = errors.New("this backup is not this deployment's")
+
+// checkDeployment reports whether the backup's authenticated manifest names
+// this deployment's server id. When it does not, the restore carries no
+// live credential, security switch, or destination tied to an id, and needs
+// the operator's --accept-lost-credentials; it says so before anything
+// changes.
+func checkDeployment(ctx context.Context, src *Source, loader DatabaseLoader, opts SwapOptions, out io.Writer) (bool, error) {
+	here, err := loader.ServerID(ctx, opts.LiveURL)
+	if err != nil {
+		return false, fmt.Errorf("reading this server's identity: %w", err)
+	}
+	if src.authenticated && here != "" && here == src.Manifest.ServerID {
+		return true, nil
+	}
+	why := fmt.Sprintf("it was taken on server %s and this is %s", src.Manifest.ServerID, here)
+	if !src.authenticated {
+		why = "its manifest cannot be verified, so the server it names cannot be trusted"
+	}
+	const lost = "account and installation ids in it are not this server's, so none of this server's API keys, invitations, sign-in links, push and notification destinations, webhooks, or other credentials are carried into it: the restored server has none of them, everyone signs in again, and admins create keys, invitations, and links again"
+	if !opts.Validate.AcceptLostCredentials {
+		return false, fmt.Errorf("%w: %s. The %s. Pass --accept-lost-credentials to restore it so", ErrOtherDeployment, why, lost)
+	}
+	_, _ = fmt.Fprintf(out, "This backup is not this deployment's (%s). The %s.\n", why, lost)
+	return false, nil
 }
 
 // checkLiveIdle requires that no client other than this command is on the

@@ -463,13 +463,31 @@ neither list.
   never key material. Identity sequences move past the ids written. Live rows are
   encrypted with this server's key, so they stay readable after
   `--accept-lost-credentials`.
-- In the same transaction, a full restore keeps each security switch inside
-  an otherwise restored table at the stricter of the backup's and the live
-  server's value (`stricterFlags`), so it never turns back on what an admin
-  turned off since the backup: an account's `enabled`, `break_glass`, and
-  `local_password_login_enabled` (off wins) and `password_change_required`
-  (on wins), and the `enabled` of every plugin installation, plugin task
-  binding, and plugin catalog (off wins): plugins run as the server, so one
+- Carrying from the live server is for the deployment the backup came from:
+  credentials, destinations, sign-in links, and switches are tied to its
+  account, profile, and installation ids, which on another deployment are
+  other people. When the authenticated manifest's server id is not the live
+  server's (or the manifest cannot be verified), the restore says so before
+  anything changes and needs `--accept-lost-credentials`; it then carries
+  none of them, deleting the backup's own, so everyone signs in again and
+  admins create keys, invitations, and links again
+  (`ErrOtherDeployment`, `checkDeployment`). Stricter-of server settings,
+  which are not tied to ids, still apply.
+- In the same transaction, a full restore keeps each security, access,
+  sharing, or outbound switch inside an otherwise restored table at the
+  stricter of the backup's and the live server's value (`stricterFlags`),
+  so it never turns back on what an admin or a user turned off since the
+  backup: a library's `enabled`; autoscan's and each autoscan source's;
+  history-import sources, request integrations, routes, and the request
+  settings (requests, auto-approval, watchlist requests); subtitle
+  providers; marker sharing; per-account and per-group download,
+  transcode, and request permissions; a profile's child flag, library
+  restriction, and advisory-age requirement (on wins); a personal
+  collection's sharing; a profile's notification preferences; a
+  watch-provider connection's sync switches; an account's `enabled`,
+  `break_glass`, and `local_password_login_enabled` (off wins) and
+  `password_change_required` (on wins), and the `enabled` of every plugin
+  installation, plugin task binding, and plugin catalog (off wins): plugins run as the server, so one
   turned off during an incident stays off, and a sign-in provider's carried
   links then sign no one in. A plugin installation or catalog the backup
   has and the live server no longer does comes back off, never on. Nothing
@@ -479,7 +497,10 @@ neither list.
   lists each switch it kept. Grants through policy rather than a switch
   (`users.role`, `is_owner`, access group and per-account permissions) are
   restored as the backup has them; the credential carry above refuses
-  credentials whose account gains authority that way.
+  credentials whose account gains authority that way. Every other boolean
+  column of a restored table is in `restoredFlagColumns` with why the
+  backup's value is safe, and `TestEveryTableIsClassifiedDB` fails on one in
+  neither list.
 - Every server setting has exactly one kind (`SettingKindOf`,
   `settings_classes.go`), which both restores read: restored as the backup
   has it, server-specific (never written by a selective restore), stricter
@@ -501,7 +522,12 @@ neither list.
   the delivery switches (`email.enabled` and the email, Web Push, webhook,
   Apple and Android push, Discord, server-channel, and fan-out notification
   switches), so a channel an admin turned off stays off while its live
-  destinations are carried. The
+  destinations are carried, the release-event pause and in-app
+  notifications, downloads, the AI, transcription, recommendation, and
+  semantic-search providers that receive library data, marker sharing and
+  online marker lookups, and LAN discovery. Every other switch setting is in
+  `restoredFlagSettings` with its reason (`TestEverySwitchSettingIsDecided`).
+  The
   live row is copied as stored, so an encrypted value stays bound to its
   key name; values are compared decrypted, and one that does not decrypt
   counts as wider. The command lists each setting it kept.

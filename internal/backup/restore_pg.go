@@ -14,6 +14,7 @@ import (
 
 	"github.com/Silo-Server/silo-server/internal/blobstore"
 	"github.com/Silo-Server/silo-server/internal/secret"
+	"github.com/Silo-Server/silo-server/internal/serveridentity"
 	"github.com/Silo-Server/silo-server/internal/subtitles"
 )
 
@@ -55,6 +56,14 @@ func (l PGLoader) Load(ctx context.Context, dbURL, dumpPath string) error {
 		return fmt.Errorf("pg_restore failed: %w: %s", err, strings.TrimSpace(stderr.String()))
 	}
 	return nil
+}
+
+func (l PGLoader) ServerID(ctx context.Context, dbURL string) (string, error) {
+	rows, err := readSettingsAt(ctx, dbURL, []string{serveridentity.Key})
+	if err != nil {
+		return "", err
+	}
+	return rows[serveridentity.Key], nil
 }
 
 func (l PGLoader) Inspect(ctx context.Context, dbURL string) (Inspection, error) {
