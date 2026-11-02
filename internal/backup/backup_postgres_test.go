@@ -271,20 +271,12 @@ func TestBackupRestoreRoundTripDB(t *testing.T) {
 	if len(src.Manifest.AppliedMigrations) == 0 || !slices.Equal(in.Applied, src.Manifest.AppliedMigrations) {
 		t.Fatalf("restored applied migrations %v, manifest %v", in.Applied, src.Manifest.AppliedMigrations)
 	}
-	for key, want := range seed.blobs {
-		got, err := os.ReadFile(filepath.Join(blobsInto, filepath.FromSlash(key)))
-		if err != nil || !bytes.Equal(got, want) {
-			t.Fatalf("restored blob %s = %q, %v; want %q", key, got, err, want)
-		}
-	}
-	if _, err := os.Stat(filepath.Join(blobsInto, filepath.FromSlash(seed.leftOut))); !errors.Is(err, fs.ErrNotExist) {
-		t.Fatalf("restored %s, a provider subtitle the setting leaves out (%v)", seed.leftOut, err)
-	}
 	restoredPool, err := pgxpool.New(ctx, into)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer restoredPool.Close()
+	checkRestoredFiles(t, seed, blobsInto, restoredPool)
 	checkCredentials(t, loader, pool, dsn, into, restoredPool, seed.userID)
 	restoredSettings := catalog.NewEncryptedSettingsRepo(catalog.NewServerSettingsRepo(restoredPool), cipher)
 	if got, err := restoredSettings.Get(ctx, seed.secretKey); err != nil || got != seed.secretValue {
@@ -295,6 +287,25 @@ func TestBackupRestoreRoundTripDB(t *testing.T) {
 		t.Fatalf("verify into a used database = %v, want refusal", err)
 	}
 	checkAnotherKey(t, src, loader, pool, dsn, seed.secretKey)
+}
+
+// checkRestoredFiles: every blob the backup holds is restored, and a
+// provider subtitle the setting left out is neither restored nor listed.
+func checkRestoredFiles(t *testing.T, seed roundTripSeed, blobsInto string, restored *pgxpool.Pool) {
+	t.Helper()
+	for key, want := range seed.blobs {
+		got, err := os.ReadFile(filepath.Join(blobsInto, filepath.FromSlash(key)))
+		if err != nil || !bytes.Equal(got, want) {
+			t.Fatalf("restored blob %s = %q, %v; want %q", key, got, err, want)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(blobsInto, filepath.FromSlash(seed.leftOut))); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("restored %s, a provider subtitle the setting leaves out (%v)", seed.leftOut, err)
+	}
+	var omitted int
+	if err := restored.QueryRow(t.Context(), `SELECT count(*) FROM downloaded_subtitles WHERE s3_key = $1`, seed.leftOut).Scan(&omitted); err != nil || omitted != 0 {
+		t.Fatalf("restored %d rows of the subtitle the backup left out (%v), want none", omitted, err)
+	}
 }
 
 // checkCredentials: a restore brings back no sign-in session. A full

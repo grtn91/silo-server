@@ -145,6 +145,13 @@ Blob keys come from the snapshot's references, never from listing the store:
 | Uploaded subtitles (`downloaded_subtitles.s3_key` with provider `upload`), always: they cannot be fetched again | assets |
 | Downloaded subtitles (`downloaded_subtitles.s3_key` from a provider), unless `backup.include_subtitles` is off | assets |
 
+A backup taken with `backup.include_subtitles` off still dumps every
+`downloaded_subtitles` row. A full restore deletes the provider rows whose
+object is not in the storage the restored server uses (in separate mode,
+all of them), so players do not list tracks with no content; Silo downloads
+them again when they are chosen. Storing a subtitle whose row exists but
+whose object is gone writes the object back under the row.
+
 For an artwork original (`.../original[.<revision>].<ext>`) the copy also
 takes the stored variants of the same revision in its directory. Only the
 referenced key itself is required.
