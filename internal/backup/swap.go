@@ -163,6 +163,11 @@ func RestoreSwap(ctx context.Context, src *Source, loader DatabaseLoader, ctl Co
 	if err := clearLostSettings(ctx, loader, restoredURL, m, opts.Validate, opts.Cipher, out); err != nil {
 		return discard(err)
 	}
+	// The live server's credentials, read now: preflight found no other
+	// client on the live database, so they are as they will be at the swap.
+	if err := carryCredentials(ctx, loader, restoredURL, opts.LiveURL, out); err != nil {
+		return discard(err)
+	}
 	if err := ctl.AllowConnections(ctx, restored, false); err != nil {
 		return discard(err)
 	}

@@ -203,6 +203,9 @@ func (l fakeLoader) UnbindStorage(context.Context, string) error { return nil }
 func (l fakeLoader) ClearUnreadableSettings(context.Context, string, *secret.Cipher) ([]string, error) {
 	return nil, nil
 }
+func (l fakeLoader) CarryCredentials(context.Context, string, string) (CarriedCredentials, error) {
+	return CarriedCredentials{}, nil
+}
 func (l fakeLoader) Load(_ context.Context, dbURL, _ string) error {
 	name, err := databaseName(dbURL)
 	if err != nil {

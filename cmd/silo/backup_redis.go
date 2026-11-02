@@ -75,7 +75,7 @@ func clearRedisAfterRestore(ctx context.Context, plan redisPlan, dial func(confi
 		_, _ = fmt.Fprintln(out, "Left Redis as it is (--keep-redis); it can still hold state cached from before the restore.")
 		return
 	case plan.readErr != nil:
-		_, _ = fmt.Fprintf(out, "Warning: could not read the Redis settings (%v). If Silo uses Redis, run FLUSHDB on its database before starting Silo.\n", plan.readErr)
+		_, _ = fmt.Fprintf(out, "Warning: could not read the restored server's Redis settings (%v), so no Redis was cleared. If Silo uses Redis, run FLUSHDB on its database before starting Silo (redis-cli -n <database> FLUSHDB), or give it an empty one.\n", plan.readErr)
 		return
 	case strings.TrimSpace(plan.config.URL) == "":
 		return
