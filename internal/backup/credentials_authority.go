@@ -203,7 +203,13 @@ func grantOf(table string, row map[string]any) (inviteeGrant, bool) {
 // inviteePolicy is the effective policy an account created now from g
 // would get in tx's database, as account creation resolves it.
 func inviteePolicy(ctx context.Context, tx pgx.Tx, g inviteeGrant) (access.EffectiveUserPolicy, error) {
-	user := &models.User{Role: g.role, LibraryIDs: g.libraryIDs, AccessGroupID: g.groupID}
+	// The permissions account creation stores (auth.NewUserPermissions), so
+	// a group's allowed permissions mask the same list here as there.
+	permissions, err := auth.NewUserPermissions(models.CreateUserInput{Role: g.role, LibraryIDs: g.libraryIDs, AccessGroupID: g.groupID})
+	if err != nil {
+		return access.EffectiveUserPolicy{}, err
+	}
+	user := &models.User{Role: g.role, LibraryIDs: g.libraryIDs, AccessGroupID: g.groupID, Permissions: permissions}
 	if user.AccessGroupID == nil && g.role != models.RoleAdmin {
 		var id int64
 		err := tx.QueryRow(ctx, `SELECT id FROM access_groups WHERE is_default`).Scan(&id)
