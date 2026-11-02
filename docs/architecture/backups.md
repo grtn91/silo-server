@@ -726,7 +726,14 @@ the same order, so the two wait for each other instead of deadlocking:
   again themselves, which is free in the same transaction, so no caller can
   skip it.
 - Page sections and featured sections: the section editor's order (see
-  `selective_sections.go`).
+  `selective_sections.go`): collection parents, then section rows in id
+  order, then surface revisions. A section whose collection references
+  changed between its read and its row lock is `sections.ErrReferencesChanged`:
+  its new parents are never locked under the section lock.
+- Any item that fails with that, a deadlock (`40P01`), or a serialization
+  failure (`40001`) rolls back to its savepoint and starts again from its
+  read, up to three times, and is then left out as changed during the
+  restore (`changed_since_preview`).
 - Accounts and profiles: `userdata.Preparer`'s order, the account locks, then
   each data type's own, then data rows.
 - Libraries, plugins, and settings write through the editor's own functions

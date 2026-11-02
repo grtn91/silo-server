@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -18,6 +19,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/blobstore"
 	"github.com/Silo-Server/silo-server/internal/config"
 	"github.com/Silo-Server/silo-server/internal/models"
+	"github.com/Silo-Server/silo-server/internal/sections"
 )
 
 // TestWriteBlobNeverReplacesAnExistingObject: a restore writes a blob only
@@ -320,5 +322,22 @@ func TestSelectiveRestoreAuthenticatesTheManifest(t *testing.T) {
 				t.Fatalf("StartRestore confirmed = %v, want %v", err, tt.wantConfirmed)
 			}
 		})
+	}
+}
+
+// TestRetryableItemError: an item starts again from its read after a
+// deadlock, a serialization failure, or a section whose references changed
+// under it, and fails on anything else.
+func TestRetryableItemError(t *testing.T) {
+	for err, want := range map[error]bool{
+		fmt.Errorf("writing: %w", sections.ErrReferencesChanged): true,
+		&pgconn.PgError{Code: "40P01"}:                           true,
+		fmt.Errorf("item: %w", &pgconn.PgError{Code: "40001"}):   true,
+		&pgconn.PgError{Code: "23505"}:                           false,
+		errors.New("boom"):                                       false,
+	} {
+		if got := retryableItemError(err); got != want {
+			t.Errorf("retryableItemError(%v) = %v, want %v", err, got, want)
+		}
 	}
 }

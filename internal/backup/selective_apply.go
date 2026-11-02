@@ -17,12 +17,14 @@ import (
 	"strings"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/Silo-Server/silo-server/internal/backup/userdata"
 	"github.com/Silo-Server/silo-server/internal/blobstore"
 	"github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/plugins"
+	"github.com/Silo-Server/silo-server/internal/sections"
 )
 
 // ExecuteRestore runs one backup_restore job:
@@ -206,17 +208,9 @@ func (a *applier) apply(ctx context.Context, section, id string) error {
 	var result applied
 	next := a.clone()
 	err := a.commit(ctx, next, "Restoring "+section, func(tx pgx.Tx) error {
-		sp, err := tx.Begin(ctx)
+		var err error
+		result, err = a.applyWithRetry(ctx, tx, section, id)
 		if err != nil {
-			return err
-		}
-		result, err = a.applyItem(ctx, sp, section, id)
-		result.item.Section, result.item.ID = section, id
-		if err != nil {
-			_ = sp.Rollback(ctx)
-			result.after, result.mapLibrary = nil, [2]int{}
-			result.item.Outcome, result.item.Error = OutcomeFailed, err.Error()
-		} else if err := sp.Commit(ctx); err != nil {
 			return err
 		}
 		next.Items = append(next.Items, result.item)
@@ -233,6 +227,54 @@ func (a *applier) apply(ctx context.Context, section, id string) error {
 		result.after(ctx)
 	}
 	return nil
+}
+
+// itemAttempts bounds how often an item starts again from its read after
+// a retryable failure (retryableItemError).
+const itemAttempts = 3
+
+// applyWithRetry runs one item in a savepoint of tx. A deadlock, a
+// serialization failure, or a section whose references changed between
+// its read and its lock rolls the savepoint back and starts the item again
+// from its read; after itemAttempts it is left out as changed during the
+// restore. Any other failure records the item as failed.
+func (a *applier) applyWithRetry(ctx context.Context, tx pgx.Tx, section, id string) (applied, error) {
+	for attempt := 1; ; attempt++ {
+		sp, err := tx.Begin(ctx)
+		if err != nil {
+			return applied{}, err
+		}
+		result, err := a.applyItem(ctx, sp, section, id)
+		result.item.Section, result.item.ID = section, id
+		if err == nil {
+			return result, sp.Commit(ctx)
+		}
+		_ = sp.Rollback(ctx)
+		if retryableItemError(err) && attempt < itemAttempts && ctx.Err() == nil {
+			continue
+		}
+		item := ReportItem{Section: section, ID: id, Kind: result.item.Kind, Label: result.item.Label}
+		if retryableItemError(err) {
+			item = leftOut(item, ReasonChanged, "It changed on this server while the restore ran. Restore it again.").item
+		} else {
+			item.Outcome, item.Error = OutcomeFailed, err.Error()
+		}
+		if item.Label == "" {
+			item.Label = id
+		}
+		return applied{item: item}, nil
+	}
+}
+
+// retryableItemError reports a failure an item survives by starting again
+// from its read: a deadlock or serialization failure, or a section whose
+// references changed under it.
+func retryableItemError(err error) bool {
+	if errors.Is(err, sections.ErrReferencesChanged) {
+		return true
+	}
+	pgErr, ok := errors.AsType[*pgconn.PgError](err)
+	return ok && (pgErr.Code == "40P01" || pgErr.Code == "40001")
 }
 
 func (a *applier) applyItem(ctx context.Context, tx pgx.Tx, section, id string) (applied, error) {
