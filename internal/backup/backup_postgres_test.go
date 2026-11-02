@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -107,6 +108,7 @@ type roundTripSeed struct {
 	secretKey, secretValue string
 	missingKey             string
 	blobs                  map[string][]byte
+	userID                 int64
 }
 
 // seedRoundTrip writes an encrypted setting, recorded storage identities, a
@@ -147,6 +149,10 @@ func seedRoundTrip(t *testing.T, pool *pgxpool.Pool, settings *catalog.Encrypted
 	exec(`INSERT INTO user_profiles (id, user_id, name, avatar) VALUES ($1, $2, 'Backup', $3)`, profileID, userID, "upload:"+avatarKey)
 	// A sign-in the restore must not bring back (signInTables).
 	exec(`INSERT INTO auth_sessions (id, user_id, expires_at) VALUES ($1, $2, now() + interval '1 day')`, "backup-test-"+suffix, userID)
+	// An API key, which a full restore replaces with the live ones and a
+	// separate restore leaves out (credentialTables).
+	exec(`INSERT INTO api_keys (user_id, label, key_hash) VALUES ($1, 'in backup', encode(sha256(convert_to($2, 'UTF8')), 'hex'))`, userID, "in-backup-"+suffix)
+	seed.userID = userID
 	t.Cleanup(func() { _, _ = pool.Exec(context.Background(), `DELETE FROM user_profiles WHERE id = $1`, profileID) })
 	seed.blobs = map[string][]byte{
 		posterKey: []byte("poster " + suffix),
@@ -227,12 +233,15 @@ func TestBackupRestoreRoundTripDB(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Everything the manifest counts, less the storage identities the
-	// restore cleared.
+	// Everything the manifest counts, less the storage identities and the
+	// API keys the restore cleared.
 	want := slices.Clone(src.Manifest.Tables)
 	for i := range want {
-		if want[i].Name == "server_settings" {
+		switch want[i].Name {
+		case "server_settings":
 			want[i].Rows -= int64(len(storageIdentities))
+		case "api_keys":
+			want[i].Rows = 0
 		}
 	}
 	if in.GooseVersion != src.Manifest.GooseVersion || !slices.Equal(in.Tables, want) {
@@ -252,10 +261,7 @@ func TestBackupRestoreRoundTripDB(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer restoredPool.Close()
-	var sessions int
-	if err := restoredPool.QueryRow(ctx, `SELECT count(*) FROM auth_sessions`).Scan(&sessions); err != nil || sessions != 0 {
-		t.Fatalf("restored %d sign-in sessions (%v), want none", sessions, err)
-	}
+	checkCredentials(t, loader, pool, dsn, into, restoredPool, seed.userID)
 	restoredSettings := catalog.NewEncryptedSettingsRepo(catalog.NewServerSettingsRepo(restoredPool), cipher)
 	if got, err := restoredSettings.Get(ctx, seed.secretKey); err != nil || got != seed.secretValue {
 		t.Fatalf("restored encrypted setting = %q, %v; want %q", got, err, seed.secretValue)
@@ -265,6 +271,79 @@ func TestBackupRestoreRoundTripDB(t *testing.T) {
 		t.Fatalf("verify into a used database = %v, want refusal", err)
 	}
 	checkAnotherKey(t, src, loader, pool, dsn, seed.secretKey)
+}
+
+// checkCredentials: a restore brings back no sign-in session, and every
+// excluded sign-in table exists, so the dump excludes something by that
+// name. A full restore keeps the live server's API keys and pending
+// invitations as they are at the swap, not the backup's, and drops a live
+// key whose account is not in the backup.
+func checkCredentials(t *testing.T, loader PGLoader, pool *pgxpool.Pool, dsn, into string, restored *pgxpool.Pool, userID int64) {
+	t.Helper()
+	ctx := t.Context()
+	var sessions int
+	if err := restored.QueryRow(ctx, `SELECT count(*) FROM auth_sessions`).Scan(&sessions); err != nil || sessions != 0 {
+		t.Fatalf("restored %d sign-in sessions (%v), want none", sessions, err)
+	}
+	for _, table := range signInTables {
+		var found bool
+		if err := restored.QueryRow(ctx, `SELECT to_regclass('public.' || $1) IS NOT NULL`, table).Scan(&found); err != nil || !found {
+			t.Fatalf("sign-in table %s does not exist (%v); the dump excludes nothing by that name", table, err)
+		}
+	}
+	suffix := randomHex(t, 4)
+	exec := func(sql string, args ...any) {
+		t.Helper()
+		if _, err := pool.Exec(ctx, sql, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// After the backup: the backed-up key is revoked, one is created for
+	// the backed-up account, and one for an account the backup lacks.
+	exec(`DELETE FROM api_keys WHERE user_id = $1`, userID)
+	exec(`INSERT INTO api_keys (user_id, label, key_hash) VALUES ($1, 'after backup', encode(sha256(convert_to($2, 'UTF8')), 'hex'))`, userID, "live-"+suffix)
+	var newUser, keptID int64
+	if err := pool.QueryRow(ctx, `INSERT INTO users (role, username) VALUES ('user', $1) RETURNING id`, "after-backup-"+suffix).Scan(&newUser); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = pool.Exec(context.Background(), `DELETE FROM users WHERE id = $1`, newUser) })
+	exec(`INSERT INTO api_keys (user_id, label, key_hash) VALUES ($1, 'new account', encode(sha256(convert_to($2, 'UTF8')), 'hex'))`, newUser, "orphan-"+suffix)
+	// A pending invitation, carried too.
+	exec(`INSERT INTO invitations (token_hash, invited_by, expires_at, delivery, library_ids)
+		VALUES ($1, $2, now() + interval '1 day', 'link', '{}')`, "invite-"+suffix, userID)
+	var liveKeys int
+	if err := pool.QueryRow(ctx, `SELECT count(*), max(id) FILTER (WHERE user_id = $1) FROM api_keys`, userID).Scan(&liveKeys, &keptID); err != nil {
+		t.Fatal(err)
+	}
+
+	carried, err := loader.CarryCredentials(ctx, into, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var orphan int64
+	if err := pool.QueryRow(ctx, `SELECT id FROM api_keys WHERE user_id = $1`, newUser).Scan(&orphan); err != nil {
+		t.Fatal(err)
+	}
+	wantDropped := []string{fmt.Sprintf("API key %d 'new account' (account %d)", orphan, newUser)}
+	if carried.Kept != liveKeys || !slices.Equal(carried.Dropped, wantDropped) {
+		t.Fatalf("carried %+v, want %d kept and dropped %q", carried, liveKeys, wantDropped)
+	}
+	var invited int
+	if err := restored.QueryRow(ctx, `SELECT count(*) FROM invitations WHERE token_hash = $1`, "invite-"+suffix).Scan(&invited); err != nil || invited != 1 {
+		t.Fatalf("restored %d copies of the live invitation (%v), want 1", invited, err)
+	}
+	rows, err := restored.Query(ctx, `SELECT label FROM api_keys WHERE user_id = $1`, userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if labels, err := pgx.CollectRows(rows, pgx.RowTo[string]); err != nil || !slices.Equal(labels, []string{"after backup"}) {
+		t.Fatalf("restored keys of the backed-up account = %v (%v), want only the live one", labels, err)
+	}
+	// The next key the restored server creates must not reuse a live id.
+	var next int64
+	if err := restored.QueryRow(ctx, `INSERT INTO api_keys (user_id, label, key_hash) VALUES ($1, 'next', encode(sha256(convert_to($2, 'UTF8')), 'hex')) RETURNING id`, userID, "next-"+suffix).Scan(&next); err != nil || next <= keptID {
+		t.Fatalf("next restored key id %d (%v), want above %d", next, err, keptID)
+	}
 }
 
 // checkAnotherKey: a backup taken with another SECRET_KEY restores only

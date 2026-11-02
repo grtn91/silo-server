@@ -167,6 +167,10 @@ type DatabaseLoader interface {
 	// cipher cannot open (nil opens none) and returns their keys. Rows are
 	// only deleted: a value is bound to its key name.
 	ClearUnreadableSettings(ctx context.Context, dbURL string, cipher *secret.Cipher) ([]string, error)
+	// CarryCredentials replaces the restored database's long-lived
+	// credentials (credentialTables) with liveURL's, or deletes them when
+	// liveURL is "".
+	CarryCredentials(ctx context.Context, dbURL, liveURL string) (CarriedCredentials, error)
 }
 
 // clearLostSettings removes, from a restored database taken with another
@@ -297,6 +301,11 @@ func RestoreSeparate(ctx context.Context, src *Source, loader DatabaseLoader, op
 		return RestoreReport{}, fmt.Errorf("clearing the restored storage identities: %w", err)
 	}
 	if err := clearLostSettings(ctx, loader, opts.Into, src.Manifest, opts.Validate, opts.Cipher, out); err != nil {
+		return RestoreReport{}, err
+	}
+	// A copy is not the live server: it gets none of the backup's
+	// credentials and none of the live ones.
+	if err := carryCredentials(ctx, loader, opts.Into, "", out); err != nil {
 		return RestoreReport{}, err
 	}
 	report := RestoreReport{Database: opts.Into, MissingBlobs: src.Manifest.MissingBlobs}
