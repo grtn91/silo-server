@@ -38,6 +38,7 @@ export const BACKUP_STATUS_LABELS: Record<AdminBackupStatus, string> = {
   complete_with_warnings: "Complete with warnings",
   in_progress: "In progress",
   incomplete: "Incomplete",
+  unverified: "Unverified",
 };
 
 /**
@@ -49,9 +50,18 @@ export function knownSiloVersion(version: string | null | undefined): string | n
   return trimmed && trimmed.toLowerCase() !== "unavailable" ? trimmed : null;
 }
 
-/** A backup with a manifest: one that can be downloaded and restored. */
+/**
+ * A backup with a manifest: one that can be downloaded and restored. An
+ * unverified one with its objects listed was written under another
+ * SECRET_KEY, and restoring it asks for confirmation; one without was
+ * changed after it was written and is never offered.
+ */
 export function isFinished(backup: AdminBackup): boolean {
-  return backup.status === "complete" || backup.status === "complete_with_warnings";
+  return (
+    backup.status === "complete" ||
+    backup.status === "complete_with_warnings" ||
+    (backup.status === "unverified" && backup.objects.length > 0)
+  );
 }
 
 const DAY_MS = 86_400_000;

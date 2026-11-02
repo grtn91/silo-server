@@ -14155,10 +14155,10 @@ export interface components {
       /** Format: int64 */
       size_bytes: number;
       /**
-       * @description complete: manifest written, checksums recorded, table of contents readable; it does not claim a restore was tested. complete_with_warnings: some referenced files were missing when copied. in_progress: being written now. incomplete: no manifest and nothing running; deleted after 24 hours
+       * @description complete: manifest written, checksums recorded, table of contents readable; it does not claim a restore was tested. complete_with_warnings: some referenced files were missing when copied. in_progress: being written now. incomplete: no manifest and nothing running; deleted after 24 hours. unverified: this server cannot authenticate the manifest (another SECRET_KEY, none recorded, or changed since it was written); a restore needs confirmation, and one whose manifest names this key but does not verify shows no details and cannot be restored
        * @enum {string}
        */
-      status: "complete" | "complete_with_warnings" | "in_progress" | "incomplete";
+      status: "complete" | "complete_with_warnings" | "in_progress" | "incomplete" | "unverified";
     };
     AdminBackupActive: {
       backup_id?: string;

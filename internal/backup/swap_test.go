@@ -291,6 +291,10 @@ func writeTestBackup(t *testing.T, entries []tarEntry) *Source {
 	for _, name := range inventoryTables {
 		m.Tables = append(m.Tables, TableCount{Name: name})
 	}
+	m.KeyCheck = testKeyCheck
+	if err := m.sign(testManifestKey); err != nil {
+		t.Fatal(err)
+	}
 	data, _ := json.Marshal(m)
 	if err := os.WriteFile(filepath.Join(dir, ManifestName), data, 0o600); err != nil {
 		t.Fatal(err)
@@ -336,8 +340,24 @@ func newSwapFixtureWith(t *testing.T, entries []tarEntry) *swapFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &swapFixture{t: t, ctl: newFakeControl(t), root: root, live: live, src: writeTestBackup(t, entries), workDir: t.TempDir(), cipher: cipher}
+	return &swapFixture{t: t, ctl: newFakeControl(t), root: root, live: live, src: writeTestBackup(t, entries), workDir: t.TempDir(), cipher: cipher,
+		validate: ValidateOptions{KeyCheck: testKeyCheck, ManifestKey: testManifestKey}}
 }
+
+// resign signs the fixture's manifest again after a test changed it, as
+// the backup that wrote it would have.
+func (f *swapFixture) resign() {
+	f.t.Helper()
+	if err := f.src.Manifest.sign(testManifestKey); err != nil {
+		f.t.Fatal(err)
+	}
+}
+
+// testManifestKey and testKeyCheck are the SECRET_KEY test backups are
+// written under and test restores check them with.
+var testManifestKey = []byte("0123456789abcdef0123456789abcdef")
+
+const testKeyCheck = "0000-1111-2222-3333"
 
 func (f *swapFixture) openStores(ctx context.Context, sc StoreConfig) (blobstore.Stores, error) {
 	if sc.Backend != blobstore.BackendLocal || sc.LocalPath != f.root {
@@ -710,7 +730,7 @@ func TestSwapStopsWhenTheJournalCannotBeMadeDurable(t *testing.T) {
 // back to the newest-version check, and the restored database is checked
 // before the swap goes ahead.
 func TestSwapRefusesMigrationsThisBinaryDoesNotCarry(t *testing.T) {
-	binary := ValidateOptions{BinaryGooseVersion: 9, BinaryMigrations: []int64{1, 9}}
+	binary := ValidateOptions{BinaryGooseVersion: 9, BinaryMigrations: []int64{1, 9}, KeyCheck: testKeyCheck, ManifestKey: testManifestKey}
 	tests := []struct {
 		name     string
 		goose    int64
@@ -733,6 +753,7 @@ func TestSwapRefusesMigrationsThisBinaryDoesNotCarry(t *testing.T) {
 			f := newSwapFixture(t)
 			f.validate = binary
 			f.src.Manifest.GooseVersion, f.src.Manifest.AppliedMigrations = tt.goose, tt.recorded
+			f.resign()
 			f.restoredApplied = tt.restored
 			err, _ := f.restore()
 			if tt.want == nil {
@@ -827,5 +848,47 @@ func TestSensitiveSettingsAreClassified(t *testing.T) {
 		if !catalog.SensitiveSettingKeys[key] {
 			t.Errorf("%s is classified but is not a sensitive setting", key)
 		}
+	}
+}
+
+// TestValidateAuthenticatesTheManifest: a full restore trusts a manifest
+// only when it verifies under this server's SECRET_KEY. One naming this
+// key that does not verify is refused even when the operator accepts lost
+// credentials; one that cannot be checked (no key check value, another
+// key, or no SECRET_KEY here) is refused unless the operator passes
+// --accept-lost-credentials.
+func TestValidateAuthenticatesTheManifest(t *testing.T) {
+	tests := []struct {
+		name      string
+		change    func(*Manifest)
+		keyCheck  string
+		key       []byte
+		want      error // without --accept-lost-credentials
+		wantAfter error // with it
+	}{
+		{name: "matching", change: func(*Manifest) {}},
+		{name: "wrong MAC", change: func(m *Manifest) { m.MAC = strings.Repeat("ab", 32) }, want: ErrManifestTampered, wantAfter: ErrManifestTampered},
+		{name: "missing MAC", change: func(m *Manifest) { m.MAC = "" }, want: ErrManifestTampered, wantAfter: ErrManifestTampered},
+		{name: "changed checksum", change: func(m *Manifest) { m.Objects[0].SHA256 = strings.Repeat("0", 64) }, want: ErrManifestTampered, wantAfter: ErrManifestTampered},
+		{name: "missing key check", change: func(m *Manifest) { m.KeyCheck = "" }, want: ErrUnauthenticatedBackup},
+		{name: "other key", change: func(m *Manifest) { m.KeyCheck = "9999-8888-7777-6666" }, want: ErrKeyMismatch},
+		{name: "no SECRET_KEY here", change: func(*Manifest) {}, keyCheck: "-", want: ErrUnauthenticatedBackup},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			src := writeTestBackup(t, nil)
+			tt.change(src.Manifest)
+			opts := ValidateOptions{KeyCheck: testKeyCheck, ManifestKey: testManifestKey}
+			if tt.keyCheck == "-" {
+				opts = ValidateOptions{}
+			}
+			if err := src.Validate(t.Context(), opts); !errors.Is(err, tt.want) || (tt.want == nil) != (err == nil) {
+				t.Fatalf("Validate = %v, want %v", err, tt.want)
+			}
+			opts.AcceptLostCredentials = true
+			if err := src.Validate(t.Context(), opts); !errors.Is(err, tt.wantAfter) || (tt.wantAfter == nil) != (err == nil) {
+				t.Fatalf("Validate with --accept-lost-credentials = %v, want %v", err, tt.wantAfter)
+			}
+		})
 	}
 }

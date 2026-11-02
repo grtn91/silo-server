@@ -1,11 +1,14 @@
 package backup
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Silo-Server/silo-server/internal/blobstore"
 )
 
 func validTestManifest() Manifest {
@@ -102,5 +105,57 @@ func TestManifestMAC(t *testing.T) {
 	}
 	if ok, err := signed().checkMAC(key, "1111-2222-3333-4444"); ok || err != nil {
 		t.Fatalf("another key's manifest = %v, %v; want not authenticated, no error", ok, err)
+	}
+}
+
+// TestListShowsUnverifiedBackups: the listing says a backup is unverified
+// when its manifest names another SECRET_KEY or none, and when it names
+// this key but does not verify; that one shows no details and the sweep
+// leaves it.
+func TestListShowsUnverifiedBackups(t *testing.T) {
+	ctx := t.Context()
+	store, err := blobstore.NewFilesystem(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Date(2026, 11, 2, 12, 0, 0, 0, time.UTC)
+	svc := New(Options{Destination: NewStoreDestination(store), KeyCheck: "aaaa-bbbb-cccc-dddd", ManifestKey: []byte("0123456789abcdef0123456789abcdef"),
+		Now: func() time.Time { return now }, ServerID: func(context.Context) (string, error) { return "server", nil }})
+	write := func(day int, keyCheck string, tamper bool) string {
+		t.Helper()
+		m := validTestManifest()
+		m.ID = FolderName(now.AddDate(0, 0, -day), KindNightly)
+		m.CreatedAt, m.CompletedAt, m.KeyCheck = now.AddDate(0, 0, -day), now.AddDate(0, 0, -day), keyCheck
+		if err := writeManifest(ctx, target{Destination: svc.opts.Destination}, &m, svc.opts.ManifestKey); err != nil {
+			t.Fatal(err)
+		}
+		if tamper {
+			m.Objects[0].SHA256 = strings.Repeat("0", 64)
+			data, _ := json.Marshal(&m)
+			if err := store.Put(ctx, objectKey("server", m.ID, ManifestName), data); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return m.ID
+	}
+	verified, other, none, tampered := write(1, "aaaa-bbbb-cccc-dddd", false), write(2, "1111-2222-3333-4444", false), write(3, "", false), write(4, "aaaa-bbbb-cccc-dddd", true)
+	listing, err := svc.List(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	status := map[string]Summary{}
+	for _, b := range listing.Backups {
+		status[b.ID] = b
+	}
+	if status[verified].Status != StatusComplete || status[other].Status != StatusUnverified || status[none].Status != StatusUnverified ||
+		status[tampered].Status != StatusUnverified || len(status[tampered].Objects) != 0 {
+		t.Fatalf("statuses = %+v", status)
+	}
+	folders, err := svc.folders(ctx, target{Destination: svc.opts.Destination}, "server")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if swept := planSweep(folders, now.AddDate(0, 1, 0)); len(swept) != 0 {
+		t.Fatalf("the sweep would delete %v", swept)
 	}
 }

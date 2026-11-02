@@ -101,8 +101,12 @@ func (src *Source) Validate(ctx context.Context, opts ValidateOptions) error {
 	m := src.Manifest
 	// First, so nothing below trusts a checksum anyone with write access to
 	// the backup could have changed with its object.
-	if _, err := m.checkMAC(opts.ManifestKey, opts.KeyCheck); err != nil {
+	authenticated, err := m.checkMAC(opts.ManifestKey, opts.KeyCheck)
+	if err != nil {
 		return err
+	}
+	if !authenticated && !opts.AcceptLostCredentials {
+		return unauthenticatedError(m, opts.KeyCheck)
 	}
 	for _, name := range []string{DumpName, BlobsName} {
 		entry, ok := m.object(name)
@@ -124,12 +128,26 @@ func (src *Source) Validate(ctx context.Context, opts ValidateOptions) error {
 	if err := opts.checkMigrations(m.AppliedMigrations, "the backup records"); err != nil {
 		return err
 	}
-	if m.KeyCheck != "" && m.KeyCheck != opts.KeyCheck {
-		if !opts.AcceptLostCredentials {
-			return fmt.Errorf("%w (backup %s, this key %s); encrypted settings and credentials in it cannot be read with this key, and its manifest cannot be authenticated. Pass --accept-lost-credentials to restore anyway", ErrKeyMismatch, m.KeyCheck, opts.KeyCheck)
-		}
-	}
 	return nil
+}
+
+// ErrUnauthenticatedBackup refuses a backup whose manifest this server
+// cannot authenticate, without the operator's --accept-lost-credentials.
+var ErrUnauthenticatedBackup = errors.New("this backup cannot be verified")
+
+// unauthenticatedError says why m cannot be authenticated and what accepts
+// it. A backup taken with another key is ErrKeyMismatch too: its encrypted
+// settings are lost with it, which is what --accept-lost-credentials
+// accepts, and its MAC was made with that key.
+func unauthenticatedError(m *Manifest, keyCheck string) error {
+	switch {
+	case keyCheck == "":
+		return fmt.Errorf("%w: SECRET_KEY is not set, so its manifest cannot be checked. Set SECRET_KEY, or pass --accept-lost-credentials to restore it unverified", ErrUnauthenticatedBackup)
+	case m.KeyCheck == "":
+		return fmt.Errorf("%w: its manifest records no SECRET_KEY check value, which every Silo backup has, so it may have been changed. Pass --accept-lost-credentials to restore it unverified, encrypted settings and credentials included as lost", ErrUnauthenticatedBackup)
+	}
+	return fmt.Errorf("%w (backup %s, this key %s): %w; encrypted settings and credentials in it cannot be read with this key, and its manifest cannot be verified, so it may have been changed. Pass --accept-lost-credentials to restore it anyway",
+		ErrUnauthenticatedBackup, m.KeyCheck, keyCheck, ErrKeyMismatch)
 }
 
 // checkArchive validates blobs.tar against where its entries would land and
@@ -464,8 +482,8 @@ func VerifyBackup(ctx context.Context, src *Source, loader DatabaseLoader, scrat
 	if err := src.Validate(ctx, validate); err != nil {
 		return err
 	}
-	if src.Manifest.KeyCheck != "" && src.Manifest.KeyCheck != validate.KeyCheck {
-		_, _ = fmt.Fprintln(out, "Warning: this backup was taken with a different SECRET_KEY; its encrypted settings and credentials cannot be read with this one, and its manifest cannot be authenticated.")
+	if authenticated, _ := src.Manifest.checkMAC(validate.ManifestKey, validate.KeyCheck); !authenticated {
+		_, _ = fmt.Fprintln(out, "Warning: this backup cannot be verified: it was taken with another SECRET_KEY, records none, or SECRET_KEY is not set here. Anyone who could write to its storage could have changed it, and encrypted settings and credentials in it cannot be read.")
 	}
 	if err := loadAndVerify(ctx, src, loader, scratch, validate, out); err != nil {
 		return err
