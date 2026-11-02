@@ -14575,7 +14575,8 @@ export interface components {
         | "template_not_available"
         | "collection_not_mapped"
         | "unreadable"
-        | "files_missing_here";
+        | "files_missing_here"
+        | "needs_install";
       /** @description Items (section:id) that must be chosen with this one: a collection whose library is restored by the same request */
       requires: string[];
       restart_required: boolean;
@@ -14790,7 +14791,8 @@ export interface components {
         | "template_not_available"
         | "collection_not_mapped"
         | "unreadable"
-        | "files_missing_here";
+        | "files_missing_here"
+        | "needs_install";
       restart_keys: string[];
       restart_required: boolean;
       /** @enum {string} */

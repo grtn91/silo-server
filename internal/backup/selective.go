@@ -61,6 +61,10 @@ const (
 	// files are missing from its storage; restoring writes them back and
 	// changes nothing else.
 	ReasonFilesMissingHere = "files_missing_here"
+	// ReasonNeedsInstall: a plugin this server does not have. A restore
+	// never installs one from a backup; an admin installs it from a plugin
+	// catalog and restores it again for its settings.
+	ReasonNeedsInstall = "needs_install"
 )
 
 // Report outcomes.

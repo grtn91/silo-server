@@ -605,39 +605,22 @@ func (a *applier) applyPlugin(ctx context.Context, tx pgx.Tx, id string) (applie
 	if a.s.targets.Plugins == nil {
 		return applied{}, plugins.ErrRestoreUnavailable
 	}
-	archive, err := a.rs.pluginArchive(doc.PluginID)
-	if err != nil {
-		return applied{}, fmt.Errorf("reading the plugin archive: %w", err)
-	}
-	in := plugins.RestoreInstallationInput{PluginID: doc.PluginID, Version: doc.Version, Enabled: doc.Enabled, Archive: archive,
+	in := plugins.RestoreInstallationInput{PluginID: doc.PluginID, Version: doc.Version,
 		SourceInstallationID: doc.InstallationID, ConfigUnreadable: !a.s.keyMatches(a.rs)}
 	for _, c := range doc.Configs {
 		in.Configs = append(in.Configs, plugins.RestoreConfig{Key: c.Key, Stored: c.Value})
 	}
 	res, after, err := a.s.targets.Plugins.RestorePlugin(ctx, tx, in)
+	if errors.Is(err, plugins.ErrPluginNotInstalled) {
+		return leftOut(item, ReasonNeedsInstall, needsInstallMessage(*doc)), nil
+	}
 	if err != nil {
 		return applied{}, err
-	}
-	// A new installation's lifecycle event and provider-chain sync are
-	// owed durably, like a new library's follow-ups. Reconfiguring an
-	// installed plugin advanced its runtime generation in this transaction,
-	// which replaces stale processes even if the event after commit is lost.
-	if res.Installed {
-		if err := recordFollowUp(ctx, tx, followUpPluginInstalled, res.InstallationID); err != nil {
-			return applied{}, err
-		}
 	}
 	for _, r := range res.Rejected {
 		item.Notes = append(item.Notes, fmt.Sprintf("Configuration %q was not restored: %s.", r.Key, r.Reason))
 	}
 	switch {
-	case res.Installed && !res.Enabled && doc.Enabled:
-		item.Outcome = OutcomeRestored
-		item.Message = "Installed and left disabled, because its configuration could not be restored."
-		after = a.s.CompleteFollowUps
-	case res.Installed:
-		item.Outcome, item.Message = OutcomeRestored, "Installed."
-		after = a.s.CompleteFollowUps
 	case len(res.Written) > 0 && res.SettingsOnly:
 		item.Outcome = OutcomeRestored
 		item.Message = fmt.Sprintf("Settings only: version %s is installed here.", res.InstalledHere)
@@ -649,6 +632,16 @@ func (a *applier) applyPlugin(ctx context.Context, tx pgx.Tx, id string) (applie
 		return unchanged(item), nil
 	}
 	return applied{item: item, after: after}, nil
+}
+
+// needsInstallMessage says how to restore a plugin this server does not
+// have: a restore never installs one from a backup.
+func needsInstallMessage(doc PluginDocument) string {
+	msg := fmt.Sprintf("Install %s %s from a plugin catalog, then restore it again", doc.PluginID, doc.Version)
+	if len(doc.Configs) > 0 {
+		return msg + " to apply its settings. A restore never installs a plugin from a backup."
+	}
+	return msg + ". A restore never installs a plugin from a backup."
 }
 
 // ---- Settings ----

@@ -289,12 +289,7 @@ func (p *planner) planPlugin(doc PluginDocument, locals map[string]localPlugin) 
 	}
 	local, installed := locals[doc.PluginID]
 	if !installed {
-		item.Status, item.Selectable = ItemNotOnThisServer, true
-		item.Message = "Installs the plugin from the backup, disabled until its configuration is applied."
-		if len(doc.Configs) > 0 && !p.keyMatches {
-			item.Reason = ReasonConfigNeedsKey
-			item.Message = "Installs without its configuration, which was encrypted with another SECRET_KEY. The plugin stays disabled."
-		}
+		item.Status, item.Reason, item.Message = ItemNotOnThisServer, ReasonNeedsInstall, needsInstallMessage(doc)
 		return item
 	}
 	item.Plugin.InstalledVersion = local.version

@@ -380,7 +380,7 @@ accept versions 1 to 3; version 3 is always written.
 | Section | Holds | Blob prefixes |
 |---|---|---|
 | `libraries` | `media_folders` rows with their paths and per-library options, and the poster key | `library-posters/` |
-| `plugins` | per installation: plugin id, version, enabled state, installation id, the stored archive (`plugin_archives`), and `plugin_runtime_configs` rows as stored | none |
+| `plugins` | per installation: plugin id, version, enabled state, installation id, the stored archive (`plugin_archives`, a record only: never installed), and `plugin_runtime_configs` rows as stored | none |
 | `settings` | `server_settings` rows the restore table offers, as stored | none |
 | `users` | one document per account: the account's fields, its profiles with their fields and data by data type, and the items that data names (see [Users](#users)) | `profile-avatars/` (operational store), `user-collection-images/` |
 | `collections` | manually managed admin collections with their library scope, group, and items; template-bundle collections (see below); uploaded item and season artwork (`upload://` sources); branding assets | `collection-images/`, `local/`, `branding/` |
@@ -427,8 +427,8 @@ referenced artwork original's directory; avatars a user document names
 listed for the section; documents that decode strictly
 (unknown fields and trailing data refused) and match the index counts; and
 limits on entries (200,000), document size (64 MiB), plugin archive and blob
-size (256 MiB), total bytes (32 GiB), and JSON nesting (32). A plugin archive
-also gets the installer's normal checks when it is installed. Readers accept
+size (256 MiB), total bytes (32 GiB), and JSON nesting (32). A plugin
+archive is never installed ([Plugins](#plugins)). Readers accept
 every format version up to theirs and refuse a newer one with "This backup is
 from a newer Silo. Upgrade this server first."
 
@@ -498,27 +498,27 @@ it is never offered and the preview says so.
 
 ### Plugins
 
-A plugin missing here is installed from the backup's archive through the
-admin upload path's checks, with the installer's `KeepDisabled` option: the
-installation is persisted disabled and is never enabled in between. Its
-configuration is decrypted under the source installation id, checked with
-the validation an admin save uses, and written re-encrypted under the new
-installation id (`plugin_runtime_configs:config_value:<installation id>:<key>`).
-Only then is the backup's enabled state applied, and after commit
-`EventPluginsChanged` is published and a metadata provider joins the library
-chains as an upload's does. Configuration that fails validation or cannot be
-decrypted leaves the plugin disabled, and the report says why.
+A restore never installs or runs a plugin from a backup. Its archive is
+vouched for only by the backup's own checksums, and anyone who can write the
+backup destination could replace it with code that would run as the Silo
+user. A plugin missing here is not selectable (`needs_install`): the preview
+and the report tell the admin to install that plugin id and version from a
+plugin catalog, through the normal install path and its checks, and to
+restore it again, which then applies its settings. The archive stays in the
+restore set as a record of what was installed; the reader checks its digest
+and keeps no copy.
 
 A plugin installed here keeps its installation and enabled state. At the
-same version its configuration is restored the same way; at another version
-only values the installed version accepts are written ("settings only").
-With another `SECRET_KEY` a missing plugin installs without configuration and
-stays disabled. `plugin_instance_state` is never restored.
-
-A new installation's lifecycle event and provider-chain sync are owed
-durably (see [Follow-ups](#follow-ups)). Reconfiguring an installed plugin
-advances its runtime generation in the item's transaction, which replaces
-stale processes even when the event after commit is lost.
+same version its configuration is decrypted under the source installation
+id, checked with the validation an admin save uses, and written re-encrypted
+under this installation's id
+(`plugin_runtime_configs:config_value:<installation id>:<key>`); at another
+version only values the installed version accepts are written ("settings
+only"). Configuration that cannot be decrypted, as with another
+`SECRET_KEY`, or that fails validation is left out, and the report says why.
+`plugin_instance_state` is never restored. Reconfiguring a plugin advances
+its runtime generation in the item's transaction, which replaces stale
+processes even when the event after commit is lost.
 
 ### Libraries
 
@@ -701,14 +701,13 @@ the same order, so the two wait for each other instead of deadlocking:
 - Accounts and profiles: `userdata.Preparer`'s order, the account locks, then
   each data type's own, then data rows.
 - Libraries, plugins, and settings write through the editor's own functions
-  (`catalog.CreateFolderInTx`, the plugin installer, the admin settings write
+  (`catalog.CreateFolderInTx`, the plugin configuration store, the admin settings write
   path) and take their locks.
 
 ### Follow-ups
 
 Some work runs only after an item commits: a restored library's sections,
-provider chain, monitoring, and first scan, a restored plugin's lifecycle
-event and provider-chain sync, and a restored template collection's
+provider chain, monitoring, and first scan, and a restored template collection's
 template poster and sync. The item's transaction records it in
 `backup_restore_followups`, and the row is deleted only once every step of
 the work succeeded: the restore's follow-ups return each failed step

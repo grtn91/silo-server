@@ -103,6 +103,7 @@ const BLOCKED_PHRASES: Record<RestoreReason, string> = {
   collection_not_mapped: "the collection they show isn't here or in the backup",
   unreadable: "the backup's copy of them can't be read",
   files_missing_here: "their files are missing on this server",
+  needs_install: "they need to be installed from a plugin catalog first",
 };
 
 /** For an item the server gave a status but no reason. */

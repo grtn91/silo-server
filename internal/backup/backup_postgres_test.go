@@ -19,6 +19,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/Silo-Server/silo-server/internal/auth"
 	"github.com/Silo-Server/silo-server/internal/backup/backuptest"
 	"github.com/Silo-Server/silo-server/internal/blobstore"
 	"github.com/Silo-Server/silo-server/internal/catalog"
@@ -432,6 +433,30 @@ func checkCarryInvitation(t *testing.T, loader PGLoader, pool *pgxpool.Pool, dsn
 	setDownloads(restored, false)
 	if carried, err = loader.CarryCredentials(ctx, into, dsn); err != nil || slices.Contains(carried.Dropped, want) || invited() != 1 {
 		t.Fatalf("carried %+v (%v), want the invitation kept under the same policy", carried, err)
+	}
+	// The group stopped allowing the permissions a new account gets by
+	// default (auth.NewUserPermissions) after the backup.
+	var permissions []string
+	if err := pool.QueryRow(ctx, `SELECT allowed_permissions FROM access_groups WHERE is_default`).Scan(&permissions); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), `UPDATE access_groups SET allowed_permissions = $1 WHERE is_default`, permissions)
+	})
+	setPermissions := func(db *pgxpool.Pool, allowed []string) {
+		t.Helper()
+		if _, err := db.Exec(ctx, `UPDATE access_groups SET allowed_permissions = $1 WHERE is_default`, allowed); err != nil {
+			t.Fatal(err)
+		}
+	}
+	setPermissions(pool, []string{})
+	setPermissions(restored, auth.DefaultUserPermissions())
+	if carried, err = loader.CarryCredentials(ctx, into, dsn); err != nil || !slices.Contains(carried.Dropped, want) || invited() != 0 {
+		t.Fatalf("carried %+v (%v), want %q dropped: its group allowed more permissions in the backup", carried, err, want)
+	}
+	setPermissions(restored, []string{})
+	if carried, err = loader.CarryCredentials(ctx, into, dsn); err != nil || slices.Contains(carried.Dropped, want) || invited() != 1 {
+		t.Fatalf("carried %+v (%v), want the invitation kept once the permissions match", carried, err)
 	}
 }
 

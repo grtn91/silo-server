@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -192,8 +193,9 @@ func TestReadRestoreSetAcceptsAValidArchive(t *testing.T) {
 	if family := rs.blobFamily("profile-avatars/5/p1/original.webp"); len(family) != 2 {
 		t.Fatalf("avatar variants not kept with their original: %v", family)
 	}
-	if archive, err := rs.pluginArchive("tmdb"); err != nil || string(archive) != "PK-not-really-a-zip" {
-		t.Fatalf("plugin archive not extracted: %q %v", archive, err)
+	// A plugin archive is checked and never kept: nothing installs it.
+	if kept, _ := filepath.Glob(filepath.Join(rs.dir, "archive-*")); len(kept) != 0 {
+		t.Fatalf("plugin archive kept on disk: %v", kept)
 	}
 }
 
