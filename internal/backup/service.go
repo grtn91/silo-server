@@ -734,6 +734,7 @@ func (s *Service) folders(ctx context.Context, t target, serverID string) ([]fol
 		if name == ManifestName {
 			m, err := s.readManifest(ctx, t, serverID, id)
 			if err != nil {
+				f.tampered = errors.Is(err, ErrManifestTampered)
 				slog.WarnContext(ctx, "unreadable backup manifest", "component", "backup", "id", id, "error", err)
 				continue
 			}

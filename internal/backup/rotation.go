@@ -19,8 +19,13 @@ type folder struct {
 	id   string
 	kind Kind
 	at   time.Time
-	// manifest is nil for an incomplete folder.
+	// manifest is nil for an incomplete folder, and for one whose manifest
+	// did not verify (tampered).
 	manifest *Manifest
+	// tampered is set when the folder's manifest named this server's
+	// SECRET_KEY and did not verify: nothing in it is trusted, and the
+	// sweep leaves the folder for the admin to look at.
+	tampered bool
 	size     int64
 	// newest is the latest modification time of any object in the folder.
 	newest time.Time
@@ -88,7 +93,7 @@ func planRotation(folders []folder, keep int, now time.Time, pinned map[string]b
 func planSweep(folders []folder, now time.Time) []string {
 	var deletes []string
 	for _, f := range folders {
-		if f.manifest != nil {
+		if f.manifest != nil || f.tampered {
 			continue
 		}
 		if now.Sub(f.at) > incompleteSweepAge && now.Sub(f.newest) > incompleteSweepAge {

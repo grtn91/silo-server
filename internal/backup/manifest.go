@@ -33,6 +33,11 @@ const (
 	// StatusIncomplete: no manifest and nothing running; the sweep deletes it
 	// after 24 hours.
 	StatusIncomplete Status = "incomplete"
+	// StatusUnverified: a manifest this server cannot authenticate: written
+	// under another SECRET_KEY or with none recorded, or one naming this key
+	// that does not verify (then nothing in it is shown). A restore from it
+	// needs the admin's confirmation, and from a tampered one is refused.
+	StatusUnverified Status = "unverified"
 )
 
 // Manifest is manifest.json, written after every other object. Readers accept
@@ -126,12 +131,20 @@ func (m *Manifest) sign(key []byte) error {
 }
 
 // checkMAC authenticates m for a server whose SECRET_KEY has check value
-// keyCheck and manifest key key. A manifest written under another key
-// cannot be checked here: authenticated is false, and the caller decides
-// (a full restore needs --accept-lost-credentials for it anyway). One
-// written under this key must carry a MAC that verifies.
+// keyCheck and manifest key key, as a strict state machine:
+//
+//   - a manifest naming this key's check value must carry a MAC that
+//     verifies (ErrManifestTampered otherwise, a missing MAC included);
+//   - one without a check value or a MAC, or naming another key, cannot be
+//     authenticated here: authenticated is false, and the caller refuses it
+//     unless the operator confirmed (a full restore's
+//     --accept-lost-credentials, a selective restore's confirmation).
+//
+// Every Silo that writes manifests signs them, so a legitimate one from
+// this server always verifies. Without a key (key nil) nothing can be
+// authenticated.
 func (m *Manifest) checkMAC(key []byte, keyCheck string) (authenticated bool, err error) {
-	if key == nil || m.KeyCheck != keyCheck {
+	if key == nil || keyCheck == "" || m.KeyCheck != keyCheck {
 		return false, nil
 	}
 	want, err := hex.DecodeString(m.MAC)

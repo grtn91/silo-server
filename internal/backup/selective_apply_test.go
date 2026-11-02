@@ -120,12 +120,6 @@ func (h *memHeld) Exec(context.Context, string, ...any) (pgconn.CommandTag, erro
 	return pgconn.CommandTag{}, nil
 }
 
-// testManifestKey and testKeyCheck are the SECRET_KEY a test service and
-// its test backups share, so the manifests putPlainBackup writes verify.
-var testManifestKey = []byte("0123456789abcdef0123456789abcdef")
-
-const testKeyCheck = "0000-1111-2222-3333"
-
 // putPlainBackup stores a complete unencrypted backup with a restore set,
 // its manifest signed with testManifestKey, and returns the restore set's
 // digest.

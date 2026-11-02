@@ -101,6 +101,9 @@ function BackupStatus({
           {active?.operation === "backup" ? `${label}, ${Math.round(active.progress)}%` : label}
         </SettingFieldStatus>
       );
+    case "unverified":
+      // Written with another SECRET_KEY, or changed after it was written.
+      return <SettingFieldStatus tone="warn">{label}</SettingFieldStatus>;
     default:
       return <SettingFieldStatus tone="muted">{label}</SettingFieldStatus>;
   }

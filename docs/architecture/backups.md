@@ -100,12 +100,23 @@ change an object and its checksum together; only a server with the key can
 write a `mac` that verifies. Every read checks it before trusting anything
 else in the manifest: the listing, downloads and download links, a
 selective restore's preview and restore, `silo backup restore`, and
-`silo backup verify`. A manifest whose check value is this server's must
-verify, and one that does not is refused (`ErrManifestTampered`), a missing
-`mac` included; a manifest a destination read must also name the folder and
-server it was read from. A backup written under another `SECRET_KEY` cannot
-be checked here: a full restore of it already needs
-`--accept-lost-credentials`, and its preview says it is not authenticated.
+`silo backup verify`. The check is a strict state machine, with no legacy
+path (every Silo that writes manifests signs them):
+
+- The manifest names this server's check value: its `mac` must verify, or
+  it is refused (`ErrManifestTampered`), a missing `mac` included, even with
+  `--accept-lost-credentials`.
+- It names another check value, none, or `SECRET_KEY` is not set here: it
+  cannot be authenticated. `silo backup restore` refuses it unless the
+  operator passes `--accept-lost-credentials`, the flag that already accepts
+  a backup taken with another key (whose encrypted settings are lost), and
+  says plainly that the backup cannot be verified; `silo backup verify`
+  warns. A selective restore needs the admin's confirmation
+  (`accept_unauthenticated`), and the listing shows it as `unverified`.
+- A manifest a destination read must also name the folder and server it was
+  read from. A folder whose manifest names this key and does not verify is
+  listed as `unverified` with no details, cannot be restored or downloaded,
+  and the sweep leaves it.
 
 ## Taking a backup
 

@@ -86,7 +86,7 @@ type AdminBackupMissingBlob struct {
 type AdminBackup struct {
 	ID           string                   `json:"id" doc:"The backup folder name: UTC start time and kind"`
 	Kind         string                   `json:"kind" enum:"nightly,manual,before-restore"`
-	Status       string                   `json:"status" enum:"complete,complete_with_warnings,in_progress,incomplete" doc:"complete: manifest written, checksums recorded, table of contents readable; it does not claim a restore was tested. complete_with_warnings: some referenced files were missing when copied. in_progress: being written now. incomplete: no manifest and nothing running; deleted after 24 hours"`
+	Status       string                   `json:"status" enum:"complete,complete_with_warnings,in_progress,incomplete,unverified" doc:"complete: manifest written, checksums recorded, table of contents readable; it does not claim a restore was tested. complete_with_warnings: some referenced files were missing when copied. in_progress: being written now. incomplete: no manifest and nothing running; deleted after 24 hours. unverified: this server cannot authenticate the manifest (another SECRET_KEY, none recorded, or changed since it was written); a restore needs confirmation, and one whose manifest names this key but does not verify shows no details and cannot be restored"`
 	CreatedAt    Instant                  `json:"created_at"`
 	CompletedAt  *Instant                 `json:"completed_at,omitempty"`
 	SizeBytes    int64                    `json:"size_bytes"`

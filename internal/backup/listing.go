@@ -177,6 +177,8 @@ func (s *Service) list(ctx context.Context) (Listing, error) {
 			if listing.LastSuccessAt == nil || completed.After(*listing.LastSuccessAt) {
 				listing.LastSuccessAt = &completed
 			}
+		case f.tampered:
+			summary.Status = StatusUnverified
 		case listing.Active != nil && listing.Active.Operation == OperationBackup && listing.Active.BackupID == f.id:
 			summary.Status = StatusInProgress
 		default:
@@ -209,6 +211,9 @@ func otherServerIDs(objects []blobstore.ObjectInfo, serverID string) []string {
 func (s *Service) fromManifest(summary *Summary, m *Manifest) {
 	completed := m.CompletedAt
 	summary.Status, summary.CompletedAt, summary.SiloVersion = m.Status(), &completed, m.SiloVersion
+	if !m.authenticated && s.opts.ManifestKey != nil {
+		summary.Status = StatusUnverified
+	}
 	summary.SizeBytes, summary.MissingBlobs, summary.Objects, summary.BlobCount = m.Size(), m.MissingBlobs, m.Objects, m.Blobs.Count
 	summary.KeyCheck, summary.KeyMatches = m.KeyCheck, m.KeyCheck != "" && m.KeyCheck == s.opts.KeyCheck
 	if summary.MissingBlobs == nil {
