@@ -3,6 +3,7 @@ package backup
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"slices"
 
@@ -162,4 +163,99 @@ func credentialOwners(tables []secretTable, live []string) ([]int, error) {
 	}
 	slices.Sort(ids)
 	return slices.Compact(ids), nil
+}
+
+// inviteeGrant is what an account created from an invitation or an invite
+// code gets: a role, the invitation's libraries, and an access group (the
+// default group when none is named, unless the role is admin).
+type inviteeGrant struct {
+	role       string
+	libraryIDs []int
+	groupID    *int64
+}
+
+// grantOf reads the grant of a carried row of table, if it grants one.
+func grantOf(table string, row map[string]any) (inviteeGrant, bool) {
+	switch table {
+	case "invite_codes":
+		return inviteeGrant{role: models.RoleUser}, true
+	case "invitations":
+		g := inviteeGrant{role: models.RoleUser}
+		if role, ok := row["role"].(string); ok {
+			g.role = role
+		}
+		if ids, ok := row["library_ids"].([]any); ok {
+			g.libraryIDs = []int{}
+			for _, id := range ids {
+				if n, ok := id.(float64); ok {
+					g.libraryIDs = append(g.libraryIDs, int(n))
+				}
+			}
+		}
+		if id, ok := row["access_group_id"].(float64); ok {
+			g.groupID = new(int64(id))
+		}
+		return g, true
+	}
+	return inviteeGrant{}, false
+}
+
+// inviteePolicy is the effective policy an account created now from g
+// would get in tx's database, as account creation resolves it.
+func inviteePolicy(ctx context.Context, tx pgx.Tx, g inviteeGrant) (access.EffectiveUserPolicy, error) {
+	user := &models.User{Role: g.role, LibraryIDs: g.libraryIDs, AccessGroupID: g.groupID}
+	if user.AccessGroupID == nil && g.role != models.RoleAdmin {
+		var id int64
+		err := tx.QueryRow(ctx, `SELECT id FROM access_groups WHERE is_default`).Scan(&id)
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return access.EffectiveUserPolicy{}, fmt.Errorf("reading the default access group: %w", err)
+		}
+		if err == nil {
+			user.AccessGroupID = &id
+		}
+	}
+	if !access.GroupApplies(user) {
+		return access.ApplyGroupPolicy(user, nil), nil
+	}
+	group, err := access.ReadGroupInTransaction(ctx, tx, *user.AccessGroupID)
+	if errors.Is(err, access.ErrGroupNotFound) {
+		// The carry drops an invitation whose group is gone.
+		return access.ApplyGroupPolicy(user, nil), nil
+	}
+	if err != nil {
+		return access.EffectiveUserPolicy{}, fmt.Errorf("reading access group %d: %w", *user.AccessGroupID, err)
+	}
+	policy := group.Policy()
+	return access.ApplyGroupPolicy(user, &policy), nil
+}
+
+// grantKey names a carried row that grants an account: its table and id.
+type grantKey struct {
+	table string
+	id    int64
+}
+
+// inviteePolicies reads, in tx's database, the policy each carried row
+// that grants an account would give it.
+func inviteePolicies(ctx context.Context, tx pgx.Tx, tables []secretTable, live []string) (map[grantKey]access.EffectiveUserPolicy, error) {
+	out := map[grantKey]access.EffectiveUserPolicy{}
+	for i, t := range tables {
+		var rows []map[string]any
+		if err := json.Unmarshal([]byte(live[i]), &rows); err != nil {
+			return nil, fmt.Errorf("%s: %w", t.name, err)
+		}
+		for _, row := range rows {
+			g, ok := grantOf(t.name, row)
+			id, hasID := row["id"].(float64)
+			if !ok || !hasID {
+				continue
+			}
+			policy, err := inviteePolicy(ctx, tx, g)
+			if err != nil {
+				return nil, err
+			}
+			out[grantKey{table: t.name, id: int64(id)}] = policy
+		}
+	}
+	return out, nil
 }

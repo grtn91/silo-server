@@ -9,6 +9,8 @@ import (
 	"strings"
 
 	"github.com/jackc/pgx/v5"
+
+	"github.com/Silo-Server/silo-server/internal/access"
 )
 
 // secretHandling is what a backup and a restore do with a table holding a
@@ -81,6 +83,14 @@ func ownerCarried(column string) string {
 	return `EXISTS (SELECT 1 FROM carried_owners o WHERE o.id = r.` + column + `)`
 }
 
+// grantCarried is the SQL condition, over the live row r of table, that the
+// account it would create gets no wider a policy under the restored data
+// than live (carried_grants): an invitation's or invite code's access group
+// may have granted more when the backup was taken.
+func grantCarried(table string) string {
+	return `EXISTS (SELECT 1 FROM carried_grants g WHERE g.tbl = '` + table + `' AND g.id = r.id)`
+}
+
 // Reasons shared by several secretTables entries.
 const (
 	outboundOnly  = "outbound: what Silo presents to another service, not a credential for Silo"
@@ -124,14 +134,14 @@ var secretTables = []secretTable{
 	{name: "invitations", handling: secretCarried, why: "pending invitations", carry: &carrySpec{
 		key: "id", same: []string{"id", "token_hash"}, credential: `t.accepted_at IS NULL AND t.revoked_at IS NULL`,
 		owners: []string{"invited_by"},
-		owned: `(r.invited_by IS NULL OR ` + ownerCarried("invited_by") + `)
+		owned: `(r.invited_by IS NULL OR ` + ownerCarried("invited_by") + `) AND ` + grantCarried("invitations") + `
 			AND (r.access_group_id IS NULL OR EXISTS (SELECT 1 FROM access_groups g WHERE g.id = r.access_group_id))`,
 		describe: `format('invitation %s', r.id)`,
 	}},
 	{name: "invite_codes", handling: secretCarried, why: "invite codes", carry: &carrySpec{
 		key: "id", same: []string{"id", "code"}, credential: everyRow,
 		owners:   []string{"created_by"},
-		owned:    `r.created_by IS NULL OR ` + ownerCarried("created_by"),
+		owned:    `(r.created_by IS NULL OR ` + ownerCarried("created_by") + `) AND ` + grantCarried("invite_codes"),
 		describe: `format('invite code %s %L', r.id, r.label)`,
 	}},
 	{name: "autoscan_webhook_endpoints", handling: secretCarried, why: "autoscan webhook tokens", carry: &carrySpec{
@@ -260,10 +270,10 @@ func (l PGLoader) CarryCredentials(ctx context.Context, dbURL, liveURL string) (
 	for i := range live {
 		live[i] = "[]"
 	}
-	var liveAuthority map[int]accountAuthority
+	var liveState liveCredentials
 	if liveURL != "" {
 		var err error
-		if liveAuthority, err = readLiveCredentials(ctx, liveURL, tables, live); err != nil {
+		if liveState, err = readLiveCredentials(ctx, liveURL, tables, live); err != nil {
 			return CarriedCredentials{}, fmt.Errorf("reading the live server's credentials: %w", err)
 		}
 	}
@@ -274,7 +284,10 @@ func (l PGLoader) CarryCredentials(ctx context.Context, dbURL, liveURL string) (
 	defer func() { _ = conn.Close(context.WithoutCancel(ctx)) }()
 	result := CarriedCredentials{Kept: map[string]int{}}
 	err = pgx.BeginFunc(ctx, conn, func(tx pgx.Tx) error {
-		if err := carriedOwners(ctx, tx, liveAuthority); err != nil {
+		if err := carriedOwners(ctx, tx, liveState.authority); err != nil {
+			return err
+		}
+		if err := carriedGrants(ctx, tx, tables, live, liveState.grants); err != nil {
 			return err
 		}
 		for i, table := range tables {
@@ -306,15 +319,42 @@ func carriedOwners(ctx context.Context, tx pgx.Tx, live map[int]accountAuthority
 	return err
 }
 
+// carriedGrants writes carried_grants, the carried rows that grant an
+// account no wider a policy under the restored data than live.
+func carriedGrants(ctx context.Context, tx pgx.Tx, tables []secretTable, live []string, livePolicies map[grantKey]access.EffectiveUserPolicy) error {
+	restored, err := inviteePolicies(ctx, tx, tables, live)
+	if err != nil {
+		return err
+	}
+	var names []string
+	var ids []int64
+	for key, policy := range restored {
+		if l, ok := livePolicies[key]; ok && len(access.WiderThan(policy, l)) == 0 {
+			names, ids = append(names, key.table), append(ids, key.id)
+		}
+	}
+	_, err = tx.Exec(ctx, `CREATE TEMP TABLE carried_grants ON COMMIT DROP AS
+		SELECT * FROM unnest($1::text[], $2::bigint[]) AS g(tbl, id)`, names, ids)
+	return err
+}
+
+// liveCredentials is what readLiveCredentials reads besides the rows: the
+// authority of the accounts they belong to, and the policy each row that
+// grants an account would give it.
+type liveCredentials struct {
+	authority map[int]accountAuthority
+	grants    map[grantKey]access.EffectiveUserPolicy
+}
+
 // readLiveCredentials reads each credential table of liveURL as one JSON
-// array, and the authority of the accounts they belong to, in one snapshot.
-func readLiveCredentials(ctx context.Context, liveURL string, tables []secretTable, into []string) (map[int]accountAuthority, error) {
+// array, and liveCredentials, in one snapshot.
+func readLiveCredentials(ctx context.Context, liveURL string, tables []secretTable, into []string) (liveCredentials, error) {
+	var state liveCredentials
 	conn, err := pgx.Connect(ctx, liveURL)
 	if err != nil {
-		return nil, err
+		return state, err
 	}
 	defer func() { _ = conn.Close(context.WithoutCancel(ctx)) }()
-	var authority map[int]accountAuthority
 	err = pgx.BeginTxFunc(ctx, conn, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly}, func(tx pgx.Tx) error {
 		for i, table := range tables {
 			sql := fmt.Sprintf(`SELECT coalesce(json_agg(t), '[]')::text FROM %s t WHERE %s`, table.name, table.carry.credential)
@@ -326,10 +366,13 @@ func readLiveCredentials(ctx context.Context, liveURL string, tables []secretTab
 		if err != nil {
 			return err
 		}
-		authority, err = readAuthority(ctx, tx, owners)
+		if state.authority, err = readAuthority(ctx, tx, owners); err != nil {
+			return err
+		}
+		state.grants, err = inviteePolicies(ctx, tx, tables, into)
 		return err
 	})
-	return authority, err
+	return state, err
 }
 
 // carry runs in the restored database: it deletes the restored credentials

@@ -168,6 +168,13 @@ func RestoreSwap(ctx context.Context, src *Source, loader DatabaseLoader, ctl Co
 	if err := carryCredentials(ctx, loader, restoredURL, opts.LiveURL, out); err != nil {
 		return discard(err)
 	}
+	// A subtitle the backup left out may still be in the live storage the
+	// restored server keeps using.
+	if !opts.DatabaseOnly {
+		if err := dropOmittedSubtitles(ctx, loader, restoredURL, m, storedIn(opened.Assets), out); err != nil {
+			return discard(err)
+		}
+	}
 	if err := ctl.AllowConnections(ctx, restored, false); err != nil {
 		return discard(err)
 	}
@@ -280,6 +287,17 @@ func storesOf(s blobstore.Stores) blobStores {
 		stores[storeOperational] = s.Operational
 	}
 	return stores
+}
+
+// storedIn reports whether an object is in store.
+func storedIn(store blobstore.Store) func(context.Context, string) (bool, error) {
+	return func(ctx context.Context, key string) (bool, error) {
+		_, err := store.Stat(ctx, key)
+		if errors.Is(err, blobstore.ErrNotFound) {
+			return false, nil
+		}
+		return err == nil, err
+	}
 }
 
 func identityOf(store blobstore.Store) string {

@@ -12,6 +12,7 @@ import (
 
 	"github.com/Silo-Server/silo-server/internal/blobstore"
 	"github.com/Silo-Server/silo-server/internal/secret"
+	"github.com/Silo-Server/silo-server/internal/subtitles"
 )
 
 // PGLoader restores dumps with pg_restore and reads databases with pgx.
@@ -114,6 +115,47 @@ func (l PGLoader) ClearUnreadableSettings(ctx context.Context, dbURL string, cip
 		return nil, err
 	}
 	return unreadable, nil
+}
+
+func (l PGLoader) DropSubtitles(ctx context.Context, dbURL string, exists func(context.Context, string) (bool, error)) (int, error) {
+	conn, err := pgx.Connect(ctx, dbURL)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = conn.Close(context.WithoutCancel(ctx)) }()
+	rows, err := conn.Query(ctx, `SELECT id, s3_key FROM downloaded_subtitles WHERE provider <> $1`, subtitles.ProviderUpload)
+	if err != nil {
+		return 0, err
+	}
+	type row struct {
+		id  int
+		key string
+	}
+	all, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (row, error) {
+		var out row
+		return out, r.Scan(&out.id, &out.key)
+	})
+	if err != nil {
+		return 0, err
+	}
+	var gone []int
+	for _, r := range all {
+		if exists != nil {
+			present, err := exists(ctx, r.key)
+			if err != nil {
+				return 0, fmt.Errorf("checking %s: %w", r.key, err)
+			}
+			if present {
+				continue
+			}
+		}
+		gone = append(gone, r.id)
+	}
+	if len(gone) == 0 {
+		return 0, nil
+	}
+	tag, err := conn.Exec(ctx, `DELETE FROM downloaded_subtitles WHERE id = ANY($1)`, gone)
+	return int(tag.RowsAffected()), err
 }
 
 // PGControl is the swap's control connection to the maintenance database.

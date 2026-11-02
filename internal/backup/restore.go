@@ -170,6 +170,10 @@ type DatabaseLoader interface {
 	// cipher cannot open (nil opens none) and returns their keys. Rows are
 	// only deleted: a value is bound to its key name.
 	ClearUnreadableSettings(ctx context.Context, dbURL string, cipher *secret.Cipher) ([]string, error)
+	// DropSubtitles deletes the restored database's provider subtitle rows
+	// (not uploads) whose object exists returns false for, or all of them
+	// when exists is nil, and returns how many it deleted.
+	DropSubtitles(ctx context.Context, dbURL string, exists func(ctx context.Context, key string) (bool, error)) (int, error)
 	// CarryCredentials replaces the restored database's long-lived
 	// credentials (secretTables, secretCarried) with liveURL's, or deletes them when
 	// liveURL is "".
@@ -191,6 +195,25 @@ func clearLostSettings(ctx context.Context, loader DatabaseLoader, dbURL string,
 	}
 	if len(keys) > 0 {
 		_, _ = fmt.Fprintf(out, "Cleared %d encrypted settings this SECRET_KEY cannot read; enter them again after Silo starts: %s\n", len(keys), strings.Join(keys, ", "))
+	}
+	return nil
+}
+
+// dropOmittedSubtitles removes, when the backup left provider subtitles out
+// (backup.include_subtitles off), the restored rows whose object is not in
+// the stores the restored server uses, so players do not list tracks with
+// no content. Silo downloads them again when asked; uploads are always in
+// the backup. exists nil means none is there.
+func dropOmittedSubtitles(ctx context.Context, loader DatabaseLoader, dbURL string, m *Manifest, exists func(context.Context, string) (bool, error), out io.Writer) error {
+	if m.Blobs.IncludesSubtitles {
+		return nil
+	}
+	n, err := loader.DropSubtitles(ctx, dbURL, exists)
+	if err != nil {
+		return fmt.Errorf("removing the downloaded subtitles the backup left out: %w", err)
+	}
+	if n > 0 {
+		_, _ = fmt.Fprintf(out, "Removed %d downloaded subtitles the backup left out; Silo downloads them again when they are chosen.\n", n)
 	}
 	return nil
 }
@@ -318,6 +341,13 @@ func RestoreSeparate(ctx context.Context, src *Source, loader DatabaseLoader, op
 	// credentials and none of the live ones.
 	if err := carryCredentials(ctx, loader, opts.Into, "", out); err != nil {
 		return RestoreReport{}, err
+	}
+	// The copy's files land in an empty directory, so a subtitle the backup
+	// left out is nowhere.
+	if !opts.DatabaseOnly {
+		if err := dropOmittedSubtitles(ctx, loader, opts.Into, src.Manifest, nil, out); err != nil {
+			return RestoreReport{}, err
+		}
 	}
 	report := RestoreReport{Database: opts.Into, MissingBlobs: src.Manifest.MissingBlobs}
 	if opts.DatabaseOnly {

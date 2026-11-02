@@ -271,20 +271,12 @@ func TestBackupRestoreRoundTripDB(t *testing.T) {
 	if len(src.Manifest.AppliedMigrations) == 0 || !slices.Equal(in.Applied, src.Manifest.AppliedMigrations) {
 		t.Fatalf("restored applied migrations %v, manifest %v", in.Applied, src.Manifest.AppliedMigrations)
 	}
-	for key, want := range seed.blobs {
-		got, err := os.ReadFile(filepath.Join(blobsInto, filepath.FromSlash(key)))
-		if err != nil || !bytes.Equal(got, want) {
-			t.Fatalf("restored blob %s = %q, %v; want %q", key, got, err, want)
-		}
-	}
-	if _, err := os.Stat(filepath.Join(blobsInto, filepath.FromSlash(seed.leftOut))); !errors.Is(err, fs.ErrNotExist) {
-		t.Fatalf("restored %s, a provider subtitle the setting leaves out (%v)", seed.leftOut, err)
-	}
 	restoredPool, err := pgxpool.New(ctx, into)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer restoredPool.Close()
+	checkRestoredFiles(t, seed, blobsInto, restoredPool)
 	checkCredentials(t, loader, pool, dsn, into, restoredPool, seed.userID)
 	restoredSettings := catalog.NewEncryptedSettingsRepo(catalog.NewServerSettingsRepo(restoredPool), cipher)
 	if got, err := restoredSettings.Get(ctx, seed.secretKey); err != nil || got != seed.secretValue {
@@ -295,6 +287,25 @@ func TestBackupRestoreRoundTripDB(t *testing.T) {
 		t.Fatalf("verify into a used database = %v, want refusal", err)
 	}
 	checkAnotherKey(t, src, loader, pool, dsn, seed.secretKey)
+}
+
+// checkRestoredFiles: every blob the backup holds is restored, and a
+// provider subtitle the setting left out is neither restored nor listed.
+func checkRestoredFiles(t *testing.T, seed roundTripSeed, blobsInto string, restored *pgxpool.Pool) {
+	t.Helper()
+	for key, want := range seed.blobs {
+		got, err := os.ReadFile(filepath.Join(blobsInto, filepath.FromSlash(key)))
+		if err != nil || !bytes.Equal(got, want) {
+			t.Fatalf("restored blob %s = %q, %v; want %q", key, got, err, want)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(blobsInto, filepath.FromSlash(seed.leftOut))); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("restored %s, a provider subtitle the setting leaves out (%v)", seed.leftOut, err)
+	}
+	var omitted int
+	if err := restored.QueryRow(t.Context(), `SELECT count(*) FROM downloaded_subtitles WHERE s3_key = $1`, seed.leftOut).Scan(&omitted); err != nil || omitted != 0 {
+		t.Fatalf("restored %d rows of the subtitle the backup left out (%v), want none", omitted, err)
+	}
 }
 
 // checkCredentials: a restore brings back no sign-in session. A full
@@ -363,6 +374,49 @@ func checkCredentials(t *testing.T, loader PGLoader, pool *pgxpool.Pool, dsn, in
 		t.Fatalf("next restored key id %d (%v), want above %d", next, err, keptID)
 	}
 	checkCarryAuthority(t, loader, pool, dsn, into, restored, userID, keptID, liveKeys)
+	checkCarryInvitation(t, loader, pool, dsn, into, restored, "invite-"+suffix)
+}
+
+// checkCarryInvitation: a pending invitation is dropped when the account it
+// would create gets more under the restored data than live (its default
+// group allowed downloads in the backup and does not now), and kept when
+// the policies match.
+func checkCarryInvitation(t *testing.T, loader PGLoader, pool *pgxpool.Pool, dsn, into string, restored *pgxpool.Pool, tokenHash string) {
+	t.Helper()
+	ctx := t.Context()
+	var id int64
+	var allowed bool
+	if err := pool.QueryRow(ctx, `SELECT i.id, g.download_allowed FROM invitations i, access_groups g WHERE i.token_hash = $1 AND g.is_default`, tokenHash).Scan(&id, &allowed); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), `UPDATE access_groups SET download_allowed = $1 WHERE is_default`, allowed)
+	})
+	setDownloads := func(db *pgxpool.Pool, allow bool) {
+		t.Helper()
+		if _, err := db.Exec(ctx, `UPDATE access_groups SET download_allowed = $1 WHERE is_default`, allow); err != nil {
+			t.Fatal(err)
+		}
+	}
+	invited := func() int {
+		t.Helper()
+		var n int
+		if err := restored.QueryRow(ctx, `SELECT count(*) FROM invitations WHERE token_hash = $1`, tokenHash).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	setDownloads(pool, false)
+	setDownloads(restored, true)
+	carried, err := loader.CarryCredentials(ctx, into, dsn)
+	want := fmt.Sprintf("invitation %d", id)
+	if err != nil || !slices.Contains(carried.Dropped, want) || invited() != 0 {
+		t.Fatalf("carried %+v (%v), want %q dropped: its group allowed downloads in the backup", carried, err, want)
+	}
+	setDownloads(restored, false)
+	if carried, err = loader.CarryCredentials(ctx, into, dsn); err != nil || slices.Contains(carried.Dropped, want) || invited() != 1 {
+		t.Fatalf("carried %+v (%v), want the invitation kept under the same policy", carried, err)
+	}
 }
 
 // checkCarryAuthority: a live key is dropped when its account has more

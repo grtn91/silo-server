@@ -205,6 +205,9 @@ func (l fakeLoader) UnbindStorage(context.Context, string) error { return nil }
 func (l fakeLoader) ClearUnreadableSettings(context.Context, string, *secret.Cipher) ([]string, error) {
 	return nil, nil
 }
+func (l fakeLoader) DropSubtitles(context.Context, string, func(context.Context, string) (bool, error)) (int, error) {
+	return 0, nil
+}
 func (l fakeLoader) CarryCredentials(context.Context, string, string) (CarriedCredentials, error) {
 	return CarriedCredentials{}, nil
 }
