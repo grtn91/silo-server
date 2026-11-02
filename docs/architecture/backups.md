@@ -963,16 +963,28 @@ neither list.
   (`users.role`, `is_owner`, access group and per-account permissions) are
   restored as the backup has them; the credential carry above refuses
   credentials whose account gains authority that way.
-- It also keeps the live value of each access setting the backup would
-  widen (`accessSettings` in `settings_access.go`, the one classification
-  the selective restore uses too): who may sign in and how (local password
+- Every server setting has exactly one kind (`SettingKindOf`,
+  `settings_classes.go`), which both restores read: restored as the backup
+  has it, server-specific (never written by a selective restore), stricter
+  of backup and live (`accessSettings`), or part of a service route
+  (`settingRoutes`: an address and the secrets sent there, restored
+  together). `TestEverySettingIsClassified` enumerates the registries (admin
+  defaults, sensitive settings, branding assets, rate limits, and the keys
+  the server writes for itself) and fails on a setting with no kind or an
+  entry that names none.
+- It also keeps the live value of each stricter setting the backup would
+  widen (`accessSettings` in `settings_access.go`): who may sign in and how (local password
   sign-in, email auto-match, sign-up, self-service password reset, the
   Jellyfin and Audiobookshelf sign-in surfaces), session, token, and
   provider re-check lifetimes and the provider outage policy, what a
   rating-capped profile sees (`access.unrated_content`), private-network
   destinations, trusted proxies (a list that trusts any network the live
   one does not is wider), mail transport security, and the sign-in rate
-  limits (`ratelimit.enabled`, `ratelimit.auth.*`, `ratelimit.ip.*`). The
+  limits (`ratelimit.enabled`, `ratelimit.auth.*`, `ratelimit.ip.*`), and
+  the delivery switches (`email.enabled` and the email, Web Push, webhook,
+  Apple and Android push, Discord, server-channel, and fan-out notification
+  switches), so a channel an admin turned off stays off while its live
+  destinations are carried. The
   live row is copied as stored, so an encrypted value stays bound to its
   key name; values are compared decrypted, and one that does not decrypt
   counts as wider. The command lists each setting it kept.

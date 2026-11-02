@@ -55,6 +55,17 @@ var accessSettings = func() map[string]widerFunc {
 		"media_servers.allow_private_destinations":          on,
 		settingTrustedProxies:                               moreNetworks,
 		settingSMTPSecurity:                                 byRank(map[string]int64{smtpStartTLS: 0, smtpTLS: 0, smtpNone: 1}),
+		// What delivers notifications and mail to destinations without a
+		// session: a channel an admin turned off stays off.
+		"email.enabled":                               on,
+		"notifications.email_enabled":                 on,
+		"notifications.web_push_enabled":              on,
+		"notifications.webhooks_enabled":              on,
+		"notifications.apple_push_delivery_enabled":   on,
+		"notifications.android_push_delivery_enabled": on,
+		"notifications.discord_enabled":               on,
+		"notifications.server_channels_enabled":       on,
+		"notifications.fanout_enabled":                on,
 		// Sign-in throttling.
 		"ratelimit.enabled": func(restored, live string) bool { return on(live, restored) },
 	}
