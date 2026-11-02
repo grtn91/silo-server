@@ -183,6 +183,9 @@ func runBackupRestore(ctx context.Context, args []string, out io.Writer) error {
 	if err != nil {
 		return err
 	}
+	// Validation copies the objects it checks to a private directory and
+	// every step reads those; they go when the command ends, failed or not.
+	defer func() { _ = src.Close() }()
 	loader := backup.PGLoader{Tools: tools}
 	if f.into != "" {
 		return runSeparateRestore(ctx, f, src, loader, validate, masterKey, out)
@@ -353,6 +356,7 @@ func runBackupVerify(ctx context.Context, args []string, out io.Writer) error {
 	if err != nil {
 		return err
 	}
+	defer func() { _ = src.Close() }()
 	return backup.VerifyBackup(ctx, src, backup.PGLoader{Tools: tools}, *scratch, validate, out)
 }
 

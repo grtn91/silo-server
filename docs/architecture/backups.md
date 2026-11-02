@@ -366,7 +366,13 @@ in its store's backup namespaces, and no two entries land on the same object
 is not newer than this binary's newest migration, the backup applied no
 migration this binary does not carry (`database.MigrationVersions`; the
 refusal names the versions), and the key check value matches. All of it runs
-before anything changes. Migrations run out of order, so a database can hold
+before anything changes. The checksums are taken of private copies: after
+the manifest's MAC, `db.dump` and `blobs.tar` are copied into a new 0700
+directory (`TMPDIR`, as 0600 files) and hashed as they are written, after a
+check that their size plus 1 GB is free there. `pg_restore`, the archive
+checks, and the blob writes read only those copies, so a backup folder
+changed after the check changes nothing. The command removes them when it
+ends, failed or not. Migrations run out of order, so a database can hold
 a version below the binary's newest that the binary does not have, such as
 one from another branch's build; the newest-version check alone would let it
 through. A manifest written before `applied_migrations` existed is checked

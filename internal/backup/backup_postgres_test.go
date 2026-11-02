@@ -250,10 +250,7 @@ func TestBackupRestoreRoundTripDB(t *testing.T) {
 		t.Fatalf("backup result = %+v, want complete with warnings naming %s", result, seed.missingKey)
 	}
 
-	src, err := OpenSource(filepath.Join(root, "backups", serverID, result.ID))
-	if err != nil {
-		t.Fatal(err)
-	}
+	src := openTestSource(t, filepath.Join(root, "backups", serverID, result.ID))
 	into := createDatabase(t, pool, dsn)
 	blobsInto := t.TempDir()
 	loader := PGLoader{Tools: tools}
@@ -312,7 +309,7 @@ func TestBackupRestoreRoundTripDB(t *testing.T) {
 // refused before anything reads its objects.
 func checkManifestTampering(t *testing.T, src *Source, manifestKey []byte, keyCheck string) {
 	t.Helper()
-	path := filepath.Join(src.Dir, ManifestName)
+	path := filepath.Join(src.Folder(), ManifestName)
 	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
@@ -330,7 +327,7 @@ func checkManifestTampering(t *testing.T, src *Source, manifestKey []byte, keyCh
 	if err := os.WriteFile(path, changed, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	tampered, err := OpenSource(src.Dir)
+	tampered, err := OpenSource(src.Folder())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -964,4 +961,16 @@ func TestFullRestoresAreSerializedDB(t *testing.T) {
 	} else {
 		unlock(ctx)
 	}
+}
+
+// openTestSource opens a backup folder and removes its private copies when
+// the test ends.
+func openTestSource(t *testing.T, dir string) *Source {
+	t.Helper()
+	src, err := OpenSource(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = src.Close() })
+	return src
 }
