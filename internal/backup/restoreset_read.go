@@ -68,9 +68,7 @@ type RestoreSet struct {
 	// blobs maps each blob key in the archive to its extracted file, or to
 	// "" when the read did not extract.
 	blobs map[string]string
-	// archives maps a plugin id to its extracted archive file.
-	archives map[string]string
-	dir      string
+	dir   string
 	// metadataBytes estimates what the set holds in memory: its documents
 	// and blob keys, for the preview cache's bound.
 	metadataBytes int64
@@ -113,7 +111,7 @@ func ReadRestoreSet(ctx context.Context, r io.Reader, opts ReadOptions) (_ *Rest
 	digest := sha256.New()
 	counted := &countingReader{r: io.TeeReader(r, digest)}
 	tr := tar.NewReader(counted)
-	rs := &RestoreSet{blobs: map[string]string{}, archives: map[string]string{}}
+	rs := &RestoreSet{blobs: map[string]string{}}
 	if opts.ExtractDir != "" {
 		if rs.dir, err = os.MkdirTemp(opts.ExtractDir, "restore-set-"); err != nil {
 			return nil, err
@@ -382,12 +380,19 @@ func (p *restoreSetParser) archive(h *tar.Header, tr io.Reader, want FileDigest)
 	if h.Size > maxRestoreSetArchive {
 		return fmt.Errorf("%q is larger than %d bytes", h.Name, maxRestoreSetArchive)
 	}
-	target, err := p.extract("archive", h, tr, want.SHA256)
-	if err != nil {
-		return err
+	// A plugin's archive is checked against its digest and never kept: a
+	// restore never installs or runs a plugin from a backup (see
+	// plugins.ErrPluginNotInstalled), so nothing reads it.
+	sum := sha256.New()
+	n, err := io.Copy(sum, io.LimitReader(tr, h.Size))
+	switch {
+	case err != nil:
+		return fmt.Errorf("reading %q: %w", h.Name, err)
+	case n != h.Size:
+		return fmt.Errorf("%q is truncated", h.Name)
+	case hex.EncodeToString(sum.Sum(nil)) != want.SHA256:
+		return fmt.Errorf("%q does not match its digest", h.Name)
 	}
-	pluginID := path.Base(path.Dir(h.Name))
-	p.rs.archives[pluginID] = target
 	return nil
 }
 
@@ -951,13 +956,4 @@ func (rs *RestoreSet) blobFamily(key string) []string {
 	}
 	sort.Strings(out[1:])
 	return out
-}
-
-// pluginArchive reads an extracted plugin archive.
-func (rs *RestoreSet) pluginArchive(pluginID string) ([]byte, error) {
-	file, ok := rs.archives[pluginID]
-	if !ok || file == "" {
-		return nil, ErrNotFound
-	}
-	return os.ReadFile(file) //nolint:gosec // G304: a file this read created
 }

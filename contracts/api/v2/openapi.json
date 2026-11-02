@@ -4041,7 +4041,8 @@
               "template_not_available",
               "collection_not_mapped",
               "unreadable",
-              "files_missing_here"
+              "files_missing_here",
+              "needs_install"
             ],
             "type": "string"
           },
@@ -4280,7 +4281,8 @@
               "template_not_available",
               "collection_not_mapped",
               "unreadable",
-              "files_missing_here"
+              "files_missing_here",
+              "needs_install"
             ],
             "type": "string"
           },
