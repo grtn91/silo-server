@@ -38,6 +38,7 @@ const backupCommandUsage = `usage:
       Finish a replace that stopped, from silo-restore-<time>.journal in this directory.
   silo backup verify --from <backup> --scratch <database URL> [-env .env]
       Restore into an empty scratch database and check it against the manifest.
+  A --into or --scratch URL must not carry a password: set PGPASSWORD, or use ~/.pgpass.
 
 <backup> is a backup folder on this computer: the folder at the backup destination, or a
 downloaded copy of its objects`
@@ -142,8 +143,18 @@ func parseBackupRestoreFlags(args []string) (backupRestoreFlags, error) {
 		return f, errors.New("--blobs-into and --database-only exclude each other")
 	case strings.Contains(f.blobsInto, "://"):
 		return f, errors.New("--blobs-into must be a directory on this computer")
+	case f.into != "" && backup.HasPassword(f.into):
+		return f, passwordOnCommandLine("--into")
 	}
 	return f, nil
+}
+
+// passwordOnCommandLine refuses a database URL that carries its password in
+// a flag: any account on the host can read a running command's arguments.
+// PostgreSQL reads the password from PGPASSWORD or a password file instead.
+func passwordOnCommandLine(flagName string) error {
+	return fmt.Errorf("%s carries a database password, which other accounts on this computer can read from the process list; "+
+		"leave it out of the URL and set PGPASSWORD, or put it in ~/.pgpass (PGPASSFILE)", flagName)
 }
 
 // optionalCipher is the cipher of masterKey, or nil without one.
@@ -232,8 +243,27 @@ func runBackupRestore(ctx context.Context, args []string, out io.Writer) error {
 	}); err != nil {
 		return err
 	}
+	afterRedis = restoredRedisPlan(ctx, afterRedis, liveURL, cipher)
 	clearRedisAfterRestore(ctx, afterRedis, dialRedis, out)
 	return nil
+}
+
+// restoredRedisPlan reads the Redis the restored database names, which the
+// servers started on it will use; the live one was read before the swap
+// only to fall back on when this read fails. REDIS_URL, when set, wins
+// over both, as it does at startup.
+func restoredRedisPlan(ctx context.Context, plan redisPlan, liveURL string, cipher *secret.Cipher) redisPlan {
+	if plan.keep || os.Getenv("REDIS_URL") != "" {
+		return plan
+	}
+	readCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
+	cfg, err := liveConfigFromDatabase(readCtx, liveURL, cipher)
+	if err != nil {
+		return plan
+	}
+	plan.config, plan.readErr = liveRedisConfig(cfg), nil
+	return plan
 }
 
 // closeControl closes the control connection after the command's context
@@ -286,6 +316,9 @@ func runBackupVerify(ctx context.Context, args []string, out io.Writer) error {
 	scratch := flags.String("scratch", "", "empty scratch database URL")
 	if err := flags.Parse(args); err != nil || flags.NArg() != 0 || *from == "" || *scratch == "" {
 		return errors.New(backupCommandUsage)
+	}
+	if backup.HasPassword(*scratch) {
+		return passwordOnCommandLine("--scratch")
 	}
 	_ = godotenv.Load(*envFile)
 	// The drill runs anywhere: without SECRET_KEY it only cannot say whether

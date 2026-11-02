@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -143,6 +144,24 @@ func libpqTarget(databaseURL, dbname string) (conn string, env []string, err err
 		u.RawPath = ""
 	}
 	return u.String(), env, nil
+}
+
+// HasPassword reports whether a database URL or key=value DSN carries a
+// password. One that does not parse counts as carrying one.
+func HasPassword(databaseURL string) bool {
+	if !strings.Contains(databaseURL, "://") {
+		pairs, err := parseKeyValueDSN(databaseURL)
+		if err != nil {
+			return true
+		}
+		return slices.ContainsFunc(pairs, func(p dsnPair) bool { return p.key == "password" })
+	}
+	u, err := url.Parse(databaseURL)
+	if err != nil {
+		return true
+	}
+	_, inUser := u.User.Password()
+	return inUser || u.Query().Has("password")
 }
 
 // libpqKeyValueTarget is libpqTarget for a key=value DSN: it is rewritten

@@ -64,3 +64,20 @@ func TestLibpqTargetMovesThePasswordToTheEnvironment(t *testing.T) {
 		}
 	}
 }
+
+// A database URL with a password is refused on the command line, where
+// every account on the host can read it.
+func TestHasPassword(t *testing.T) {
+	for dsn, want := range map[string]bool{
+		"postgres://silo:pw@db/silo":          true,
+		"postgres://silo@db/silo?password=pw": true,
+		"postgres://silo@db/silo":             false,
+		"host=db user=silo password='p w'":    true,
+		"host=db user=silo dbname=silo":       false,
+		"host=db password='unterminated":      true,
+	} {
+		if got := HasPassword(dsn); got != want {
+			t.Errorf("HasPassword(%q) = %v, want %v", dsn, got, want)
+		}
+	}
+}
