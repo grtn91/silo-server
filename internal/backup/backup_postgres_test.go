@@ -126,6 +126,8 @@ func seedRoundTrip(t *testing.T, pool *pgxpool.Pool, settings *catalog.Encrypted
 	seed := roundTripSeed{secretKey: "s3.operational_token_secret", secretValue: "token-" + suffix, missingKey: "library-posters/" + suffix + "-gone.jpg"}
 	setSetting(t, pool, settings, seed.secretKey, seed.secretValue)
 	setSetting(t, pool, settings, "branding.mark_light_ref", suffix+".webp")
+	// A signing key, which no restore brings back (rotatedSettings).
+	setSetting(t, pool, settings, "auth.jwt_secret", "backup-jwt-"+suffix)
 	// The source's recorded stores, which a separate restore must not keep.
 	for _, key := range storageIdentities {
 		setSetting(t, pool, settings, key, "local|/elsewhere")
@@ -254,13 +256,17 @@ func TestBackupRestoreRoundTripDB(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Everything the manifest counts, less the storage identities and the
-	// API keys the restore cleared.
+	// Everything the manifest counts, less the storage identities, the
+	// signing keys, and the API keys the restore cleared.
+	var signingKeys int64
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM server_settings WHERE key = ANY($1)`, rotatedSettingKeys()).Scan(&signingKeys); err != nil {
+		t.Fatal(err)
+	}
 	want := slices.Clone(src.Manifest.Tables)
 	for i := range want {
 		switch want[i].Name {
 		case "server_settings":
-			want[i].Rows -= int64(len(storageIdentities))
+			want[i].Rows -= int64(len(storageIdentities)) + signingKeys
 		case "api_keys":
 			want[i].Rows = 0
 		}
@@ -502,8 +508,13 @@ func checkAnotherKey(t *testing.T, src *Source, loader PGLoader, pool *pgxpool.P
 	if err := restored.QueryRow(ctx, `SELECT count(*) FROM server_settings WHERE value LIKE 'enc:%'`).Scan(&left); err != nil {
 		t.Fatal(err)
 	}
-	if left != 0 || !strings.Contains(out.String(), secretKey) {
-		t.Fatalf("%d unreadable settings left; output %q does not name %s", left, out.String(), secretKey)
+	if left != len(rotatedSettings) || !strings.Contains(out.String(), secretKey) || strings.Contains(out.String(), "enter them again after Silo starts: auth.jwt_secret") {
+		t.Fatalf("%d encrypted settings left, want only the new signing keys; output %q must name %s and not the signing key", left, out.String(), secretKey)
+	}
+	// The signing key is a new one, encrypted with this server's key.
+	jwt, err := catalog.NewEncryptedSettingsRepo(catalog.NewServerSettingsRepo(restored), other).Get(ctx, "auth.jwt_secret")
+	if err != nil || jwt == "" || strings.HasPrefix(jwt, "backup-jwt-") {
+		t.Fatalf("restored signing key = %q, %v; want a new one", jwt, err)
 	}
 }
 

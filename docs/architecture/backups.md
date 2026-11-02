@@ -760,6 +760,20 @@ that holds a bearer secret or a public capability, each one way:
 names and fails on a table missing from the list, so a new credential
 table needs a decision before it ships.
 
+Sensitive settings (`catalog.SensitiveSettingKeys`) are classified the same
+way in `internal/backup/settings_secrets.go`. The signing keys Silo
+generates for the tokens it issues (`auth.jwt_secret`, which signs sessions,
+download and artwork links, backup object links, OAuth state, and cursors,
+and `audiobooks.abs.jwt_secret`) are replaced on every restore, swap or
+separate, before the lost-settings pass: a fresh random value written
+encrypted with this server's `SECRET_KEY`, bound to its key name as the
+settings store writes it, or, without a key, deleted so the server generates
+one when it starts. A key leaked and rotated after the backup therefore
+never signs again; every session ends with a restore anyway. The other
+sensitive settings are credentials for other services and are restored.
+`TestSensitiveSettingsAreClassified` fails on a sensitive setting in
+neither list.
+
 - A full restore (swap mode) keeps the live server's carried credentials as
   they are right before the swap. After verification, in the same step
   that clears unreadable settings, it reads them from the live database
