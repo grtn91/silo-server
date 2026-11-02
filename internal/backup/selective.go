@@ -57,6 +57,10 @@ const (
 	// ReasonUnreadable marks an entry the restore-set reader left out
 	// (RestoreSet.Unusable).
 	ReasonUnreadable = "unreadable"
+	// ReasonFilesMissingHere: an image this server already shows, whose
+	// files are missing from its storage; restoring writes them back and
+	// changes nothing else.
+	ReasonFilesMissingHere = "files_missing_here"
 )
 
 // Report outcomes.

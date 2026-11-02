@@ -544,7 +544,14 @@ admin chose since stays, and a re-run repairs a membership left ungrouped. Items
 are left out. Uploaded item and season artwork is published for the same
 content id, whose blob key is the same on every server, as an upload does,
 with the images lock. Branding assets write their blob and then their setting
-through the admin settings write path.
+through the admin settings write path. Item artwork or a branding asset this
+server already shows as the backup has it is the same only when its files
+(the artwork's stored family, the branding blob) are in the assets store,
+checked with `Stat`, eight at a time. When any is missing it differs
+(`files_missing_here`), and restoring it writes the missing files back with
+the exclusive create every restore uses and changes nothing else; the next
+preview finds it the same. Library posters and collection images of a library
+or collection matched here are not restored onto it, so they are not checked.
 
 ### Template collections
 

@@ -79,7 +79,7 @@ func (s *Service) ExecuteRestore(ctx context.Context, run RestoreRun) (any, erro
 		return fail(ErrDigestMismatch)
 	}
 
-	a := &applier{s: s, rs: rs, run: run, report: report, total: 1, staged: map[string]error{}}
+	a := &applier{s: s, rs: rs, run: run, report: report, total: 1, staged: map[string]error{}, filesWritten: map[string]bool{}}
 	for _, ids := range req.Selection {
 		a.total += len(ids)
 	}
@@ -145,6 +145,10 @@ type applier struct {
 	// objects, or why it could not; an item it did not write is absent,
 	// and applyArtwork never publishes one.
 	staged map[string]error
+	// filesWritten marks the artwork items stageArtwork wrote missing files
+	// back for: the catalog already showed them, so their transaction
+	// finds them the same and has nothing more to do.
+	filesWritten map[string]bool
 }
 
 // applied is one item's outcome before its transaction commits.

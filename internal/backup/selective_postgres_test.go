@@ -1,6 +1,7 @@
 package backup
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -361,6 +362,53 @@ func (f *selectiveFixture) pendingFollowUps(t *testing.T, ids []int) int {
 	return n
 }
 
+// checkMissingFilesRestored: item artwork the catalog still shows, whose
+// file is gone from storage, previews as differing; restoring it writes the
+// file back without touching the catalog, and the next preview finds it
+// the same.
+func (f *selectiveFixture) checkMissingFilesRestored(t *testing.T, seed selectiveSeed, backupID, artworkRef string) {
+	t.Helper()
+	ctx := t.Context()
+	body, _, err := f.store.Get(ctx, seed.artwork)
+	if err != nil {
+		t.Fatal(err)
+	}
+	original, err := io.ReadAll(body)
+	_ = body.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.Delete(ctx, []string{seed.artwork}); err != nil {
+		t.Fatal(err)
+	}
+	preview, err := f.svc.Preview(ctx, backupID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if item := previewItem(t, preview, SectionCollections, artworkRef); item.Status != ItemDiffers || !item.Selectable || item.Reason != ReasonFilesMissingHere {
+		t.Fatalf("artwork whose file is gone = %+v, want differing with %s", item, ReasonFilesMissingHere)
+	}
+	report, err := f.restore(t, backupID, preview.Digest, map[string][]string{SectionCollections: {artworkRef}}, &testFence{pool: f.pool})
+	if err != nil || reportOutcomes(report)[SectionCollections+":"+artworkRef] != OutcomeRestored {
+		t.Fatalf("restoring the missing file = %v (%+v)", err, report.Items)
+	}
+	body, _, err = f.store.Get(ctx, seed.artwork)
+	if err != nil {
+		t.Fatalf("the file was not written back: %v", err)
+	}
+	restored, _ := io.ReadAll(body)
+	_ = body.Close()
+	if !bytes.Equal(restored, original) {
+		t.Fatal("the file written back differs from the backup's")
+	}
+	if preview, err = f.svc.Preview(ctx, backupID); err != nil {
+		t.Fatal(err)
+	}
+	if item := previewItem(t, preview, SectionCollections, artworkRef); item.Status != ItemOnThisServer || item.Reason != ReasonSame {
+		t.Fatalf("artwork after its file came back = %+v, want the same", item)
+	}
+}
+
 // checkConflictingBlob restores the item artwork while another object
 // already sits at its key: the item fails, the object and the item are left
 // as they were, and nothing else is affected.
@@ -441,6 +489,7 @@ func TestSelectiveRestoreDB(t *testing.T) {
 			t.Fatalf("%s %s before the loss = %+v, want on this server", c.section, c.id, item)
 		}
 	}
+	f.checkMissingFilesRestored(t, seed, source.ID, artworkRef)
 	f.lose(t, seed)
 	if preview, err = f.svc.Preview(ctx, source.ID); err != nil {
 		t.Fatal(err)

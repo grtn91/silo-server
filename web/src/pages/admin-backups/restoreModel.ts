@@ -35,6 +35,7 @@ export const REASON_SENTENCES: Record<RestoreReason, string> = {
   collection_not_mapped:
     "The collection it shows isn't on this server or in the backup, so there's nothing for it to show.",
   unreadable: "The backup's copy of it can't be read, so it was left out.",
+  files_missing_here: "Its files are missing on this server. Restoring writes them back.",
 };
 
 export const SECTION_TITLES: Record<RestoreSectionId, string> = {

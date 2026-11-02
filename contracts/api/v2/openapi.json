@@ -4040,7 +4040,8 @@
               "changed_since_preview",
               "template_not_available",
               "collection_not_mapped",
-              "unreadable"
+              "unreadable",
+              "files_missing_here"
             ],
             "type": "string"
           },
@@ -4278,7 +4279,8 @@
               "changed_since_preview",
               "template_not_available",
               "collection_not_mapped",
-              "unreadable"
+              "unreadable",
+              "files_missing_here"
             ],
             "type": "string"
           },
