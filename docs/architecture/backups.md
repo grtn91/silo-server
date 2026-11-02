@@ -393,7 +393,10 @@ table needs a decision before it ships.
   applied), or, for a profile both sides have, a restriction lifted or
   loosened (child profile, rating or advisory-age ceiling, library
   restriction). Changing an account's role deletes its keys for the same
-  reason. The command
+  reason. An invitation or invite code is also dropped when the account it
+  would create gets a wider effective policy under the restored data than
+  live: its role and libraries applied to its access group, or the default
+  group when it names none, as account creation resolves them. The command
   counts what it kept per kind and lists what it dropped by id and label,
   never key material. Identity sequences move past the ids written. Live rows are
   encrypted with this server's key, so they stay readable after

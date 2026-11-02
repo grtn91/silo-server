@@ -374,6 +374,49 @@ func checkCredentials(t *testing.T, loader PGLoader, pool *pgxpool.Pool, dsn, in
 		t.Fatalf("next restored key id %d (%v), want above %d", next, err, keptID)
 	}
 	checkCarryAuthority(t, loader, pool, dsn, into, restored, userID, keptID, liveKeys)
+	checkCarryInvitation(t, loader, pool, dsn, into, restored, "invite-"+suffix)
+}
+
+// checkCarryInvitation: a pending invitation is dropped when the account it
+// would create gets more under the restored data than live (its default
+// group allowed downloads in the backup and does not now), and kept when
+// the policies match.
+func checkCarryInvitation(t *testing.T, loader PGLoader, pool *pgxpool.Pool, dsn, into string, restored *pgxpool.Pool, tokenHash string) {
+	t.Helper()
+	ctx := t.Context()
+	var id int64
+	var allowed bool
+	if err := pool.QueryRow(ctx, `SELECT i.id, g.download_allowed FROM invitations i, access_groups g WHERE i.token_hash = $1 AND g.is_default`, tokenHash).Scan(&id, &allowed); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), `UPDATE access_groups SET download_allowed = $1 WHERE is_default`, allowed)
+	})
+	setDownloads := func(db *pgxpool.Pool, allow bool) {
+		t.Helper()
+		if _, err := db.Exec(ctx, `UPDATE access_groups SET download_allowed = $1 WHERE is_default`, allow); err != nil {
+			t.Fatal(err)
+		}
+	}
+	invited := func() int {
+		t.Helper()
+		var n int
+		if err := restored.QueryRow(ctx, `SELECT count(*) FROM invitations WHERE token_hash = $1`, tokenHash).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	setDownloads(pool, false)
+	setDownloads(restored, true)
+	carried, err := loader.CarryCredentials(ctx, into, dsn)
+	want := fmt.Sprintf("invitation %d", id)
+	if err != nil || !slices.Contains(carried.Dropped, want) || invited() != 0 {
+		t.Fatalf("carried %+v (%v), want %q dropped: its group allowed downloads in the backup", carried, err, want)
+	}
+	setDownloads(restored, false)
+	if carried, err = loader.CarryCredentials(ctx, into, dsn); err != nil || slices.Contains(carried.Dropped, want) || invited() != 1 {
+		t.Fatalf("carried %+v (%v), want the invitation kept under the same policy", carried, err)
+	}
 }
 
 // checkCarryAuthority: a live key is dropped when its account has more
