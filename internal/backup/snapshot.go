@@ -9,6 +9,7 @@ import (
 
 	"github.com/Silo-Server/silo-server/internal/branding"
 	"github.com/Silo-Server/silo-server/internal/metadata"
+	"github.com/Silo-Server/silo-server/internal/subtitles"
 )
 
 // Store names inside blobs.tar. Avatars live in the operational store; every
@@ -27,8 +28,10 @@ var inventoryTables = []string{
 }
 
 const (
-	tableLibraryCollections = "library_collections"
-	tableUserProfiles       = "user_profiles"
+	tableLibraryCollections  = "library_collections"
+	tableUserProfiles        = "user_profiles"
+	tableDownloadedSubtitles = "downloaded_subtitles"
+	tableAPIKeys             = "api_keys"
 )
 
 // sourceLibraryPoster names what references a library poster blob.
@@ -189,9 +192,14 @@ func referencedBlobs(ctx context.Context, q queryer, includeSubtitles bool) ([]b
 		query{table: "user_profiles", source: "profile avatar", store: storeOperational, ladder: true,
 			sql: `SELECT DISTINCT substr(avatar, 8) FROM public.user_profiles WHERE avatar LIKE 'upload:%' AND avatar NOT LIKE 'upload:%://%' AND length(avatar) > 7`},
 	)
+	// Uploaded subtitles cannot be fetched again, so they are always kept;
+	// the setting covers only the ones a provider can download again.
+	uploaded := fmt.Sprintf("provider = '%s'", subtitles.ProviderUpload)
+	queries = append(queries, query{table: tableDownloadedSubtitles, source: "uploaded subtitle", store: storeAssets,
+		sql: `SELECT DISTINCT s3_key FROM public.downloaded_subtitles WHERE ` + uploaded + ` AND ` + cached("s3_key")})
 	if includeSubtitles {
-		queries = append(queries, query{table: "downloaded_subtitles", source: "downloaded subtitle", store: storeAssets,
-			sql: `SELECT DISTINCT s3_key FROM public.downloaded_subtitles WHERE ` + cached("s3_key")})
+		queries = append(queries, query{table: tableDownloadedSubtitles, source: "downloaded subtitle", store: storeAssets,
+			sql: `SELECT DISTINCT s3_key FROM public.downloaded_subtitles WHERE NOT (` + uploaded + `) AND ` + cached("s3_key")})
 	}
 	for _, qy := range queries {
 		present, err := tableExists(ctx, q, qy.table)

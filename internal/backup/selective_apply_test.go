@@ -189,12 +189,12 @@ func TestQueuedRestoreKeepsItsSource(t *testing.T) {
 			mu.Unlock()
 			return &models.AdminJob{ID: "job"}, nil
 		},
-		ActiveRestore: func(context.Context) (*RestoreRequest, error) {
-			mu.Lock()
-			defer mu.Unlock()
-			return queued, activeErr
-		},
 	})
+	svc.opts.ActiveRestore = func(context.Context) (*RestoreRequest, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		return queued, activeErr
+	}
 	req := RestoreRequest{BackupID: source, Digest: digest, Selection: map[string][]string{SectionSettings: {pageAppearance}}}
 
 	// Another operation holds the lock: nothing is queued.
@@ -240,6 +240,13 @@ func TestQueuedRestoreKeepsItsSource(t *testing.T) {
 	if err := svc.Delete(ctx, source); err == nil || errors.Is(err, ErrBackupInUse) {
 		t.Fatalf("delete without the queue = %v", err)
 	}
+	// Nor when the service has no way to read it.
+	active := svc.opts.ActiveRestore
+	svc.opts.ActiveRestore = nil
+	if rotated, _, warnings := svc.rotate(ctx, tgt, "server", nil); len(rotated) != 0 || len(warnings) != 1 {
+		t.Fatalf("rotation without a queue reader = %v, %v", rotated, warnings)
+	}
+	svc.opts.ActiveRestore = active
 	activeErr, queued = nil, nil
 	if err := svc.Delete(ctx, source); err != nil {
 		t.Fatalf("deleting a backup no restore reads = %v", err)

@@ -4,10 +4,13 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"maps"
 	"slices"
 	"strings"
 
 	"github.com/jackc/pgx/v5"
+
+	"github.com/Silo-Server/silo-server/internal/access"
 )
 
 // secretHandling is what a backup and a restore do with a table holding a
@@ -54,8 +57,12 @@ type carrySpec struct {
 	// are the restored history.
 	credential string
 	// owned is true, over the live row r, when everything it belongs to
-	// exists in the restored data.
+	// exists in the restored data and its accounts keep their credentials
+	// (ownerCarried).
 	owned string
+	// owners are the columns naming the accounts a row belongs to, which
+	// ownerCarried checks.
+	owners []string
 	// describe names a dropped row, over r, without any key material.
 	describe string
 }
@@ -66,27 +73,25 @@ const everyRow = "true"
 // columnUserID is the owner column of several carried tables.
 const columnUserID = "user_id"
 
-// ownerNotElevated is the SQL condition, over the live row r, that the
-// account in column exists in the restored data with no more authority than
-// it has on the live server (liveAuthority): a higher role (the Owner over
-// admin over user), enabled where it is disabled now, break-glass access,
-// or a permission it lacks now. A live credential of an account demoted
-// since the backup would otherwise carry the snapshot's authority; changing
-// an account's role deletes its keys for the same reason.
-func ownerNotElevated(column string) string {
-	return `EXISTS (SELECT 1 FROM users u JOIN live_authority l ON l.id = u.id
-		WHERE u.id = r.` + column + `
-		  AND (CASE WHEN u.is_owner THEN 2 WHEN u.role = 'admin' THEN 1 ELSE 0 END) <= l.rank
-		  AND (NOT u.enabled OR l.enabled) AND (NOT u.break_glass OR l.break_glass)
-		  AND u.permissions <@ l.permissions)`
+// ownerCarried is the SQL condition, over the live row r, that the account
+// in column may keep its live credentials (carried_owners): it exists in the
+// restored data with no more authority there than on the live server
+// (accountAuthority.widerThan). A live credential of an account demoted since
+// the backup would otherwise carry the snapshot's authority; changing an
+// account's role deletes its keys for the same reason.
+func ownerCarried(column string) string {
+	return `EXISTS (SELECT 1 FROM carried_owners o WHERE o.id = r.` + column + `)`
 }
 
-// liveAuthority reads, on the live server, what ownerNotElevated compares.
-const liveAuthority = `SELECT coalesce(json_agg(json_build_object('id', id,
-	'rank', CASE WHEN is_owner THEN 2 WHEN role = 'admin' THEN 1 ELSE 0 END,
-	'enabled', enabled, 'break_glass', break_glass, 'permissions', permissions)), '[]')::text FROM users`
+// grantCarried is the SQL condition, over the live row r of table, that the
+// account it would create gets no wider a policy under the restored data
+// than live (carried_grants): an invitation's or invite code's access group
+// may have granted more when the backup was taken.
+func grantCarried(table string) string {
+	return `EXISTS (SELECT 1 FROM carried_grants g WHERE g.tbl = '` + table + `' AND g.id = r.id)`
+}
 
-// SQL conditions over the live row r, shared by several carried tables.
+// Reasons shared by several secretTables entries.
 const (
 	outboundOnly  = "outbound: what Silo presents to another service, not a credential for Silo"
 	workerLease   = "a worker's lease or claim on a job, not a credential"
@@ -121,19 +126,22 @@ var secretTables = []secretTable{
 	{name: "watch_together_votes", handling: secretLeftOut, why: watchTogether},
 	{name: "backup_status", handling: secretLeftOut, why: "describes the backup being taken, which would read as a stale run after a restore"},
 
-	{name: "api_keys", handling: secretCarried, why: "API keys", carry: &carrySpec{
-		key: "id", same: []string{"id", columnUserID, "key_hash", "key_prefix"}, credential: everyRow, owned: ownerNotElevated(columnUserID),
+	{name: tableAPIKeys, handling: secretCarried, why: "API keys", carry: &carrySpec{
+		key: "id", same: []string{"id", columnUserID, "key_hash", "key_prefix"}, credential: everyRow,
+		owned: ownerCarried(columnUserID), owners: []string{columnUserID},
 		describe: `format('API key %s %L (account %s)', r.id, r.label, r.user_id)`,
 	}},
 	{name: "invitations", handling: secretCarried, why: "pending invitations", carry: &carrySpec{
 		key: "id", same: []string{"id", "token_hash"}, credential: `t.accepted_at IS NULL AND t.revoked_at IS NULL`,
-		owned: `(r.invited_by IS NULL OR ` + ownerNotElevated("invited_by") + `)
+		owners: []string{"invited_by"},
+		owned: `(r.invited_by IS NULL OR ` + ownerCarried("invited_by") + `) AND ` + grantCarried("invitations") + `
 			AND (r.access_group_id IS NULL OR EXISTS (SELECT 1 FROM access_groups g WHERE g.id = r.access_group_id))`,
 		describe: `format('invitation %s', r.id)`,
 	}},
 	{name: "invite_codes", handling: secretCarried, why: "invite codes", carry: &carrySpec{
 		key: "id", same: []string{"id", "code"}, credential: everyRow,
-		owned:    `r.created_by IS NULL OR ` + ownerNotElevated("created_by"),
+		owners:   []string{"created_by"},
+		owned:    `(r.created_by IS NULL OR ` + ownerCarried("created_by") + `) AND ` + grantCarried("invite_codes"),
 		describe: `format('invite code %s %L', r.id, r.label)`,
 	}},
 	{name: "autoscan_webhook_endpoints", handling: secretCarried, why: "autoscan webhook tokens", carry: &carrySpec{
@@ -143,14 +151,16 @@ var secretTables = []secretTable{
 	}},
 	{name: "abs_rss_feeds", handling: secretCarried, why: "audiobook RSS feed links", carry: &carrySpec{
 		key: "id", same: []string{"id", columnUserID, "slug"}, credential: everyRow,
-		owned: ownerNotElevated(columnUserID) + `
+		owners: []string{columnUserID},
+		owned: ownerCarried(columnUserID) + `
 			AND EXISTS (SELECT 1 FROM media_items m WHERE m.content_id = r.library_item_id)
 			AND (r.profile_id IS NULL OR EXISTS (SELECT 1 FROM user_profiles p WHERE p.id = r.profile_id::text))`,
 		describe: `format('RSS feed %s (account %s)', r.id, r.user_id)`,
 	}},
 	{name: "webhook_sync_connections", handling: secretCarried, why: "Plex and Jellyfin webhook sync secrets", carry: &carrySpec{
 		key: "id", same: []string{"id", columnUserID, "webhook_secret"}, credential: everyRow,
-		owned: ownerNotElevated(columnUserID) + `
+		owners: []string{columnUserID},
+		owned: ownerCarried(columnUserID) + `
 			AND (r.default_profile_id = '' OR EXISTS (SELECT 1 FROM user_profiles p WHERE p.id = r.default_profile_id))`,
 		describe: `format('webhook sync connection %s %L (account %s)', r.id, r.server_name, r.user_id)`,
 	}},
@@ -256,13 +266,14 @@ func carryCredentials(ctx context.Context, loader DatabaseLoader, dbURL, liveURL
 // transaction.
 func (l PGLoader) CarryCredentials(ctx context.Context, dbURL, liveURL string) (CarriedCredentials, error) {
 	tables := secretTablesHandled(secretCarried)
-	// The live rows of each table, then the live accounts' authority.
-	live := make([]string, len(tables)+1)
+	live := make([]string, len(tables))
 	for i := range live {
 		live[i] = "[]"
 	}
+	var liveState liveCredentials
 	if liveURL != "" {
-		if err := readLiveCredentials(ctx, liveURL, tables, live); err != nil {
+		var err error
+		if liveState, err = readLiveCredentials(ctx, liveURL, tables, live); err != nil {
 			return CarriedCredentials{}, fmt.Errorf("reading the live server's credentials: %w", err)
 		}
 	}
@@ -273,11 +284,11 @@ func (l PGLoader) CarryCredentials(ctx context.Context, dbURL, liveURL string) (
 	defer func() { _ = conn.Close(context.WithoutCancel(ctx)) }()
 	result := CarriedCredentials{Kept: map[string]int{}}
 	err = pgx.BeginFunc(ctx, conn, func(tx pgx.Tx) error {
-		if _, err := tx.Exec(ctx, `
-			CREATE TEMP TABLE live_authority ON COMMIT DROP AS
-			SELECT * FROM json_to_recordset($1::json) AS a(id bigint, rank int, enabled boolean, break_glass boolean, permissions text[])`,
-			live[len(tables)]); err != nil {
-			return fmt.Errorf("reading the live accounts' authority: %w", err)
+		if err := carriedOwners(ctx, tx, liveState.authority); err != nil {
+			return err
+		}
+		if err := carriedGrants(ctx, tx, tables, live, liveState.grants); err != nil {
+			return err
 		}
 		for i, table := range tables {
 			if err := table.carryInto(ctx, tx, live[i], &result); err != nil {
@@ -289,23 +300,79 @@ func (l PGLoader) CarryCredentials(ctx context.Context, dbURL, liveURL string) (
 	return result, err
 }
 
-// readLiveCredentials reads each credential table of liveURL as one JSON
-// array, and last the accounts' authority (liveAuthority), in one snapshot.
-func readLiveCredentials(ctx context.Context, liveURL string, tables []secretTable, into []string) error {
-	conn, err := pgx.Connect(ctx, liveURL)
+// carriedOwners writes carried_owners, the accounts whose live credentials
+// the restored database keeps: those in it with no more authority there
+// than live.
+func carriedOwners(ctx context.Context, tx pgx.Tx, live map[int]accountAuthority) error {
+	ids := slices.Sorted(maps.Keys(live))
+	restored, err := readAuthority(ctx, tx, ids)
 	if err != nil {
 		return err
 	}
+	var kept []int
+	for _, id := range ids {
+		if r, ok := restored[id]; ok && !r.widerThan(live[id]) {
+			kept = append(kept, id)
+		}
+	}
+	_, err = tx.Exec(ctx, `CREATE TEMP TABLE carried_owners ON COMMIT DROP AS SELECT unnest($1::bigint[]) AS id`, kept)
+	return err
+}
+
+// carriedGrants writes carried_grants, the carried rows that grant an
+// account no wider a policy under the restored data than live.
+func carriedGrants(ctx context.Context, tx pgx.Tx, tables []secretTable, live []string, livePolicies map[grantKey]access.EffectiveUserPolicy) error {
+	restored, err := inviteePolicies(ctx, tx, tables, live)
+	if err != nil {
+		return err
+	}
+	var names []string
+	var ids []int64
+	for key, policy := range restored {
+		if l, ok := livePolicies[key]; ok && len(access.WiderThan(policy, l)) == 0 {
+			names, ids = append(names, key.table), append(ids, key.id)
+		}
+	}
+	_, err = tx.Exec(ctx, `CREATE TEMP TABLE carried_grants ON COMMIT DROP AS
+		SELECT * FROM unnest($1::text[], $2::bigint[]) AS g(tbl, id)`, names, ids)
+	return err
+}
+
+// liveCredentials is what readLiveCredentials reads besides the rows: the
+// authority of the accounts they belong to, and the policy each row that
+// grants an account would give it.
+type liveCredentials struct {
+	authority map[int]accountAuthority
+	grants    map[grantKey]access.EffectiveUserPolicy
+}
+
+// readLiveCredentials reads each credential table of liveURL as one JSON
+// array, and liveCredentials, in one snapshot.
+func readLiveCredentials(ctx context.Context, liveURL string, tables []secretTable, into []string) (liveCredentials, error) {
+	var state liveCredentials
+	conn, err := pgx.Connect(ctx, liveURL)
+	if err != nil {
+		return state, err
+	}
 	defer func() { _ = conn.Close(context.WithoutCancel(ctx)) }()
-	return pgx.BeginTxFunc(ctx, conn, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly}, func(tx pgx.Tx) error {
+	err = pgx.BeginTxFunc(ctx, conn, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly}, func(tx pgx.Tx) error {
 		for i, table := range tables {
 			sql := fmt.Sprintf(`SELECT coalesce(json_agg(t), '[]')::text FROM %s t WHERE %s`, table.name, table.carry.credential)
 			if err := tx.QueryRow(ctx, sql).Scan(&into[i]); err != nil {
 				return fmt.Errorf("%s: %w", table.name, err)
 			}
 		}
-		return tx.QueryRow(ctx, liveAuthority).Scan(&into[len(tables)])
+		owners, err := credentialOwners(tables, into)
+		if err != nil {
+			return err
+		}
+		if state.authority, err = readAuthority(ctx, tx, owners); err != nil {
+			return err
+		}
+		state.grants, err = inviteePolicies(ctx, tx, tables, into)
+		return err
 	})
+	return state, err
 }
 
 // carry runs in the restored database: it deletes the restored credentials

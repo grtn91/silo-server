@@ -152,7 +152,15 @@ Blob keys come from the snapshot's references, never from listing the store:
 | Library posters (`media_folders.poster_path`) | assets |
 | Branding assets (`branding.*_ref` settings, `branding.AssetObjectKey`) | assets |
 | Uploaded profile avatars (`user_profiles.avatar` starting `upload:`) | operational |
-| Downloaded subtitles (`downloaded_subtitles.s3_key`), unless `backup.include_subtitles` is off | assets |
+| Uploaded subtitles (`downloaded_subtitles.s3_key` with provider `upload`), always: they cannot be fetched again | assets |
+| Downloaded subtitles (`downloaded_subtitles.s3_key` from a provider), unless `backup.include_subtitles` is off | assets |
+
+A backup taken with `backup.include_subtitles` off still dumps every
+`downloaded_subtitles` row. A full restore deletes the provider rows whose
+object is not in the storage the restored server uses (in separate mode,
+all of them), so players do not list tracks with no content; Silo downloads
+them again when they are chosen. Storing a subtitle whose row exists but
+whose object is gone writes the object back under the row.
 
 For an artwork original (`.../original[.<revision>].<ext>`) the copy also
 takes the stored variants of the same revision in its directory. Only the
@@ -316,8 +324,10 @@ away copies the admin meant to keep.
   run, so no other rotation, sweep, or delete runs, and the rotation of its
   own before-restore backup is told to keep the source. A queued restore is
   read from the job queue under the lock rotation holds, the lock restores
-  are queued under ([The restore job](#the-restore-job)); when the queue
-  cannot be read, rotation deletes nothing and warns.
+  are queued under ([The restore job](#the-restore-job)); the service reads
+  it from `admin_jobs` itself, wired when it is built, so nothing that
+  starts before the API router can rotate without it. When the queue cannot
+  be read, rotation deletes nothing and warns.
 - Deleting a backup takes the same lock and refuses (409) while a queued or
   running restore reads it.
 - A delete that fails leaves a warning in the task result.
@@ -1022,8 +1032,16 @@ table needs a decision before it ships.
   restored data is dropped, and so is one whose account (owner, inviter, or
   creator) has more authority in the restored data than on the live server:
   a higher role (the Owner over admin over user), enabled where it is
-  disabled now, break-glass access, or a permission it lacks now. Changing
-  an account's role deletes its keys for the same reason. The command
+  disabled now, break-glass access, an effective account policy wider in
+  any field (`access.WiderThan`: libraries, quality, stream and transcode
+  caps, profiles, downloads, requests, permissions, with access groups
+  applied), or, for a profile both sides have, a restriction lifted or
+  loosened (child profile, rating or advisory-age ceiling, library
+  restriction). Changing an account's role deletes its keys for the same
+  reason. An invitation or invite code is also dropped when the account it
+  would create gets a wider effective policy under the restored data than
+  live: its role and libraries applied to its access group, or the default
+  group when it names none, as account creation resolves them. The command
   counts what it kept per kind and lists what it dropped by id and label,
   never key material. Identity sequences move past the ids written. Live rows are
   encrypted with this server's key, so they stay readable after

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"slices"
@@ -21,6 +22,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/backup/backuptest"
 	"github.com/Silo-Server/silo-server/internal/blobstore"
 	"github.com/Silo-Server/silo-server/internal/catalog"
+	"github.com/Silo-Server/silo-server/internal/config"
 	"github.com/Silo-Server/silo-server/internal/secret"
 )
 
@@ -109,6 +111,8 @@ type roundTripSeed struct {
 	missingKey             string
 	blobs                  map[string][]byte
 	userID                 int64
+	// leftOut is a stored blob the backup must not copy.
+	leftOut string
 }
 
 // seedRoundTrip writes an encrypted setting, recorded storage identities, a
@@ -154,8 +158,25 @@ func seedRoundTrip(t *testing.T, pool *pgxpool.Pool, settings *catalog.Encrypted
 	exec(`INSERT INTO api_keys (user_id, label, key_hash) VALUES ($1, 'in backup', encode(sha256(convert_to($2, 'UTF8')), 'hex'))`, userID, "in-backup-"+suffix)
 	seed.userID = userID
 	t.Cleanup(func() { _, _ = pool.Exec(context.Background(), `DELETE FROM user_profiles WHERE id = $1`, profileID) })
+	// An uploaded subtitle, which the backup keeps with
+	// backup.include_subtitles off, and a provider's, which it leaves out.
+	setSetting(t, pool, settings, config.BackupIncludeSubtitlesSettingKey, "false")
+	uploadedSub, providerSub := "subtitles/"+suffix+"-upload.srt", "subtitles/"+suffix+"-provider.srt"
+	exec(`INSERT INTO media_items (content_id, type, title) VALUES ($1, 'movie', 'Backup subtitles')`, "backup-test-"+suffix)
+	exec(`INSERT INTO media_files (id, media_folder_id, file_path, content_id) VALUES ($1, $2, $3, $4)`,
+		folderID, folderID, "/backup-test/"+suffix+".mkv", "backup-test-"+suffix)
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), `DELETE FROM media_items WHERE content_id = $1`, "backup-test-"+suffix)
+	})
+	exec(`INSERT INTO downloaded_subtitles (media_file_id, provider, language, format, s3_key) VALUES ($1, 'upload', 'en', 'srt', $2), ($1, 'opensubtitles', 'en', 'srt', $3)`,
+		folderID, uploadedSub, providerSub)
+	if err := store.Put(ctx, providerSub, []byte("provider "+suffix)); err != nil {
+		t.Fatal(err)
+	}
+	seed.leftOut = providerSub
 	seed.blobs = map[string][]byte{
-		posterKey: []byte("poster " + suffix),
+		uploadedSub: []byte("uploaded subtitle " + suffix),
+		posterKey:   []byte("poster " + suffix),
 		"branding/mark-light/" + suffix + ".webp": []byte("mark " + suffix),
 		avatarKey: []byte("avatar " + suffix),
 		"profile-avatars/" + profileID + "/w256.webp": []byte("avatar display " + suffix),
@@ -250,17 +271,12 @@ func TestBackupRestoreRoundTripDB(t *testing.T) {
 	if len(src.Manifest.AppliedMigrations) == 0 || !slices.Equal(in.Applied, src.Manifest.AppliedMigrations) {
 		t.Fatalf("restored applied migrations %v, manifest %v", in.Applied, src.Manifest.AppliedMigrations)
 	}
-	for key, want := range seed.blobs {
-		got, err := os.ReadFile(filepath.Join(blobsInto, filepath.FromSlash(key)))
-		if err != nil || !bytes.Equal(got, want) {
-			t.Fatalf("restored blob %s = %q, %v; want %q", key, got, err, want)
-		}
-	}
 	restoredPool, err := pgxpool.New(ctx, into)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer restoredPool.Close()
+	checkRestoredFiles(t, seed, blobsInto, restoredPool)
 	checkCredentials(t, loader, pool, dsn, into, restoredPool, seed.userID)
 	restoredSettings := catalog.NewEncryptedSettingsRepo(catalog.NewServerSettingsRepo(restoredPool), cipher)
 	if got, err := restoredSettings.Get(ctx, seed.secretKey); err != nil || got != seed.secretValue {
@@ -271,6 +287,25 @@ func TestBackupRestoreRoundTripDB(t *testing.T) {
 		t.Fatalf("verify into a used database = %v, want refusal", err)
 	}
 	checkAnotherKey(t, src, loader, pool, dsn, seed.secretKey)
+}
+
+// checkRestoredFiles: every blob the backup holds is restored, and a
+// provider subtitle the setting left out is neither restored nor listed.
+func checkRestoredFiles(t *testing.T, seed roundTripSeed, blobsInto string, restored *pgxpool.Pool) {
+	t.Helper()
+	for key, want := range seed.blobs {
+		got, err := os.ReadFile(filepath.Join(blobsInto, filepath.FromSlash(key)))
+		if err != nil || !bytes.Equal(got, want) {
+			t.Fatalf("restored blob %s = %q, %v; want %q", key, got, err, want)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(blobsInto, filepath.FromSlash(seed.leftOut))); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("restored %s, a provider subtitle the setting leaves out (%v)", seed.leftOut, err)
+	}
+	var omitted int
+	if err := restored.QueryRow(t.Context(), `SELECT count(*) FROM downloaded_subtitles WHERE s3_key = $1`, seed.leftOut).Scan(&omitted); err != nil || omitted != 0 {
+		t.Fatalf("restored %d rows of the subtitle the backup left out (%v), want none", omitted, err)
+	}
 }
 
 // checkCredentials: a restore brings back no sign-in session. A full
@@ -338,12 +373,65 @@ func checkCredentials(t *testing.T, loader PGLoader, pool *pgxpool.Pool, dsn, in
 	if err := restored.QueryRow(ctx, `INSERT INTO api_keys (user_id, label, key_hash) VALUES ($1, 'next', encode(sha256(convert_to($2, 'UTF8')), 'hex')) RETURNING id`, userID, "next-"+suffix).Scan(&next); err != nil || next <= keptID {
 		t.Fatalf("next restored key id %d (%v), want above %d", next, err, keptID)
 	}
+	checkCarryAuthority(t, loader, pool, dsn, into, restored, userID, keptID, liveKeys)
+	checkCarryInvitation(t, loader, pool, dsn, into, restored, "invite-"+suffix)
+}
+
+// checkCarryInvitation: a pending invitation is dropped when the account it
+// would create gets more under the restored data than live (its default
+// group allowed downloads in the backup and does not now), and kept when
+// the policies match.
+func checkCarryInvitation(t *testing.T, loader PGLoader, pool *pgxpool.Pool, dsn, into string, restored *pgxpool.Pool, tokenHash string) {
+	t.Helper()
+	ctx := t.Context()
+	var id int64
+	var allowed bool
+	if err := pool.QueryRow(ctx, `SELECT i.id, g.download_allowed FROM invitations i, access_groups g WHERE i.token_hash = $1 AND g.is_default`, tokenHash).Scan(&id, &allowed); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), `UPDATE access_groups SET download_allowed = $1 WHERE is_default`, allowed)
+	})
+	setDownloads := func(db *pgxpool.Pool, allow bool) {
+		t.Helper()
+		if _, err := db.Exec(ctx, `UPDATE access_groups SET download_allowed = $1 WHERE is_default`, allow); err != nil {
+			t.Fatal(err)
+		}
+	}
+	invited := func() int {
+		t.Helper()
+		var n int
+		if err := restored.QueryRow(ctx, `SELECT count(*) FROM invitations WHERE token_hash = $1`, tokenHash).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	setDownloads(pool, false)
+	setDownloads(restored, true)
+	carried, err := loader.CarryCredentials(ctx, into, dsn)
+	want := fmt.Sprintf("invitation %d", id)
+	if err != nil || !slices.Contains(carried.Dropped, want) || invited() != 0 {
+		t.Fatalf("carried %+v (%v), want %q dropped: its group allowed downloads in the backup", carried, err, want)
+	}
+	setDownloads(restored, false)
+	if carried, err = loader.CarryCredentials(ctx, into, dsn); err != nil || slices.Contains(carried.Dropped, want) || invited() != 1 {
+		t.Fatalf("carried %+v (%v), want the invitation kept under the same policy", carried, err)
+	}
+}
+
+// checkCarryAuthority: a live key is dropped when its account has more
+// authority in the restored data than live (an admin there, or every
+// library there and one here), and kept when the policies match.
+func checkCarryAuthority(t *testing.T, loader PGLoader, pool *pgxpool.Pool, dsn, into string, restored *pgxpool.Pool, userID, keptID int64, liveKeys int) {
+	t.Helper()
+	ctx := t.Context()
 	// An account that was an admin in the backup and is a user here: its
 	// live key would carry admin authority, so it is dropped.
 	if _, err := restored.Exec(ctx, `UPDATE users SET role = 'admin' WHERE id = $1`, userID); err != nil {
 		t.Fatal(err)
 	}
-	if carried, err = loader.CarryCredentials(ctx, into, dsn); err != nil {
+	carried, err := loader.CarryCredentials(ctx, into, dsn)
+	if err != nil {
 		t.Fatal(err)
 	}
 	demoted := fmt.Sprintf("API key %d 'after backup' (account %d)", keptID, userID)
@@ -353,6 +441,32 @@ func checkCredentials(t *testing.T, loader PGLoader, pool *pgxpool.Pool, dsn, in
 	}
 	if carried.Kept["api_keys"] != liveKeys-2 || !slices.Contains(carried.Dropped, demoted) || left != 0 {
 		t.Fatalf("carried %+v with %d keys left for the demoted account, want its key %q dropped", carried, left, demoted)
+	}
+	// The same account with the same role, narrowed here to one library
+	// since the backup: the restored account sees every library, so its
+	// live key is dropped too.
+	var library int64
+	if err := restored.QueryRow(ctx, `UPDATE users SET role = 'user' WHERE id = $1 RETURNING (SELECT min(id) FROM media_folders)`, userID).Scan(&library); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE users SET library_ids = ARRAY[$2::int] WHERE id = $1`, userID, library); err != nil {
+		t.Fatal(err)
+	}
+	if carried, err = loader.CarryCredentials(ctx, into, dsn); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(carried.Dropped, demoted) {
+		t.Fatalf("carried %+v, want the narrowed account's key %q dropped", carried, demoted)
+	}
+	// Narrowed the same way in the restored data, it keeps its key.
+	if _, err := restored.Exec(ctx, `UPDATE users SET library_ids = ARRAY[$2::int] WHERE id = $1`, userID, library); err != nil {
+		t.Fatal(err)
+	}
+	if carried, err = loader.CarryCredentials(ctx, into, dsn); err != nil {
+		t.Fatal(err)
+	}
+	if slices.Contains(carried.Dropped, demoted) || carried.Kept["api_keys"] != liveKeys-1 {
+		t.Fatalf("carried %+v, want the key of an account with the same policy kept", carried)
 	}
 }
 
