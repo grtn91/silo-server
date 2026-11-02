@@ -92,10 +92,13 @@ func checkGroupingWaitsForTheEditor(t *testing.T, createGroup bool) {
 		restore.Release()
 		restored <- err
 	}()
-	// Wait until the restore waits on a lock the editor holds.
+	// Wait until the restore waits on a lock the editor holds. A backend
+	// that is not waiting has no wait event: NULL, read as false.
+	waitCtx, cancelWait := context.WithTimeout(ctx, 30*time.Second)
+	defer cancelWait()
 	for {
 		var waiting bool
-		if err := pool.QueryRow(ctx, `SELECT wait_event_type = 'Lock' FROM pg_stat_activity WHERE pid = $1`, pid).Scan(&waiting); err != nil {
+		if err := pool.QueryRow(waitCtx, `SELECT coalesce(wait_event_type = 'Lock', false) FROM pg_stat_activity WHERE pid = $1`, pid).Scan(&waiting); err != nil {
 			t.Fatal(err)
 		}
 		if waiting {
@@ -104,7 +107,7 @@ func checkGroupingWaitsForTheEditor(t *testing.T, createGroup bool) {
 		select {
 		case err := <-restored:
 			t.Fatalf("the restore finished while the editor held the library: %v", err)
-		case <-ctx.Done():
+		case <-waitCtx.Done():
 			t.Fatal("the restore never waited for the editor")
 		case <-time.After(10 * time.Millisecond):
 		}

@@ -31,7 +31,7 @@ const (
 	ItemAmbiguous       = "ambiguous"
 	ItemNeedsAnotherKey = "needs_another_key"
 	// SettingKeptStricter is a setting whose backup value would widen
-	// access (config.AccessSettingWider): a restore keeps the live value.
+	// access (AccessSettingWider): a restore keeps the live value.
 	SettingKeptStricter = "kept_stricter"
 	// SettingCleared is a service secret a restore clears, or the service's
 	// switch it turns off: the restore changes where the service connects,
@@ -166,6 +166,9 @@ type RestoreTargets struct {
 	// entry they refuse.
 	CheckLibrary    func(catalog.CreateFolderInput) error
 	CheckCollection func(catalog.CreateLibraryCollectionInput) error
+	// SmartCollectionCreated refreshes a committed smart collection's item
+	// count, as the editor does after creating one.
+	SmartCollectionCreated func(ctx context.Context, collectionID string) error
 }
 
 // TemplateDefaults is a template collection as a bundle apply creates it.

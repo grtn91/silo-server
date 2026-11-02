@@ -2,6 +2,7 @@ package backup
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 )
 
@@ -14,6 +15,19 @@ type settingRoute struct {
 	// enabled turns the service on; a restore that clears the secrets turns
 	// it off until they are entered again.
 	enabled string
+	// transport is the setting that protects what is sent there.
+	transport string
+}
+
+// keys are every setting of the route.
+func (r settingRoute) keys() []string {
+	keys := append([]string{r.endpoint}, r.secrets...)
+	for _, key := range []string{r.enabled, r.transport} {
+		if key != "" {
+			keys = append(keys, key)
+		}
+	}
+	return keys
 }
 
 // settingRoutes are the restorable settings that name where a service
@@ -24,7 +38,7 @@ type settingRoute struct {
 // restored whole or not at all. TestSettingRoutesAreOnOnePage keeps each
 // route on one settings page, so one page restores it.
 var settingRoutes = []settingRoute{
-	{endpoint: "email.smtp_host", secrets: []string{"email.smtp_password"}, enabled: "email.enabled"},
+	{endpoint: "email.smtp_host", secrets: []string{"email.smtp_password"}, enabled: "email.enabled", transport: settingSMTPSecurity},
 	{endpoint: "ai.base_url", secrets: []string{"ai.api_key"}},
 	{endpoint: "ai.asr_base_url", secrets: []string{"ai.asr_api_key"}},
 	{endpoint: "subtitle_ai.base_url", secrets: []string{"subtitle_ai.api_key"}},
@@ -35,8 +49,10 @@ var settingRoutes = []settingRoute{
 // service's address, each of its secrets must come from the backup too.
 // One the backup does not have, or that this server cannot read, is cleared
 // here rather than sent to the new address, and the service is turned off.
-// Every secret of a changed route is expected unchanged under the settings
-// lock (settingsUnchanged).
+// The decision rests on the route as it is here, so when a restore writes
+// any of a route's settings, every one of them is expected unchanged under
+// the settings lock (settingsUnchanged); a setting the backup does not
+// carry is added as a plan with no status, which nothing shows or writes.
 func guardRoutes(plans []settingPlan, live func(key string) string) []settingPlan {
 	index := map[string]int{}
 	for i, p := range plans {
@@ -60,7 +76,6 @@ func guardRoutes(plans []settingPlan, live func(key string) string) []settingPla
 		for _, key := range r.secrets {
 			_, inBackup := index[key]
 			p := plan(key)
-			p.expect = true
 			if inBackup && (p.preview.Status == ItemDiffers || p.preview.Status == ItemOnThisServer) {
 				continue
 			}
@@ -75,7 +90,20 @@ func guardRoutes(plans []settingPlan, live func(key string) string) []settingPla
 			p.preview.BackupValue, p.preview.CurrentValue = settingOff, live(r.enabled)
 		}
 	}
+	for _, r := range settingRoutes {
+		if !slices.ContainsFunc(r.keys(), func(key string) bool { i, ok := index[key]; return ok && plans[i].writes() }) {
+			continue
+		}
+		for _, key := range r.keys() {
+			plan(key).expect = true
+		}
+	}
 	return plans
+}
+
+// writes reports whether a restore writes the plan's setting.
+func (p settingPlan) writes() bool {
+	return p.preview.Status == ItemDiffers || p.preview.Status == SettingCleared
 }
 
 // settingCounts tallies a settings page's plans by status.

@@ -536,11 +536,11 @@ grouped by the admin page that edits each key: a key or prefix with its class.
   server has them. `TestTrustSettingsAreServerSpecific` fails on a setting
   named like one that is not in the list.
 - A restore never widens access. The access settings
-  (`config.accessSettings`: `access.unrated_content`, the Jellyfin and
+  (`accessSettings`, shared with the full restore: `access.unrated_content`, the Jellyfin and
   Audiobookshelf sign-in switches, access and refresh token and Jellyfin
   session lifetimes, and the identity provider's re-check interval and
   outage policy) are offered, but a value that grants more than the live one
-  (`config.AccessSettingWider`; a value that does not parse counts as wider)
+  (`AccessSettingWider`; a value that does not parse counts as wider)
   is never written: the preview marks it `kept_stricter` and the report says
   the stricter current value was kept. The write compares again under the
   settings lock (`accessUnchanged`, the admin settings write path's guard),

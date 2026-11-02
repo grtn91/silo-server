@@ -777,8 +777,26 @@ func (a *applier) applyCollection(ctx context.Context, tx pgx.Tx, id string) (ap
 	}
 	a.claim(claimCollection, newID, id)
 	item.Outcome, item.Message = OutcomeRestored, msgCreated
-	return applied{item: item}, nil
+	return applied{item: item, after: a.smartCollectionCreated(c.CollectionType, newID)}, nil
 }
+
+// smartCollectionCreated is the after-commit refresh of a smart collection
+// the restore created (RestoreTargets.SmartCollectionCreated), or nil. The
+// count is derived; a failed refresh waits for the periodic one.
+func (a *applier) smartCollectionCreated(collectionType, id string) func(context.Context) {
+	refresh := a.s.targets.SmartCollectionCreated
+	if refresh == nil || collectionType != collectionTypeSmart {
+		return nil
+	}
+	return func(ctx context.Context) {
+		if err := refresh(ctx, id); err != nil {
+			slog.WarnContext(ctx, "refreshing a restored smart collection's count failed", "component", "backup", "collection_id", id, "error", err)
+		}
+	}
+}
+
+// collectionTypeSmart is a collection whose items its rules choose.
+const collectionTypeSmart = "smart"
 
 // restoreOntoCollection adds the items a collection here lacks and puts its
 // memberships back in their groups. The collection's parent is locked

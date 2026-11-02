@@ -65,6 +65,7 @@ func wireBackupRestore(deps Dependencies, admin *handlers.AdminHandler, librarie
 	}
 	if collections != nil {
 		targets.CheckCollection = collections.CheckRestoredCollection
+		targets.SmartCollectionCreated = collections.SmartCollectionRestored
 		targets.TemplateTitle = collections.TemplateTitle
 		targets.TemplateCollectionCreated = collections.TemplateCollectionRestored
 		targets.TemplateCollection = func(bundleID, templateID string, libraryID int, libraryType string) (backup.TemplateDefaults, error) {

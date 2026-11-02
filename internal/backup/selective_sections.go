@@ -434,7 +434,11 @@ func (a *applier) applyHomeSection(ctx context.Context, tx pgx.Tx, id string) (a
 	} else {
 		item.Message = plan.item.Message
 	}
-	return applied{item: item}, nil
+	out := applied{item: item}
+	if e.Collection != nil {
+		out.after = a.smartCollectionCreated(e.Collection.CollectionType, collection)
+	}
+	return out, nil
 }
 
 // freeSectionID keeps the backup's section id when no section here has it.

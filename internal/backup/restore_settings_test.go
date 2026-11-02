@@ -2,7 +2,6 @@ package backup
 
 import (
 	"regexp"
-	"slices"
 	"testing"
 
 	"github.com/Silo-Server/silo-server/internal/branding"
@@ -56,26 +55,33 @@ func TestServerSpecificSettingsAreNeverOffered(t *testing.T) {
 	}
 }
 
+// TestAccessSettingsAreComparedOnRestore: an access setting (accessSettings)
+// a selective restore offers is compared with the live value; every other
+// one is server-specific and never written. Every trust setting is an
+// access setting, so a full restore keeps it as strict as live too.
+func TestAccessSettingsAreComparedOnRestore(t *testing.T) {
+	for _, key := range AccessSettingKeys() {
+		rule, ok := classifySetting(key)
+		if !ok {
+			t.Errorf("access setting %s is not classified", key)
+			continue
+		}
+		if _, offered := RestorableSetting(key); !offered && rule.class != SettingServerSpecific {
+			t.Errorf("access setting %s is neither offered nor server-specific: %+v", key, rule)
+		}
+	}
+	for _, key := range trustSettings {
+		if access, _ := AccessSettingWider(key, "", ""); !access {
+			t.Errorf("trust setting %s is not an access setting", key)
+		}
+	}
+}
+
 // TestTrustSettingsAreServerSpecific: every network-security and sign-in
 // trust toggle is server-specific, never restored, and every admin setting
 // named like one (private destinations, trusted proxies, origins, TLS
 // verification, sign-up and sign-in switches) is in trustSettings, so a
 // new one cannot be restored from a backup without a decision.
-// TestAccessSettingsAreComparedOnRestore: every setting that decides who
-// can reach this server or what a viewer sees is either never restored or
-// restored only when it grants no more than the live value
-// (config.AccessSettingWider), so offering one means comparing it.
-func TestAccessSettingsAreComparedOnRestore(t *testing.T) {
-	for _, key := range config.AccessSettingKeys() {
-		if _, offered := RestorableSetting(key); !offered {
-			t.Errorf("access setting %s is not offered: drop it from config.accessSettings or classify it", key)
-		}
-		if slices.Contains(trustSettings, key) {
-			t.Errorf("access setting %s is also a trust setting a restore never writes", key)
-		}
-	}
-}
-
 func TestTrustSettingsAreServerSpecific(t *testing.T) {
 	trusted := map[string]bool{}
 	for _, key := range trustSettings {
