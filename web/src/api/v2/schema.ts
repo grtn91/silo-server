@@ -820,7 +820,7 @@ export interface paths {
       path?: never;
       cookie?: never;
     };
-    /** Read a backup's restore set and compare each section with this server: per-item status, the library mapping, per-setting differences with encrypted values masked, and the digest a restore request must carry. 409 when the backup has no restore set or is from a newer Silo. */
+    /** Read a backup's restore set and compare each section with this server: per-item status, the library mapping, per-setting differences with encrypted values masked, and the digest a restore request must carry. 409 when the backup has no restore set or is from a newer Silo, and 409 backup_unauthenticated, before anything inside the restore set is read, when this server cannot authenticate the backup's manifest and accept_unauthenticated is not set. */
     get: operations["getAdminBackupRestoreSet"];
     put?: never;
     post?: never;
@@ -14444,7 +14444,8 @@ export interface components {
         | "collection_not_mapped"
         | "unreadable"
         | "files_missing_here"
-        | "needs_install";
+        | "needs_install"
+        | "kept_stricter";
       /** @description Items (section:id) that must be chosen with this one: a collection whose library is restored by the same request */
       requires: string[];
       restart_required: boolean;
@@ -14546,7 +14547,8 @@ export interface components {
         | "collection_not_mapped"
         | "unreadable"
         | "files_missing_here"
-        | "needs_install";
+        | "needs_install"
+        | "kept_stricter";
       restart_keys: string[];
       restart_required: boolean;
       /** @enum {string} */
@@ -14617,10 +14619,10 @@ export interface components {
       /** @description The setting applies after a restart */
       restart_required: boolean;
       /**
-       * @description on_this_server: same value here; needs_another_key: encrypted with another SECRET_KEY and never written
+       * @description on_this_server: same value here; needs_another_key: encrypted with another SECRET_KEY and never written; kept_stricter: the backup's value would widen access (who can sign in, how long sessions last, what a rating-capped profile sees), so this server keeps its stricter value and a restore never writes it
        * @enum {string}
        */
-      status: "on_this_server" | "differs" | "needs_another_key";
+      status: "on_this_server" | "differs" | "needs_another_key" | "kept_stricter";
     };
     AdminBackupRestoreSource: {
       /** @description The backup restored from */
@@ -43331,7 +43333,10 @@ export interface operations {
   };
   getAdminBackupRestoreSet: {
     parameters: {
-      query?: never;
+      query?: {
+        /** @description Confirms reading a backup whose manifest this server cannot authenticate; without it such a backup answers 409 backup_unauthenticated and nothing inside it is read */
+        accept_unauthenticated?: boolean;
+      };
       header?: {
         /** @description Optional. When present, it must name the authenticated account's primary profile; an absent header is accepted. */
         "X-Profile-Id"?: string;

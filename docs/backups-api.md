@@ -137,7 +137,11 @@ when storage is unavailable.
 `GET /admin/backups/{id}/restore-set` reads the backup's `restore-set.tar`
 and compares each item with this server. It writes nothing and takes no
 lock. `409` when the backup has no restore set, when it is from a newer Silo ("This backup is from a newer Silo. Upgrade this
-server first."), or when the restore set cannot be read.
+server first."), or when the restore set cannot be read. `409
+backup_unauthenticated` when this server cannot authenticate the backup's
+manifest (another `SECRET_KEY`, or a manifest that does not record the
+restore set's index digest), before anything inside the restore set is read;
+`?accept_unauthenticated=true` confirms reading it anyway.
 
 The answer carries `backup_id`, `digest` (the SHA-256 of `restore-set.tar`; a restore
 request must send it back), the source (`server_id`, `server_name`,
@@ -167,6 +171,7 @@ time (see the report's `failed` outcome), which a preview cannot detect.
 | `folder_missing` | A library folder this server cannot open; not selectable |
 | `ambiguous` | More than one collection or section here matches; not selectable |
 | `needs_another_key` | Encrypted with another `SECRET_KEY`; not selectable |
+| `kept_stricter` | A setting whose backup value would widen access; this server keeps its value and a restore never writes it |
 
 `reason` codes: `same`, `path_in_use` (a folder belongs to another library
 here), `folder_missing`, `library_not_restorable`, `library_not_mapped`,
@@ -180,7 +185,8 @@ server's catalog does not have, or that does not suit the library), and
 `collection_not_mapped` (a page section showing a collection that is
 neither here nor in the backup), and `unreadable` (an entry of the backup the
 reader left out because a value in it cannot be restored; its `id` is
-`unreadable:<n>` and it can never be chosen).
+`unreadable:<n>` and it can never be chosen), and `kept_stricter` (a
+settings page whose every differing setting would widen access).
 
 `requires` lists items (`libraries:<id>`, `collections:<item id>`) that must
 be restored with this one: a collection or template collection whose library
@@ -193,7 +199,12 @@ Kind-specific details:
 - `settings_page`: `settings`, each `{key, class, status, masked,
   backup_value, current_value, restart_required}`. `class` is `portable` or
   `external_service` (connects to an outside service). Encrypted and
-  sensitive settings are `masked` with both values empty.
+  sensitive settings are `masked` with both values empty. A setting's
+  `status` is `on_this_server`, `differs`, `needs_another_key`, or
+  `kept_stricter`: an access setting (`access.unrated_content`, the
+  Jellyfin and Audiobookshelf sign-in switches, session and token lifetimes,
+  the identity-provider re-check interval and outage policy) whose backup
+  value grants more than this server's.
 - `plugin`: `plugin` with `version`, `installed_version`, `enabled`,
   `config_keys`, and `config_restorable`.
 - `library`: `library` with `type`, `paths`, `local_id`, and

@@ -4052,7 +4052,8 @@
               "collection_not_mapped",
               "unreadable",
               "files_missing_here",
-              "needs_install"
+              "needs_install",
+              "kept_stricter"
             ],
             "type": "string"
           },
@@ -4292,7 +4293,8 @@
               "collection_not_mapped",
               "unreadable",
               "files_missing_here",
-              "needs_install"
+              "needs_install",
+              "kept_stricter"
             ],
             "type": "string"
           },
@@ -4524,11 +4526,12 @@
             "type": "boolean"
           },
           "status": {
-            "description": "on_this_server: same value here; needs_another_key: encrypted with another SECRET_KEY and never written",
+            "description": "on_this_server: same value here; needs_another_key: encrypted with another SECRET_KEY and never written; kept_stricter: the backup's value would widen access (who can sign in, how long sessions last, what a rating-capped profile sees), so this server keeps its stricter value and a restore never writes it",
             "enum": [
               "on_this_server",
               "differs",
-              "needs_another_key"
+              "needs_another_key",
+              "kept_stricter"
             ],
             "type": "string"
           }
@@ -67859,6 +67862,17 @@
               "pattern": "^[0-9]{8}T[0-9]{6}(\\.[0-9]{3})?Z-[a-z-]+$",
               "type": "string"
             }
+          },
+          {
+            "description": "Confirms reading a backup whose manifest this server cannot authenticate; without it such a backup answers 409 backup_unauthenticated and nothing inside it is read",
+            "explode": false,
+            "in": "query",
+            "name": "accept_unauthenticated",
+            "schema": {
+              "default": false,
+              "description": "Confirms reading a backup whose manifest this server cannot authenticate; without it such a backup answers 409 backup_unauthenticated and nothing inside it is read",
+              "type": "boolean"
+            }
           }
         ],
         "responses": {
@@ -67978,7 +67992,7 @@
             "bearerAuth": []
           }
         ],
-        "summary": "Read a backup's restore set and compare each section with this server: per-item status, the library mapping, per-setting differences with encrypted values masked, and the digest a restore request must carry. 409 when the backup has no restore set or is from a newer Silo.",
+        "summary": "Read a backup's restore set and compare each section with this server: per-item status, the library mapping, per-setting differences with encrypted values masked, and the digest a restore request must carry. 409 when the backup has no restore set or is from a newer Silo, and 409 backup_unauthenticated, before anything inside the restore set is read, when this server cannot authenticate the backup's manifest and accept_unauthenticated is not set.",
         "tags": [
           "admin-backups"
         ],

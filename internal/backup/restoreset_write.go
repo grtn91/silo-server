@@ -30,6 +30,8 @@ type restoreSetBuild struct {
 	blobs []blobRef
 	// collections caches the admin collections two sections read.
 	collections []collectionRow
+	// indexSHA256 is the written index's digest, for the manifest.
+	indexSHA256 string
 }
 
 type builtDocument struct {
@@ -89,7 +91,7 @@ func buildRestoreSet(ctx context.Context, tx pgx.Tx, meta restoreSetMeta) (*rest
 
 // summary is the manifest's record of this restore set.
 func (b *restoreSetBuild) summary() *RestoreSetSummary {
-	out := &RestoreSetSummary{FormatVersion: restoreSetVersion, Sections: map[string]int{}}
+	out := &RestoreSetSummary{FormatVersion: restoreSetVersion, Sections: map[string]int{}, IndexSHA256: b.indexSHA256}
 	for _, s := range b.index.Sections {
 		out.Sections[s.ID] = s.Count
 	}
@@ -652,6 +654,8 @@ func (b *restoreSetBuild) writeSnapshotPart(ctx context.Context, tw *tar.Writer,
 	if err != nil {
 		return err
 	}
+	sum := sha256.Sum256(index)
+	b.indexSHA256 = hex.EncodeToString(sum[:])
 	if err := writeTarFile(tw, restoreSetIndexName, index, b.index.CreatedAt); err != nil {
 		return err
 	}

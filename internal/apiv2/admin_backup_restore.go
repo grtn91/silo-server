@@ -16,7 +16,7 @@ import (
 type AdminBackupRestoreSetting struct {
 	Key             string `json:"key"`
 	Class           string `json:"class" enum:"portable,external_service" doc:"external_service: connects to an outside service (mail, requests, metadata providers)"`
-	Status          string `json:"status" enum:"on_this_server,differs,needs_another_key" doc:"on_this_server: same value here; needs_another_key: encrypted with another SECRET_KEY and never written"`
+	Status          string `json:"status" enum:"on_this_server,differs,needs_another_key,kept_stricter" doc:"on_this_server: same value here; needs_another_key: encrypted with another SECRET_KEY and never written; kept_stricter: the backup's value would widen access (who can sign in, how long sessions last, what a rating-capped profile sees), so this server keeps its stricter value and a restore never writes it"`
 	Masked          bool   `json:"masked" doc:"An encrypted or sensitive setting: both values are omitted"`
 	BackupValue     string `json:"backup_value" doc:"The value in the backup; empty when masked"`
 	CurrentValue    string `json:"current_value" doc:"The value on this server; empty when masked"`
@@ -65,7 +65,7 @@ type AdminBackupRestoreItem struct {
 	Label           string                         `json:"label"`
 	Status          string                         `json:"status" enum:"on_this_server,not_on_this_server,differs,folder_missing,ambiguous,needs_another_key"`
 	Selectable      bool                           `json:"selectable" doc:"Whether the item can be chosen. Items on this server already have nothing to restore."`
-	Reason          string                         `json:"reason,omitempty" enum:"same,path_in_use,folder_missing,library_not_restorable,library_not_mapped,ambiguous_name,needs_another_key,config_needs_another_key,other_version,item_not_on_this_server,file_missing,not_in_backup,changed_since_preview,template_not_available,collection_not_mapped,unreadable,files_missing_here,needs_install"`
+	Reason          string                         `json:"reason,omitempty" enum:"same,path_in_use,folder_missing,library_not_restorable,library_not_mapped,ambiguous_name,needs_another_key,config_needs_another_key,other_version,item_not_on_this_server,file_missing,not_in_backup,changed_since_preview,template_not_available,collection_not_mapped,unreadable,files_missing_here,needs_install,kept_stricter"`
 	Message         string                         `json:"message,omitempty" doc:"What restoring the item does or why it cannot be chosen, for display"`
 	Requires        []string                       `json:"requires" doc:"Items (section:id) that must be chosen with this one: a collection whose library is restored by the same request"`
 	RestartRequired bool                           `json:"restart_required"`
@@ -148,7 +148,7 @@ type AdminBackupRestoreReportItem struct {
 	Kind            string   `json:"kind" enum:"settings_page,plugin,library,collection,template_collection,item_artwork,branding,home_section"`
 	Label           string   `json:"label"`
 	Outcome         string   `json:"outcome" enum:"restored,unchanged,left_out,failed"`
-	Reason          string   `json:"reason,omitempty" enum:"same,path_in_use,folder_missing,library_not_restorable,library_not_mapped,ambiguous_name,needs_another_key,config_needs_another_key,other_version,item_not_on_this_server,file_missing,not_in_backup,changed_since_preview,template_not_available,collection_not_mapped,unreadable,files_missing_here,needs_install" doc:"Why a left_out item was left out"`
+	Reason          string   `json:"reason,omitempty" enum:"same,path_in_use,folder_missing,library_not_restorable,library_not_mapped,ambiguous_name,needs_another_key,config_needs_another_key,other_version,item_not_on_this_server,file_missing,not_in_backup,changed_since_preview,template_not_available,collection_not_mapped,unreadable,files_missing_here,needs_install,kept_stricter" doc:"Why a left_out item was left out"`
 	Message         string   `json:"message,omitempty"`
 	Error           string   `json:"error,omitempty" doc:"Why a failed item failed"`
 	RestartRequired bool     `json:"restart_required"`
@@ -183,16 +183,22 @@ type AdminBackupRestoreSource struct {
 	BackupID string `json:"backup_id,omitempty" doc:"The backup restored from"`
 }
 
+// AdminBackupRestoreSetInput names the backup to preview.
+type AdminBackupRestoreSetInput struct {
+	AdminBackupIDInput
+	AcceptUnauthenticated bool `query:"accept_unauthenticated" default:"false" doc:"Confirms reading a backup whose manifest this server cannot authenticate; without it such a backup answers 409 backup_unauthenticated and nothing inside it is read"`
+}
+
 func registerAdminBackupRestore(reg *Registry, op func(method, path, id, summary string) Operation) {
 	preview := op(http.MethodGet, "/{id}/restore-set", "getAdminBackupRestoreSet",
-		"Read a backup's restore set and compare each section with this server: per-item status, the library mapping, per-setting differences with encrypted values masked, and the digest a restore request must carry. 409 when the backup has no restore set or is from a newer Silo.")
+		"Read a backup's restore set and compare each section with this server: per-item status, the library mapping, per-setting differences with encrypted values masked, and the digest a restore request must carry. 409 when the backup has no restore set or is from a newer Silo, and 409 backup_unauthenticated, before anything inside the restore set is read, when this server cannot authenticate the backup's manifest and accept_unauthenticated is not set.")
 	preview.Errors = []int{http.StatusConflict}
-	Register(reg, preview, func(ctx context.Context, in *AdminBackupIDInput) (*AdminBackupRestoreSetOutput, error) {
+	Register(reg, preview, func(ctx context.Context, in *AdminBackupRestoreSetInput) (*AdminBackupRestoreSetOutput, error) {
 		svc, p := reg.backups()
 		if p != nil {
 			return nil, p
 		}
-		out, err := svc.Preview(ctx, in.ID)
+		out, err := svc.Preview(ctx, in.ID, in.AcceptUnauthenticated)
 		if err != nil {
 			return nil, backupProblem(err)
 		}
@@ -246,7 +252,7 @@ func restoreProblem(err error) error {
 		}
 		return p
 	}
-	if selection, ok := errors.AsType[*backup.SelectionError](err); ok {
+	if selection, ok := errors.AsType[*backup.SelectionError](err); ok && !errors.Is(err, backup.ErrUnauthenticated) {
 		return NewProblem(TypeValidationFailed, selection.Message)
 	}
 	return backupProblem(err)

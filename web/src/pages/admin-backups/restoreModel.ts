@@ -38,6 +38,8 @@ export const REASON_SENTENCES: Record<RestoreReason, string> = {
   files_missing_here: "Its files are missing on this server. Restoring writes them back.",
   needs_install:
     "It isn't installed here. Install it from a plugin catalog, then restore it again for its settings. A restore never installs a plugin from a backup.",
+  kept_stricter:
+    "Its settings that differ would widen access, so this server keeps its stricter current values.",
 };
 
 export const SECTION_TITLES: Record<RestoreSectionId, string> = {
@@ -435,6 +437,15 @@ export function restoreCaveats(set: RestoreSet, selection: SelectionKeys): Cavea
       add(
         "key",
         `${plural(otherKey, "encrypted setting")} saved with a different SECRET_KEY ${otherKey === 1 ? "is" : "are"} left out.`,
+      );
+    }
+    const stricter = (item.settings ?? []).filter(
+      (setting) => setting.status === "kept_stricter",
+    ).length;
+    if (stricter > 0) {
+      add(
+        "stricter",
+        `${plural(stricter, "setting")} would widen access, so this server keeps ${stricter === 1 ? "its" : "their"} stricter current ${stricter === 1 ? "value" : "values"}.`,
       );
     }
     const unknown = item.collection?.unknown_items ?? 0;

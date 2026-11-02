@@ -20,12 +20,16 @@ function restoreRootKey() {
   return [...backupsRootKey(), "restore"] as const;
 }
 
-/** The preview of a backup's restore set against this server; none while `backupId` is null. */
-export function useRestoreSet(backupId: string | null) {
+/**
+ * The preview of a backup's restore set against this server; none while
+ * `backupId` is null. `acceptUnauthenticated` opens a backup this server
+ * can't verify, which the admin has confirmed.
+ */
+export function useRestoreSet(backupId: string | null, acceptUnauthenticated = false) {
   const context = captureProfileRequestContext();
   return useQuery({
-    queryKey: [...restoreRootKey(), "set", backupId],
-    queryFn: () => getRestoreSet(captureAdminAuthority(), backupId ?? ""),
+    queryKey: [...restoreRootKey(), "set", backupId, acceptUnauthenticated],
+    queryFn: () => getRestoreSet(captureAdminAuthority(), backupId ?? "", acceptUnauthenticated),
     enabled: context !== null && backupId !== null && backupId !== "",
     // A preview is compared against the server as it is now; read it fresh
     // each time the page opens rather than restoring from a stale cache.

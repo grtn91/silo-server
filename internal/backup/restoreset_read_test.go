@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"path"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -205,6 +206,63 @@ func TestRestoreExtractsOnlyTheSelectedItemsFiles(t *testing.T) {
 	planned.blobSizes[poster] = 1 << 60
 	if err := checkTempSpace(t.TempDir(), planned, keep); !errors.Is(err, ErrNotEnoughTempSpace) {
 		t.Fatalf("a restore larger than the free space = %v, want ErrNotEnoughTempSpace", err)
+	}
+}
+
+// TestReadRestoreSetChecksBeforeDecoding: an index that does not match the
+// manifest's digest is refused before it is decoded, a failed archive check
+// stops the read before any document is decoded, and documents larger than
+// a restore set may hold are refused from the index alone.
+func TestReadRestoreSetChecksBeforeDecoding(t *testing.T) {
+	ctx := context.Background()
+	index, entries := testRestoreSet()
+	data := buildTar(t, index, entries)
+	sum := sha256.Sum256(mustJSON(index))
+	if _, err := ReadRestoreSet(ctx, bytes.NewReader(data), ReadOptions{IndexSHA256: hex.EncodeToString(sum[:])}); err != nil {
+		t.Fatalf("matching index digest: %v", err)
+	}
+	if _, err := ReadRestoreSet(ctx, bytes.NewReader(data), ReadOptions{IndexSHA256: strings.Repeat("0", 64)}); err == nil || !strings.Contains(err.Error(), "does not match the digest its manifest records") {
+		t.Fatalf("another index digest = %v", err)
+	}
+
+	// A document that would fail to decode: the archive check runs first.
+	bIndex, bEntries := testRestoreSet()
+	for i := range bEntries {
+		if bEntries[i].name == settingsDocumentName {
+			bEntries[i].data = []byte("{not json")
+		}
+	}
+	resyncDigests(&bIndex, bEntries)
+	refused := errors.New("the archive is not the one its manifest records")
+	if _, err := ReadRestoreSet(ctx, bytes.NewReader(buildTar(t, bIndex, bEntries)), ReadOptions{Verify: func() error { return refused }}); !errors.Is(err, refused) {
+		t.Fatalf("read with a failing archive check = %v, want the check's error", err)
+	}
+
+	for name, change := range map[string]func(*RestoreSetIndex){
+		"documents over the budget": func(index *RestoreSetIndex) {
+			for i := range index.Sections {
+				for j := range index.Sections[i].Files {
+					if path.Base(index.Sections[i].Files[j].Path) != pluginArchiveName {
+						index.Sections[i].Files[j].Size = maxRestoreSetDocument
+					}
+				}
+			}
+		},
+		"an oversized plugin document": func(index *RestoreSetIndex) {
+			for i := range index.Sections {
+				for j := range index.Sections[i].Files {
+					if path.Base(index.Sections[i].Files[j].Path) == pluginDocumentName {
+						index.Sections[i].Files[j].Size = maxPluginDocument + 1
+					}
+				}
+			}
+		},
+	} {
+		index, entries := testRestoreSet()
+		change(&index)
+		if _, err := ReadRestoreSet(ctx, bytes.NewReader(buildTar(t, index, entries)), ReadOptions{}); err == nil || !strings.Contains(err.Error(), restoreSetIndexName) {
+			t.Fatalf("%s: %v, want the index refused", name, err)
+		}
 	}
 }
 

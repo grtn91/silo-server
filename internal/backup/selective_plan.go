@@ -397,9 +397,17 @@ func (p *planner) planSettings(ctx context.Context) ([]settingPlan, error) {
 				have = false
 			}
 		}
-		if have && current == value {
+		live := current
+		if !have {
+			live = ""
+		}
+		switch _, wider := config.AccessSettingWider(e.Key, value, live); {
+		case have && current == value:
 			plan.preview.Status = ItemOnThisServer
-		} else {
+		case wider:
+			// A restore never widens access: the live value stays.
+			plan.preview.Status = SettingKeptStricter
+		default:
 			plan.preview.Status = ItemDiffers
 		}
 		if !plan.preview.Masked {
@@ -408,6 +416,14 @@ func (p *planner) planSettings(ctx context.Context) ([]settingPlan, error) {
 		out = append(out, plan)
 	}
 	return out, nil
+}
+
+// keptStricterNote says that n settings keep the live, stricter value.
+func keptStricterNote(n int) string {
+	if n == 1 {
+		return "1 setting would widen access, so this server keeps its stricter current value."
+	}
+	return fmt.Sprintf("%d settings would widen access, so this server keeps its stricter current values.", n)
 }
 
 // settingsPageItems groups settings by page in display order.
@@ -424,7 +440,7 @@ func settingsPageItems(plans []settingPlan) []PreviewItem {
 		}
 		sort.Slice(list, func(i, j int) bool { return list[i].preview.Key < list[j].preview.Key })
 		item := PreviewItem{ID: page.ID, Kind: KindSettingsPage, Label: page.Title, Status: ItemOnThisServer, Reason: ReasonSame}
-		differs, needsKey := 0, 0
+		differs, needsKey, stricter := 0, 0, 0
 		for _, plan := range list {
 			item.Settings = append(item.Settings, plan.preview)
 			switch plan.preview.Status {
@@ -434,18 +450,28 @@ func settingsPageItems(plans []settingPlan) []PreviewItem {
 				item.ExternalService = item.ExternalService || plan.preview.Class == SettingExternalService
 			case ItemNeedsAnotherKey:
 				needsKey++
+			case SettingKeptStricter:
+				stricter++
 			}
+		}
+		var notes []string
+		if needsKey > 0 && differs > 0 {
+			notes = append(notes, fmt.Sprintf("%d encrypted settings on this page were encrypted with another SECRET_KEY and are left out.", needsKey))
+		}
+		if stricter > 0 && (differs > 0 || needsKey > 0) {
+			notes = append(notes, keptStricterNote(stricter))
 		}
 		switch {
 		case differs > 0:
 			item.Status, item.Reason, item.Selectable = ItemDiffers, "", true
-			if needsKey > 0 {
-				item.Message = fmt.Sprintf("%d encrypted settings on this page were encrypted with another SECRET_KEY and are left out.", needsKey)
-			}
 		case needsKey > 0:
 			item.Status, item.Reason = ItemNeedsAnotherKey, ReasonNeedsAnotherKey
-			item.Message = "The settings that differ were encrypted with another SECRET_KEY."
+			notes = append([]string{"The settings that differ were encrypted with another SECRET_KEY."}, notes...)
+		case stricter > 0:
+			item.Status, item.Reason = ItemDiffers, ReasonKeptStricter
+			notes = []string{"Every setting that differs would widen access, so this server keeps its stricter current values."}
 		}
+		item.Message = strings.Join(notes, " ")
 		out = append(out, item)
 	}
 	return out
@@ -796,13 +822,15 @@ type RestorePreview struct {
 }
 
 // Preview reads a backup's restore set and compares every item with this
-// server. It writes nothing and takes no lock.
-func (s *Service) Preview(ctx context.Context, id string) (*RestorePreview, error) {
-	return s.preview(ctx, restoreSource{backupID: id})
+// server. It writes nothing and takes no lock. A backup this server cannot
+// authenticate is read only when acceptUnauthenticated confirms it
+// (ErrUnauthenticated).
+func (s *Service) Preview(ctx context.Context, id string, acceptUnauthenticated bool) (*RestorePreview, error) {
+	return s.preview(ctx, restoreSource{backupID: id}, acceptUnauthenticated)
 }
 
-func (s *Service) preview(ctx context.Context, src restoreSource) (*RestorePreview, error) {
-	rs, authenticated, err := s.previewSet(ctx, src)
+func (s *Service) preview(ctx context.Context, src restoreSource, acceptUnauthenticated bool) (*RestorePreview, error) {
+	rs, authenticated, err := s.previewSet(ctx, src, acceptUnauthenticated)
 	if err != nil {
 		return nil, err
 	}
