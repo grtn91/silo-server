@@ -663,6 +663,32 @@ are written under ids the restore just took, so a legitimate restore finds
 them absent or equal; an archive naming a live asset's key cannot replace
 it, whether or not the item's transaction later commits.
 
+Before its first item, a restore records each store's identity
+(`blobstore.RecordIdentity`), which a store opened with settings would do on
+its first write through a pool connection; items write files inside their
+transactions, and on a one-connection pool that second connection never
+comes.
+
+### Lock order
+
+An item takes the locks the editor or API path for the same rows takes, in
+the same order, so the two wait for each other instead of deadlocking:
+
+- Admin collections: the collection parent (`FOR NO KEY UPDATE`), then the
+  library's collection order revision, then membership rows. The library
+  editor's move and reorder takes every parent of the library first, in id
+  order, so a restore holding one parent never holds what the editor waits
+  on. Adding items, adding libraries to a collection's scope, and putting a
+  membership back in its group all take the parent first
+  (`TestGroupingWaitsForTheEditorDB`).
+- Page sections and featured sections: the section editor's order (see
+  `selective_sections.go`).
+- Accounts and profiles: `userdata.Preparer`'s order, the account locks, then
+  each data type's own, then data rows.
+- Libraries, plugins, and settings write through the editor's own functions
+  (`catalog.CreateFolderInTx`, the plugin installer, the admin settings write
+  path) and take their locks.
+
 ### Follow-ups
 
 Some work runs only after an item commits: a restored library's sections,

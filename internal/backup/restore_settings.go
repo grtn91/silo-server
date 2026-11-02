@@ -109,7 +109,7 @@ var settingRulesByPage = []struct {
 		"policy.":          SettingPortable,
 	}},
 	{"sign-in", map[string]SettingClass{
-		"auth.jwt_secret": SettingServerSpecific,
+		settingJWTSecret:  SettingServerSpecific,
 		"auth.":           SettingPortable,
 		"signup.":         SettingPortable,
 		"password_reset.": SettingPortable,
@@ -181,7 +181,7 @@ var settingRulesByPage = []struct {
 		"notifications.":                       SettingPortable,
 	}},
 	{"compatibility", map[string]SettingClass{
-		"audiobooks.abs.jwt_secret":       SettingServerSpecific,
+		settingABSJWTSecret:               SettingServerSpecific,
 		"jellyfin_compat.public_url":      SettingServerSpecific,
 		"jellyfin_compat.web_install_dir": SettingServerSpecific,
 		"jellyfin_compat.server_id":       SettingServerSpecific,

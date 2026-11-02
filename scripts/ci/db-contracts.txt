@@ -786,6 +786,7 @@
 ./internal/backup TestIdentityTwinsRestoreOneToOneDB
 ./internal/plugins TestRestoreInstallationDB
 ./internal/adminjob TestBackupRestoreFencingDB
+./internal/catalog TestGroupingWaitsForTheEditorDB
 ./internal/api/handlers TestLibraryRestoredReportsFailedSetupDB
 ./internal/api/handlers TestRestoredLibraryChainNeedsItsProviderLookupDB
 ./internal/api/handlers TestRestoredPluginJoinsChainsOnlyFromItsManifestDB

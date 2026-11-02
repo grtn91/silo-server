@@ -79,6 +79,13 @@ func (s *Service) ExecuteRestore(ctx context.Context, run RestoreRun) (any, erro
 		return fail(ErrDigestMismatch)
 	}
 
+	// Items write files inside their transactions; a store recording its
+	// identity on that first write would need a second pool connection.
+	for _, store := range s.stores {
+		if err := blobstore.RecordIdentity(work, store); err != nil {
+			return fail(fmt.Errorf("recording the storage: %w", err))
+		}
+	}
 	a := &applier{s: s, rs: rs, run: run, report: report, total: 1, staged: map[string]error{}, filesWritten: map[string]bool{}}
 	for _, ids := range req.Selection {
 		a.total += len(ids)
