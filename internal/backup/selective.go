@@ -33,6 +33,13 @@ const (
 	// SettingKeptStricter is a setting whose backup value would widen
 	// access (config.AccessSettingWider): a restore keeps the live value.
 	SettingKeptStricter = "kept_stricter"
+	// SettingCleared is a service secret a restore clears, or the service's
+	// switch it turns off: the restore changes where the service connects,
+	// and the backup has no secret this server can read for it.
+	SettingCleared = "cleared"
+	// SettingUnverifiedBackup is a setting that connects to an outside
+	// service, which a backup this server cannot verify never restores.
+	SettingUnverifiedBackup = "unverified_backup"
 )
 
 // Reasons an item cannot be chosen, is restored only in part, or was left
@@ -71,6 +78,10 @@ const (
 	// ReasonKeptStricter: every setting of the page that differs would
 	// widen access, so the live values stay.
 	ReasonKeptStricter = "kept_stricter"
+	// ReasonUnverifiedBackup: what the item would restore connects to
+	// outside services, which a backup this server cannot verify never
+	// restores.
+	ReasonUnverifiedBackup = "unverified_backup"
 )
 
 // Report outcomes.
@@ -109,8 +120,10 @@ var ErrDigestMismatch = errors.New("the backup changed since it was previewed; o
 // follow-up scans). They are built with the API handlers, after the service.
 type RestoreTargets struct {
 	// ApplySettings writes values through the admin settings write path in
-	// tx and reports the keys that apply after a restart.
-	ApplySettings func(ctx context.Context, tx pgx.Tx, values map[string]string) (restartKeys []string, after func(context.Context), err error)
+	// tx and reports the keys that apply after a restart. A non-nil check
+	// runs under the settings lock with the stored values, before anything
+	// is written; its error refuses the write.
+	ApplySettings func(ctx context.Context, tx pgx.Tx, values map[string]string, check func(stored map[string]string) error) (restartKeys []string, after func(context.Context), err error)
 	Plugins       PluginRestorer
 	// LibraryCreated runs the library editor's follow-ups for a committed
 	// new library: sections, provider chain, monitoring, and the first scan.
@@ -148,6 +161,11 @@ type RestoreTargets struct {
 	// CheckSection validates a page section as the admin section editor
 	// does; create marks a new row.
 	CheckSection func(sectionType, scope string, libraryID *int, config json.RawMessage, create bool) error
+	// CheckLibrary and CheckCollection validate a library or an admin
+	// collection as the editor's create command does. A restore offers no
+	// entry they refuse.
+	CheckLibrary    func(catalog.CreateFolderInput) error
+	CheckCollection func(catalog.CreateLibraryCollectionInput) error
 }
 
 // TemplateDefaults is a template collection as a bundle apply creates it.

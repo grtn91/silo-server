@@ -298,13 +298,6 @@ func rootError(err error) error {
 	}
 }
 
-func truncateText(s string, limit int) string {
-	if len(s) <= limit {
-		return s
-	}
-	return strings.ToValidUTF8(s[:limit], "")
-}
-
 // exportUserIsolated reads one account under a savepoint, so a failing
 // query leaves the snapshot transaction usable for the next account.
 func exportUserIsolated(ctx context.Context, tx pgx.Tx, account AccountEntry) ([]byte, []blobRef, error) {

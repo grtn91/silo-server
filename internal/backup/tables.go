@@ -13,7 +13,10 @@ import "strings"
 //   - restoredDataTables: the server's data, restored as the backup has it;
 //   - serverStateTables: state of the running server (caches, queues, job,
 //     lease, and lock state, revisions, samples, receipts), restored as the
-//     backup has it and rebuilt or reconciled by the server.
+//     backup has it and rebuilt or reconciled by the server;
+//   - stricterFlags (credentials_stricter.go): security switches inside a
+//     table restored as the backup has it, which a full restore keeps at
+//     the stricter of the backup's and the live server's value.
 //
 // TestEveryTableIsClassifiedDB reads every table after the migrations and
 // fails on one in none of the lists, in more than one, or on a listed name

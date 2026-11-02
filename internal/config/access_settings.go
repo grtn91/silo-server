@@ -25,6 +25,17 @@ var accessSettings = map[string]func(string) (int64, bool){
 		}
 		return 0, true
 	},
+	// A weaker transport sends the server's mail credentials where they
+	// can be read.
+	keySMTPSecurity: func(v string) (int64, bool) {
+		switch v {
+		case smtpSecurityNone:
+			return 1, true
+		case smtpSecurityStartTLS, smtpSecurityTLS:
+			return 0, true
+		}
+		return 0, false
+	},
 	AuthProviderRecheckOutagePolicySettingKey: func(v string) (int64, bool) {
 		switch v {
 		case AuthRecheckFailOpen:
@@ -54,6 +65,14 @@ const (
 	keyAccessTokenExpiry    = "auth.access_token_expiry" //nolint:gosec // G101: a setting key, not a credential
 	keyJellyfinSessionTTL   = "jellyfin_compat.session_ttl"
 	keyJellyfinPlaybackTTL  = "jellyfin_compat.playback_session_ttl"
+	keySMTPSecurity         = "email.smtp_security"
+)
+
+// The email.smtp_security modes, as internal/mail reads them.
+const (
+	smtpSecurityStartTLS = "starttls"
+	smtpSecurityTLS      = "tls"
+	smtpSecurityNone     = "none"
 )
 
 func grantsWhenTrue(v string) (int64, bool) {

@@ -193,6 +193,8 @@ type selectiveFixture struct {
 	calls         []int
 	created       []int
 	failFollowUps bool
+	// beforeSettings runs ahead of each settings write, before its lock.
+	beforeSettings func()
 }
 
 func newSelectiveFixture(t *testing.T) *selectiveFixture {
@@ -228,8 +230,18 @@ func newSelectiveFixture(t *testing.T) *selectiveFixture {
 	f.svc.SetRestoreTargets(RestoreTargets{
 		CheckFolder:  func(_ context.Context, path string) error { _, err := os.Stat(path); return err },
 		TrackArtwork: catalog.NewArtworkRevisionTracker(pool).TrackArtworkRevision,
-		ApplySettings: func(ctx context.Context, tx pgx.Tx, values map[string]string) ([]string, func(context.Context), error) {
-			err := f.settings.UpdateAtomicWithTx(ctx, tx, func(map[string]string, pgx.Tx) (map[string]string, error) { return values, nil })
+		ApplySettings: func(ctx context.Context, tx pgx.Tx, values map[string]string, check func(map[string]string) error) ([]string, func(context.Context), error) {
+			if f.beforeSettings != nil {
+				f.beforeSettings()
+			}
+			err := f.settings.UpdateAtomicWithTx(ctx, tx, func(stored map[string]string, _ pgx.Tx) (map[string]string, error) {
+				if check != nil {
+					if err := check(stored); err != nil {
+						return nil, err
+					}
+				}
+				return values, nil
+			})
 			return nil, func(context.Context) {}, err
 		},
 		LibraryCreated: func(_ context.Context, id int) error {
@@ -492,6 +504,130 @@ func (f *selectiveFixture) checkConflictingBlob(t *testing.T, seed selectiveSeed
 //     and the encrypted value are restored, and a before-restore backup is
 //     recorded;
 //   - running the same restore again changes nothing and runs no follow-up.
+//
+// TestRestoreRechecksAccessSettingsUnderTheLockDB: an access setting an
+// admin makes stricter after the restore planned its page, but before the
+// settings write takes its lock, keeps the admin's value. The item starts
+// again from its read and leaves the setting out.
+func TestRestoreRechecksAccessSettingsUnderTheLockDB(t *testing.T) {
+	f := newSelectiveFixture(t)
+	ctx := t.Context()
+	const key = config.AuthRefreshTokenExpirySettingKey
+	setSetting(t, f.pool, f.settings, key, "7d")
+	source, err := backupUnderLock(t, f.svc, KindManual)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.settings.Set(ctx, key, "30d"); err != nil {
+		t.Fatal(err)
+	}
+	preview, err := f.svc.Preview(ctx, source.ID, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	page := previewItem(t, preview, SectionSettings, pageSignIn)
+	if !page.Selectable {
+		t.Fatalf("sign-in page before the edit = %+v, want a stricter value to restore", page)
+	}
+	edited := false
+	f.beforeSettings = func() {
+		if !edited {
+			edited = true
+			if err := f.settings.Set(context.Background(), key, "1d"); err != nil {
+				t.Error(err)
+			}
+		}
+	}
+	report, err := f.restore(t, source.ID, preview.Digest, map[string][]string{SectionSettings: {pageSignIn}}, &testFence{pool: f.pool})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if item := reportItem(t, report, SectionSettings, pageSignIn); item.Outcome != OutcomeLeftOut || item.Reason != ReasonKeptStricter {
+		t.Fatalf("sign-in page = %+v, want left out, kept_stricter", item)
+	}
+	if got, err := f.settings.Get(ctx, key); err != nil || got != "1d" {
+		t.Fatalf("%s = %q, %v; want the admin's 1d", key, got, err)
+	}
+}
+
+// TestRestoreNeverSendsLiveSecretsToARestoredAddressDB: restoring a mail
+// server address the backup has no password for clears the password here
+// and turns email off, rather than sending this server's password to the
+// backup's server; a backup this server cannot verify restores no setting
+// that connects to an outside service at all.
+func TestRestoreNeverSendsLiveSecretsToARestoredAddressDB(t *testing.T) {
+	f := newSelectiveFixture(t)
+	ctx := t.Context()
+	const host, password, enabled = "email.smtp_host", "email.smtp_password", "email.enabled"
+	dbExec(t, f.pool, `DELETE FROM server_settings WHERE key = $1`, password)
+	setSetting(t, f.pool, f.settings, host, "smtp.backup.example")
+	setSetting(t, f.pool, f.settings, enabled, "true")
+	source, err := backupUnderLock(t, f.svc, KindManual)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.settings.Set(ctx, host, "mail.example.com"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.settings.Set(ctx, password, "the live password"); err != nil {
+		t.Fatal(err)
+	}
+	preview, err := f.svc.Preview(ctx, source.ID, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	page := previewItem(t, preview, SectionSettings, pageEmail)
+	cleared := map[string]bool{}
+	for _, s := range page.Settings {
+		cleared[s.Key] = s.Status == SettingCleared
+	}
+	if !page.Selectable || !cleared[password] || !cleared[enabled] {
+		t.Fatalf("email page = %+v, want the password cleared and email turned off", page)
+	}
+	report, err := f.restore(t, source.ID, preview.Digest, map[string][]string{SectionSettings: {pageEmail}}, &testFence{pool: f.pool})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if item := reportItem(t, report, SectionSettings, pageEmail); item.Outcome != OutcomeRestored {
+		t.Fatalf("email page = %+v", item)
+	}
+	for key, want := range map[string]string{host: "smtp.backup.example", password: "", enabled: "false"} {
+		if got, _ := f.settings.Get(ctx, key); got != want {
+			t.Fatalf("%s = %q, want %q", key, got, want)
+		}
+	}
+
+	// The same backup under another key: nothing that reaches a service.
+	manifestKey := objectKey(f.serverID, source.ID, ManifestName)
+	body, _, err := f.store.Get(ctx, manifestKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, _ := io.ReadAll(body)
+	_ = body.Close()
+	m, err := ParseManifest(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.KeyCheck = "9999-8888-7777-6666"
+	if data, err = json.Marshal(m); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.store.Put(ctx, manifestKey, data); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.settings.Set(ctx, host, "mail.example.com"); err != nil {
+		t.Fatal(err)
+	}
+	unverified, err := f.svc.Preview(ctx, source.ID, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if page := previewItem(t, unverified, SectionSettings, pageEmail); page.Selectable || page.Reason != ReasonUnverifiedBackup {
+		t.Fatalf("email page of an unverified backup = %+v, want unselectable, unverified_backup", page)
+	}
+}
+
 func TestSelectiveRestoreDB(t *testing.T) {
 	f := newSelectiveFixture(t)
 	ctx := t.Context()

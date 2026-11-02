@@ -37,8 +37,12 @@ func wireBackupRestore(deps Dependencies, admin *handlers.AdminHandler, librarie
 		},
 	}
 	if admin != nil {
-		targets.ApplySettings = func(ctx context.Context, tx pgx.Tx, values map[string]string) ([]string, func(context.Context), error) {
-			result, publish, err := admin.ApplyAdminSettingsInTx(ctx, tx, values)
+		targets.ApplySettings = func(ctx context.Context, tx pgx.Tx, values map[string]string, check func(map[string]string) error) ([]string, func(context.Context), error) {
+			var guard func(handlers.AdminSettingsSnapshot) error
+			if check != nil {
+				guard = func(s handlers.AdminSettingsSnapshot) error { return check(s.Stored) }
+			}
+			result, publish, err := admin.ApplyAdminSettingsInTx(ctx, tx, values, guard)
 			if err != nil {
 				return nil, nil, err
 			}
@@ -51,6 +55,7 @@ func wireBackupRestore(deps Dependencies, admin *handlers.AdminHandler, librarie
 	}
 	if libraries != nil {
 		targets.LibraryCreated = libraries.LibraryRestored
+		targets.CheckLibrary = libraries.CheckRestoredLibrary
 	}
 	if images != nil {
 		targets.ArtworkChanged = images.ArtworkRestored
@@ -59,6 +64,7 @@ func wireBackupRestore(deps Dependencies, admin *handlers.AdminHandler, librarie
 		targets.TrackArtwork = tracker.TrackArtworkRevision
 	}
 	if collections != nil {
+		targets.CheckCollection = collections.CheckRestoredCollection
 		targets.TemplateTitle = collections.TemplateTitle
 		targets.TemplateCollectionCreated = collections.TemplateCollectionRestored
 		targets.TemplateCollection = func(bundleID, templateID string, libraryID int, libraryType string) (backup.TemplateDefaults, error) {

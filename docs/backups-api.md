@@ -187,6 +187,8 @@ time (see the report's `failed` outcome), which a preview cannot detect.
 | `ambiguous` | More than one collection here has its name, or an account or profile has more than one candidate; not selectable |
 | `needs_another_key` | Encrypted with another `SECRET_KEY`; not selectable |
 | `kept_stricter` | A setting whose backup value would widen access; this server keeps its value and a restore never writes it |
+| `cleared` | A service secret the restore clears, or the service switch it turns off, because it changes where the service connects and the backup has no secret this server can read for it |
+| `unverified_backup` | A setting that connects to an outside service; a backup this server cannot verify never restores it |
 
 `reason` codes: `same`, `path_in_use` (a folder belongs to another library
 here), `folder_missing`, `library_not_restorable`, `library_not_mapped`,
@@ -206,8 +208,10 @@ server's catalog does not have, or that does not suit the library), and
 `collection_not_mapped` (a page section showing a collection that is
 neither here nor in the backup), and `unreadable` (an entry of the backup the
 reader left out because a value in it cannot be restored; its `id` is
-`unreadable:<n>` and it can never be chosen), and `kept_stricter` (a
-settings page whose every differing setting would widen access).
+`unreadable:<n>` and it can never be chosen), `kept_stricter` (a
+settings page whose every differing setting would widen access), and
+`unverified_backup` (settings or a plugin configuration that connect to
+outside services, in a backup this server cannot verify).
 
 `requires` lists items (`libraries:<id>`, `collections:<item id>`) that must
 be restored with this one: a collection or template collection whose library

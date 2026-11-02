@@ -479,6 +479,15 @@ only after the admin confirms (`accept_unauthenticated`), its preview
 included. Previews of one archive share a read (`restoreSetCache`); the read
 stops when every preview waiting on it has gone.
 
+A restored library, admin collection, template collection, or section
+meets the editor's own checks, run through restore targets so they are the
+editor's code: the library create command's (`CheckRestoredLibrary`), the
+admin collection create command's (`CheckRestoredCollection`), and the
+section editor's (`CheckRestoredSection`). One the editor would refuse is not
+offered, with its message. No entry may encode to more than the v2 API's
+request body cap (1 MiB; a collection's item list is not counted), as no
+editor request could write more for one.
+
 Any of those failures refuses the whole set. An entry whose own values no
 restore could write is left out instead, and the rest stays readable
 (`RestoreSet.Unusable`): a setting key that is not one, a library without an
@@ -544,8 +553,24 @@ grouped by the admin page that edits each key: a key or prefix with its class.
   outage policy) are offered, but a value that grants more than the live one
   (`config.AccessSettingWider`; a value that does not parse counts as wider)
   is never written: the preview marks it `kept_stricter` and the report says
-  the stricter current value was kept. `TestAccessSettingsAreComparedOnRestore`
-  requires every access setting to be offered, so none is compared in vain.
+  the stricter current value was kept. The write compares again under the
+  settings lock (`accessUnchanged`, the admin settings write path's guard),
+  so a stricter value an admin saves after the plan is kept: the item starts
+  again from its read. `TestAccessSettingsAreComparedOnRestore` requires
+  every access setting to be offered, so none is compared in vain. Mail's
+  transport security (`email.smtp_security`) is compared the same way: a
+  restore never weakens it to `none`.
+- A service's address and its secrets restore together (`settingRoutes`:
+  the SMTP host and password, the AI, speech, subtitle-AI, and embedding
+  base URLs and their keys). When a restore changes the address, each secret
+  must come from the backup and decrypt here; otherwise the restore clears
+  it and turns the service off (`email.enabled`) instead of sending this
+  server's secret to the backup's address. The preview marks those settings
+  `cleared`, and the secrets are expected unchanged under the settings lock.
+- A backup this server cannot authenticate restores no setting that
+  connects to an outside service (class `external_service`) and no plugin
+  configuration, whatever the admin confirmed: the preview marks them
+  `unverified_backup`.
 
 A key the table does not match is never offered. `TestEverySettingIsClassified`
 fails for any admin setting default, sensitive setting, or branding asset key
@@ -1181,8 +1206,7 @@ neither list.
 - A full restore (swap mode) keeps the live server's carried credentials as
   they are right before the swap. After verification, in the same step
   that clears unreadable settings, it reads them from the live database
-  (preflight has found no other client on it, so they cannot change before
-  the swap) and writes them into the restored database in one transaction,
+  and writes them into the restored database in one transaction,
   before it becomes live. A restored credential identical to a live one
   (same id, owner, and secret) is updated in place, so what refers to it
   stays linked; the others are deleted. Accepted and revoked invitations
@@ -1205,6 +1229,19 @@ neither list.
   never key material. Identity sequences move past the ids written. Live rows are
   encrypted with this server's key, so they stay readable after
   `--accept-lost-credentials`.
+- In the same transaction, a full restore keeps each security switch inside
+  an otherwise restored table at the stricter of the backup's and the live
+  server's value (`stricterFlags`), so it never turns back on what an admin
+  turned off since the backup: an account's `enabled`, `break_glass`, and
+  `local_password_login_enabled` (off wins) and `password_change_required`
+  (on wins), and the `enabled` of a plugin installation that signs people in
+  (one with sign-in bindings or an `auth_provider.v1` capability), whose
+  carried sign-in links then cannot sign anyone in. A row is the live one
+  when its id and username (an account) or plugin id match. The command
+  lists each switch it kept. Grants through policy rather than a switch
+  (`users.role`, `is_owner`, access group and per-account permissions) are
+  restored as the backup has them; the credential carry above refuses
+  credentials whose account gains authority that way.
 - Separate mode (`--into`) restores a copy, not the live server: it deletes
   the backup's carried credentials and carries none.
 
@@ -1261,6 +1298,14 @@ replicas set to 0), so nothing can write blobs. The command cannot prove that,
 so it refuses while any other client is connected to the live database and
 closes the database as an extra guard.
 
+Before anything else, the restore takes the full-restore lock: a session
+advisory lock on its control connection (`PGControl.LockRestore`, keys
+`"SRST"` and the live database's name hashed, apart from the subsystem lock),
+held until the command returns or its connection drops. A second restore or
+`--recover` of the same database fails at once with `ErrRestoreRunning`,
+naming the holder's process: each control connection is on the maintenance
+database, so neither preflight would see the other.
+
 1. Validate (above).
 2. Preflight on a control connection to the maintenance database
    (`postgres`): no other client on the live database, `CREATEDB` and
@@ -1274,8 +1319,12 @@ closes the database as an extra guard.
    restored settings record the storage location the live stores are. Then
    replace its credentials with the live ones ([Credentials](#credentials)),
    close it to connections, and end the command's sessions on it.
-5. Quiesce the live database: `ALLOW_CONNECTIONS false`, then end any session
-   that appeared since step 2. The journal starts just before this, in
+5. Quiesce the live database: `ALLOW_CONNECTIONS false`. The carried
+   credentials are the live ones only while no other client is on the live
+   database, so a client that connected since step 2 stops the restore
+   (`ErrLiveInUse`), both just before the credentials are read and here,
+   once the database is closed; its session is never ended, which would lose
+   what it changed. The live database is reopened and left unchanged. The journal starts just before this, in
    `silo-restore-<time>.journal` in the working directory (each record
    synced, and the directory synced once the file exists, so its name
    survives a host crash; if that cannot be done the swap stops before

@@ -773,6 +773,7 @@
 # a restored library whose setup partly failed, or whose provider placement
 # could not be read, reports it so it is retried without a fallback chain.
 ./internal/backup TestBackupRestoreRoundTripDB
+./internal/backup TestFullRestoresAreSerializedDB
 ./internal/backup TestBackupWritesManifestLastDB
 ./internal/backup TestSubsystemLockSerializesBackupsAndDeletesDB
 ./internal/backup TestLostLockSessionCancelsWorkDB
@@ -782,6 +783,8 @@
 ./internal/backup TestBackupAndDeleteWithOnePoolConnectionDB
 ./internal/backup TestEveryTableIsClassifiedDB
 ./internal/backup TestSelectiveRestoreDB
+./internal/backup TestRestoreRechecksAccessSettingsUnderTheLockDB
+./internal/backup TestRestoreNeverSendsLiveSecretsToARestoredAddressDB
 ./internal/backup TestTemplateCollectionsAndHomeSectionsDB
 ./internal/backup TestIdentityTwinsRestoreOneToOneDB
 ./internal/backup TestLayoutCollectionsMapAcrossServersDB

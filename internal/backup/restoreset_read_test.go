@@ -626,6 +626,8 @@ func TestReadRestoreSetLeavesOutUnusableEntries(t *testing.T) {
 	}
 	var libraries LibrariesDocument
 	var sections HomeSectionsDocument
+	var collections CollectionsDocument
+	huge := strings.Repeat("x", maxRestoredEntryBytes)
 	for name, c := range map[string]struct {
 		edit    func(*RestoreSetIndex, *[]testEntry)
 		section string
@@ -639,6 +641,12 @@ func TestReadRestoreSetLeavesOutUnusableEntries(t *testing.T) {
 			SectionCollections, func(rs *RestoreSet) bool { return len(rs.Collections.Branding) == 0 }},
 		"a section carrying a collection its configuration does not name": {editDocument(homeSectionsDocumentName, &sections, func() {
 			sections.Sections[1].Config = json.RawMessage(`{"library_collection_id":"c1"}`)
+		}), SectionHomeSections, func(rs *RestoreSet) bool { return len(rs.HomeSections.Sections) == 1 }},
+		// No editor writes more for one collection in one request.
+		"a collection description larger than a request": {editDocument(collectionsDocumentName, &collections, func() { collections.Collections[0].Description = huge }),
+			SectionCollections, func(rs *RestoreSet) bool { return len(rs.Collections.Collections) == 0 }},
+		"a section configuration larger than a request": {editDocument(homeSectionsDocumentName, &sections, func() {
+			sections.Sections[0].Config = json.RawMessage(`{"library_collection_id":"c1","pad":"` + huge + `"}`)
 		}), SectionHomeSections, func(rs *RestoreSet) bool { return len(rs.HomeSections.Sections) == 1 }},
 	} {
 		t.Run(name, func(t *testing.T) {

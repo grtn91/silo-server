@@ -22,13 +22,14 @@ const (
 // inventoryTables is the core table inventory every manifest records and
 // every full restore compares (docs/architecture/backups.md).
 var inventoryTables = []string{
-	"users", tableUserProfiles, "media_folders", "media_items", "media_files",
+	tableUsers, tableUserProfiles, "media_folders", "media_items", "media_files",
 	"server_settings", "plugin_installations", tableLibraryCollections,
 	"user_watch_history", "user_watch_progress",
 }
 
 const (
 	tableLibraryCollections  = "library_collections"
+	tableUsers               = "users"
 	tableUserProfiles        = "user_profiles"
 	tableDownloadedSubtitles = "downloaded_subtitles"
 	tableAPIKeys             = "api_keys"

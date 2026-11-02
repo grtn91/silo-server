@@ -16,6 +16,7 @@ import (
 	"runtime"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -66,10 +67,38 @@ type fakeControl struct {
 	// openAfter records, after each statement, which databases admitted
 	// connections.
 	openAfter [][]string
+	// joinOnLoad and joinOnCarry connect a client to the live database
+	// while the restore loads the dump, or right after it carries the
+	// credentials, as a server started meanwhile would.
+	joinOnLoad, joinOnCarry bool
+	// restoreLocks is the restore lock table, shared by every control of
+	// one server; held names the databases locked.
+	restoreLocks *fakeRestoreLocks
+}
+
+type fakeRestoreLocks struct {
+	mu   sync.Mutex
+	held map[string]bool
+}
+
+func (f *fakeControl) LockRestore(_ context.Context, live string) (func(context.Context), error) {
+	locks := f.restoreLocks
+	locks.mu.Lock()
+	defer locks.mu.Unlock()
+	if locks.held[live] {
+		return nil, ErrRestoreRunning
+	}
+	locks.held[live] = true
+	return func(context.Context) {
+		locks.mu.Lock()
+		defer locks.mu.Unlock()
+		delete(locks.held, live)
+	}, nil
 }
 
 func newFakeControl(t *testing.T) *fakeControl {
-	return &fakeControl{t: t, dbs: map[string]*fakeDB{liveDB: {oid: 100, allow: true}}, nextOID: 200, fail: map[string]error{}, lostReply: map[string]bool{}}
+	return &fakeControl{t: t, dbs: map[string]*fakeDB{liveDB: {oid: 100, allow: true}}, nextOID: 200, fail: map[string]error{}, lostReply: map[string]bool{},
+		restoreLocks: &fakeRestoreLocks{held: map[string]bool{}}}
 }
 
 func (f *fakeControl) do(call string, apply func() error) error {
@@ -213,12 +242,18 @@ func (l fakeLoader) RotateSigningSecrets(context.Context, string, *secret.Cipher
 	return true, nil
 }
 func (l fakeLoader) CarryCredentials(context.Context, string, string) (CarriedCredentials, error) {
+	if l.ctl.joinOnCarry {
+		l.ctl.dbs[liveDB].sessions++
+	}
 	return CarriedCredentials{}, nil
 }
 func (l fakeLoader) Load(_ context.Context, dbURL, _ string) error {
 	name, err := databaseName(dbURL)
 	if err != nil {
 		return err
+	}
+	if l.ctl.joinOnLoad {
+		l.ctl.dbs[liveDB].sessions++
 	}
 	return l.ctl.connect(name)
 }
@@ -674,6 +709,75 @@ func TestSwapPreflightChangesNothing(t *testing.T) {
 			t.Fatalf("restore = %v, calls %v", err, f.ctl.calls)
 		}
 	})
+}
+
+// TestSwapWaitsForNoOtherRestore: a full restore or a recovery of a
+// database another one holds is refused before it changes anything, and
+// the lock is free again once a restore returns.
+func TestSwapWaitsForNoOtherRestore(t *testing.T) {
+	f := newSwapFixture(t)
+	unlock, err := f.ctl.LockRestore(t.Context(), liveDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err, _ := f.restore(); !errors.Is(err, ErrRestoreRunning) || len(f.ctl.calls) != 0 {
+		t.Fatalf("restore beside another = %v, calls %v", err, f.ctl.calls)
+	}
+	unlock(t.Context())
+	if err, _ := f.restore(); err != nil {
+		t.Fatalf("%v\n%s", err, f.output.String())
+	}
+	if again, err := f.ctl.LockRestore(t.Context(), liveDB); err != nil {
+		t.Fatalf("the restore kept its lock: %v", err)
+	} else {
+		again(t.Context())
+	}
+
+	// A recovery takes the same lock: one beside another changes nothing.
+	f = newSwapFixture(t)
+	f.ctl.crashAt = "rename silo " + beforeDB
+	if _, crashed := f.restore(); !crashed {
+		t.Fatal("the restore did not crash")
+	}
+	f.ctl.crashAt = ""
+	unlock, err = f.ctl.LockRestore(t.Context(), liveDB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	calls := len(f.ctl.calls)
+	if err, _ := f.recover(); !errors.Is(err, ErrRestoreRunning) || len(f.ctl.calls) != calls {
+		t.Fatalf("recovery beside another = %v, calls %v", err, f.ctl.calls[calls:])
+	}
+	unlock(t.Context())
+	if err, crashed := f.recover(); err != nil || crashed {
+		t.Fatalf("recover = %v (crashed %v)\n%s", err, crashed, f.output.String())
+	}
+	f.wantRolledBack()
+}
+
+// TestSwapStopsWhenAClientJoinsTheLiveDatabase: the credentials a restore
+// carries are the live server's only while nothing else is on the live
+// database. A client that connects after preflight, before or after the
+// carry, stops the restore with the live database open and unchanged,
+// rather than having its session ended and its changes lost.
+func TestSwapStopsWhenAClientJoinsTheLiveDatabase(t *testing.T) {
+	for name, join := range map[string]func(*fakeControl){
+		"while the dump loads":  func(c *fakeControl) { c.joinOnLoad = true },
+		"after the credentials": func(c *fakeControl) { c.joinOnCarry = true },
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newSwapFixture(t)
+			join(f.ctl)
+			err, _ := f.restore()
+			if !errors.Is(err, ErrLiveInUse) {
+				t.Fatalf("restore = %v, want ErrLiveInUse\n%s", err, f.output.String())
+			}
+			if slices.Contains(f.ctl.calls, "terminate "+liveDB) {
+				t.Fatalf("the swap ended the client's session: %v", f.ctl.calls)
+			}
+			f.wantRolledBack()
+		})
+	}
 }
 
 // TestSwapRefusesUnsafeArchives: blobs.tar is checked whole before anything

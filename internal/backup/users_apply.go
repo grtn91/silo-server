@@ -100,6 +100,21 @@ func validateUserSelection(users []UserSelection) error {
 	return nil
 }
 
+// lockPlanned takes the locks of what a plan compared with this server:
+// the account here (pgstore.LockAccountForImport, as the import takes it),
+// or the access group a new account joins (its row, for share). It reports
+// whether it locked anything.
+func lockPlanned(ctx context.Context, tx pgx.Tx, plan accountPlan) (bool, error) {
+	switch {
+	case plan.localID != 0:
+		return true, pgstore.LockAccountForImport(ctx, tx, plan.localID)
+	case plan.groupID != nil:
+		_, err := tx.Exec(ctx, `SELECT 1 FROM access_groups WHERE id = $1 FOR SHARE`, *plan.groupID)
+		return true, err
+	}
+	return false, nil
+}
+
 // applyAccount restores one selected account in the item's transaction. The
 // account and its profiles are matched again here; a mapping that changed
 // since the preview is left out. An account or profile found here is never
@@ -120,6 +135,16 @@ func (a *applier) applyAccount(ctx context.Context, tx pgx.Tx, sel UserSelection
 	plan, err := planner.plan(ctx, doc)
 	if err != nil {
 		return applied{}, err
+	}
+	// What the plan compared is locked, and the plan made again under the
+	// locks: the account here (its profiles and limits), or the access
+	// group a new account joins, so an admin's change in between is seen.
+	if locked, err := lockPlanned(ctx, tx, plan); err != nil {
+		return applied{}, err
+	} else if locked {
+		if plan, err = planner.plan(ctx, doc); err != nil {
+			return applied{}, err
+		}
 	}
 	item.Label = plan.item.Label
 	if !plan.item.Selectable {
