@@ -111,17 +111,58 @@ func CheckToolsFor(tools Tools, serverMajor int) error {
 // rejects as unknown.
 var pgxOnlyParams = []string{"pool_", "statement_cache_capacity", "description_cache_capacity", "default_query_exec_mode", "min_read_buffer_size"}
 
+// secretParams are the connection parameters that carry a secret: libpqTarget
+// keeps them off the command line, where ps shows them, and HasSecret
+// refuses them in a command's flags.
+var secretParams = []string{paramPassword, paramSSLPassword}
+
+const (
+	paramPassword    = "password"
+	paramSSLPassword = "sslpassword"
+)
+
+// libpqServiceName is the section of the private service file that passes
+// pg_dump and pg_restore an sslpassword (libpqConn).
+const libpqServiceName = "silo-backup"
+
+// errInlineSSL refuses pgx's sslinline, which puts key material in the
+// connection string; libpq cannot read it, and it would reach the command
+// line.
+var errInlineSSL = errors.New("the database URL uses sslinline, which pg_dump and pg_restore cannot read; give the certificate and key as files")
+
 // libpqTarget turns a DATABASE_URL into what pg_dump and pg_restore accept:
-// pgx-only parameters removed, an optional database name substituted, and the
-// password moved out of the command line (where ps shows it) into PGPASSWORD.
-func libpqTarget(databaseURL, dbname string) (conn string, env []string, err error) {
+// pgx-only parameters removed, an optional database name substituted, and
+// the secretParams moved out into secrets. When an sslpassword is among
+// them, conn names libpqServiceName, which carries it.
+func libpqTarget(databaseURL, dbname string) (conn string, secrets map[string]string, err error) {
 	if dbname != "" {
 		if databaseURL, err = WithDatabase(databaseURL, dbname); err != nil {
 			return "", nil, err
 		}
 	}
+	secrets = map[string]string{}
 	if !strings.Contains(databaseURL, "://") {
-		return libpqKeyValueTarget(databaseURL)
+		pairs, err := parseKeyValueDSN(databaseURL)
+		if err != nil {
+			return "", nil, err
+		}
+		var kept []dsnPair
+		for _, p := range pairs {
+			switch {
+			case p.key == "sslinline":
+				return "", nil, errInlineSSL
+			case slices.Contains(secretParams, p.key):
+				secrets[p.key] = p.value
+			case pgxOnlyParam(p.key):
+				// libpq rejects it.
+			default:
+				kept = append(kept, p)
+			}
+		}
+		if _, ok := secrets[paramSSLPassword]; ok {
+			kept = append(kept, dsnPair{key: "service", value: libpqServiceName})
+		}
+		return joinKeyValueDSN(kept), secrets, nil
 	}
 	u, err := url.Parse(databaseURL)
 	if err != nil {
@@ -129,61 +170,94 @@ func libpqTarget(databaseURL, dbname string) (conn string, env []string, err err
 	}
 	if u.User != nil {
 		if password, ok := u.User.Password(); ok {
-			env = append(env, "PGPASSWORD="+password)
+			secrets[paramPassword] = password
 			u.User = url.User(u.User.Username())
 		}
 	}
 	query := u.Query()
-	if query.Has("password") {
-		env = append(env, "PGPASSWORD="+query.Get("password"))
-		query.Del("password")
+	if query.Has("sslinline") {
+		return "", nil, errInlineSSL
 	}
 	for key := range query {
-		if pgxOnlyParam(key) {
+		switch {
+		case slices.Contains(secretParams, key):
+			secrets[key] = query.Get(key)
+			query.Del(key)
+		case pgxOnlyParam(key):
 			query.Del(key)
 		}
 	}
+	if _, ok := secrets[paramSSLPassword]; ok {
+		query.Set("service", libpqServiceName)
+	}
 	u.RawQuery = query.Encode()
-	return u.String(), env, nil
+	return u.String(), secrets, nil
 }
 
-// HasPassword reports whether a database URL or key=value DSN carries a
-// password. One that does not parse counts as carrying one.
-func HasPassword(databaseURL string) bool {
+// libpqConn is a connection for pg_dump and pg_restore: Conn, for
+// --dbname, holds no secret. Env passes the password as PGPASSWORD and an
+// sslpassword, which libpq reads from no environment variable, through a
+// service file only this user can read, which Close removes.
+type libpqConn struct {
+	Conn string
+	Env  []string
+	dir  string
+}
+
+func newLibpqConn(databaseURL string) (*libpqConn, error) {
+	conn, secrets, err := libpqTarget(databaseURL, "")
+	if err != nil {
+		return nil, err
+	}
+	c := &libpqConn{Conn: conn}
+	if password, ok := secrets[paramPassword]; ok {
+		c.Env = append(c.Env, "PGPASSWORD="+password)
+	}
+	sslPassword, ok := secrets[paramSSLPassword]
+	if !ok {
+		return c, nil
+	}
+	// A service file line ends at a newline; a value cannot hold one.
+	if strings.ContainsAny(sslPassword, "\r\n") {
+		return nil, errors.New("the database URL's sslpassword holds a line break, which a service file cannot carry")
+	}
+	if c.dir, err = os.MkdirTemp("", "silo-pg-service-"); err != nil {
+		return nil, err
+	}
+	file := filepath.Join(c.dir, "pg_service.conf")
+	if err := os.WriteFile(file, []byte("["+libpqServiceName+"]\nsslpassword="+sslPassword+"\n"), 0o600); err != nil {
+		c.Close()
+		return nil, err
+	}
+	c.Env = append(c.Env, "PGSERVICEFILE="+file)
+	return c, nil
+}
+
+// Close removes the service file, once the command using it has exited.
+func (c *libpqConn) Close() {
+	if c.dir != "" {
+		_ = os.RemoveAll(c.dir)
+	}
+}
+
+// HasSecret reports whether a database URL or key=value DSN carries a
+// secret (secretParams, or key material inline). One that does not parse
+// counts as carrying one.
+func HasSecret(databaseURL string) bool {
 	if !strings.Contains(databaseURL, "://") {
 		pairs, err := parseKeyValueDSN(databaseURL)
 		if err != nil {
 			return true
 		}
-		return slices.ContainsFunc(pairs, func(p dsnPair) bool { return p.key == "password" })
+		return slices.ContainsFunc(pairs, func(p dsnPair) bool { return slices.Contains(secretParams, p.key) || p.key == "sslinline" })
 	}
 	u, err := url.Parse(databaseURL)
 	if err != nil {
 		return true
 	}
 	_, inUser := u.User.Password()
-	return inUser || u.Query().Has("password")
-}
-
-// libpqKeyValueTarget is libpqTarget for a key=value DSN: it is rewritten
-// without the password and the pgx-only parameters.
-func libpqKeyValueTarget(dsn string) (conn string, env []string, err error) {
-	pairs, err := parseKeyValueDSN(dsn)
-	if err != nil {
-		return "", nil, err
-	}
-	var kept []dsnPair
-	for _, p := range pairs {
-		switch {
-		case p.key == "password":
-			env = append(env, "PGPASSWORD="+p.value)
-		case pgxOnlyParam(p.key):
-			// libpq rejects it.
-		default:
-			kept = append(kept, p)
-		}
-	}
-	return joinKeyValueDSN(kept), env, nil
+	query := u.Query()
+	return inUser || query.Has("sslinline") || slices.ContainsFunc(secretParams, query.Has)
 }
 
 func joinKeyValueDSN(pairs []dsnPair) string {

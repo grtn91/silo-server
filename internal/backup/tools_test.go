@@ -1,6 +1,9 @@
 package backup
 
 import (
+	"errors"
+	"io/fs"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -8,63 +11,89 @@ import (
 	"testing"
 )
 
-// The password never reaches pg_dump's command line, where ps shows it.
-func TestLibpqTargetMovesThePasswordToTheEnvironment(t *testing.T) {
+// No secret reaches pg_dump's command line, where ps shows it: the
+// password and an sslpassword are taken out, and pgx-only parameters, which
+// libpq rejects, are dropped.
+func TestLibpqTargetKeepsSecretsOffTheCommandLine(t *testing.T) {
 	cases := []struct {
 		name, in, dbname string
 		conn             string
-		env              []string
+		secrets          map[string]string
 	}{
 		{
-			name: "url",
-			in:   "postgres://silo:s%40cret@db:5432/silo?sslmode=disable&pool_max_conns=4",
-			conn: "postgres://silo@db:5432/silo?sslmode=disable",
-			env:  []string{"PGPASSWORD=s@cret"},
+			name: "url", in: "postgres://silo:s%40cret@db:5432/silo?sslmode=disable&pool_max_conns=4",
+			conn: "postgres://silo@db:5432/silo?sslmode=disable", secrets: map[string]string{"password": "s@cret"},
 		},
 		{
-			name: "url query password",
-			in:   "postgres://silo@db/silo?password=pw",
-			conn: "postgres://silo@db/silo",
-			env:  []string{"PGPASSWORD=pw"},
+			name: "url query password", in: "postgres://silo@db/silo?password=pw",
+			conn: "postgres://silo@db/silo", secrets: map[string]string{"password": "pw"},
 		},
 		{
-			name:   "key value with substituted database",
-			in:     "host=db user=silo password=pw dbname=silo pool_max_conns=4",
-			dbname: "silo_restore",
-			conn:   "host='db' user='silo' dbname='silo_restore'",
-			env:    []string{"PGPASSWORD=pw"},
+			name: "url sslpassword", in: "postgres://silo@db/silo?sslkey=/k.pem&sslpassword=pass",
+			conn: "postgres://silo@db/silo?service=silo-backup&sslkey=%2Fk.pem", secrets: map[string]string{"sslpassword": "pass"},
 		},
 		{
-			name: "key value spaced and escaped",
-			in:   `host = db  user=si\ lo password = 'p w'`,
-			conn: "host='db' user='si lo'",
-			env:  []string{"PGPASSWORD=p w"},
+			name: "key value with substituted database", in: "host=db user=silo password=pw dbname=silo pool_max_conns=4", dbname: "silo_restore",
+			conn: "host='db' user='silo' dbname='silo_restore'", secrets: map[string]string{"password": "pw"},
 		},
 		{
-			name: "key value quoted password",
-			in:   `password='a \'b\\ c' host=db`,
-			conn: "host='db'",
-			env:  []string{`PGPASSWORD=a 'b\ c`},
+			name: "key value spaced and escaped", in: `host = db  user=si\ lo password = 'p w'`,
+			conn: "host='db' user='si lo'", secrets: map[string]string{"password": "p w"},
+		},
+		{
+			name: "key value quoted password", in: `password='a \'b\\ c' host=db`,
+			conn: "host='db'", secrets: map[string]string{"password": `a 'b\ c`},
+		},
+		{
+			name: "key value sslpassword", in: "host=db sslpassword='x y'",
+			conn: "host='db' service='silo-backup'", secrets: map[string]string{"sslpassword": "x y"},
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			conn, env, err := libpqTarget(tc.in, tc.dbname)
+			conn, secrets, err := libpqTarget(tc.in, tc.dbname)
 			if err != nil {
 				t.Fatalf("libpqTarget: %v", err)
 			}
-			if conn != tc.conn {
-				t.Errorf("conn = %q, want %q", conn, tc.conn)
-			}
-			if !slices.Equal(env, tc.env) {
-				t.Errorf("env = %q, want %q", env, tc.env)
+			if conn != tc.conn || !maps.Equal(secrets, tc.secrets) {
+				t.Errorf("libpqTarget = %q, %v; want %q, %v", conn, secrets, tc.conn, tc.secrets)
 			}
 		})
 	}
-	for _, bad := range []string{"host=db password='unterminated", "host", "=db"} {
+	for _, bad := range []string{"host=db password='unterminated", "host", "=db", "host=db sslinline=true sslkey=PEM",
+		"postgres://db/silo?sslinline=true"} {
 		if _, _, err := libpqTarget(bad, ""); err == nil {
-			t.Errorf("libpqTarget(%q) accepted a malformed connection string", bad)
+			t.Errorf("libpqTarget(%q) accepted a connection string it cannot pass on safely", bad)
 		}
+	}
+}
+
+// An sslpassword reaches pg_dump through a service file only this user can
+// read, removed when the command is done.
+func TestLibpqConnPassesTheSSLPasswordInAFile(t *testing.T) {
+	conn, err := newLibpqConn("postgres://silo:pw@db/silo?sslpassword=key%20pass")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var file string
+	for _, kv := range conn.Env {
+		if v, ok := strings.CutPrefix(kv, "PGSERVICEFILE="); ok {
+			file = v
+		}
+	}
+	info, err := os.Stat(file)
+	if err != nil || info.Mode().Perm() != 0o600 || !slices.Contains(conn.Env, "PGPASSWORD=pw") || strings.Contains(conn.Conn, "pass") {
+		t.Fatalf("conn %q env %q, file %v (%v); want the password in PGPASSWORD and the sslpassword in a private file", conn.Conn, conn.Env, info, err)
+	}
+	if data, _ := os.ReadFile(file); string(data) != "[silo-backup]\nsslpassword=key pass\n" {
+		t.Fatalf("service file = %q", data)
+	}
+	conn.Close()
+	if _, err := os.Stat(file); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("service file left after Close: %v", err)
+	}
+	if _, err := newLibpqConn("postgres://db/silo?sslpassword=a%0Ab"); err == nil {
+		t.Fatal("an sslpassword with a line break was accepted")
 	}
 }
 
@@ -111,9 +140,9 @@ func TestWithDatabase(t *testing.T) {
 	}
 }
 
-// A database URL with a password is refused on the command line, where
-// every account on the host can read it.
-func TestHasPassword(t *testing.T) {
+// A database URL with a secret is refused on the command line, where every
+// account on the host can read it.
+func TestHasSecret(t *testing.T) {
 	for dsn, want := range map[string]bool{
 		"postgres://silo:pw@db/silo":          true,
 		"postgres://silo@db/silo?password=pw": true,
@@ -121,9 +150,13 @@ func TestHasPassword(t *testing.T) {
 		"host=db user=silo password='p w'":    true,
 		"host=db user=silo dbname=silo":       false,
 		"host=db password='unterminated":      true,
+		"postgres://db/silo?sslpassword=x":    true,
+		"host=db sslpassword=x":               true,
+		"host=db sslinline=true":              true,
+		"postgres://db/silo?sslmode=require":  false,
 	} {
-		if got := HasPassword(dsn); got != want {
-			t.Errorf("HasPassword(%q) = %v, want %v", dsn, got, want)
+		if got := HasSecret(dsn); got != want {
+			t.Errorf("HasSecret(%q) = %v, want %v", dsn, got, want)
 		}
 	}
 }
