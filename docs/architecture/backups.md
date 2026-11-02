@@ -173,6 +173,12 @@ download. The one destination, `default`, is the operational store from
 backend there is no local operational store, so there is nowhere to write
 backups; the Backups page says so and links to Storage settings.
 
+A storage transition never copies `backups/` (see
+[blob-storage.md](blob-storage.md#managed-transitions)). Local backups stay
+on this server's disk when the operational store moves to a bucket; the
+Backups page then lists the bucket's backups only, and an earlier local one
+is still restored from its folder with `silo backup restore --from <dir>`.
+
 **Every API server must share the operational store.** Backups are written by
 whichever server runs the task and listed, downloaded, and deleted by any
 other. On a local artwork backend that is the shared-volume requirement
