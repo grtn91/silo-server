@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 
@@ -292,11 +293,7 @@ func (c *PGControl) Rename(ctx context.Context, from, to string) error {
 }
 
 func (c *PGControl) AllowConnections(ctx context.Context, name string, allow bool) error {
-	value := "false"
-	if allow {
-		value = "true"
-	}
-	_, err := c.Conn.Exec(ctx, "ALTER DATABASE "+ident(name)+" WITH ALLOW_CONNECTIONS "+value)
+	_, err := c.Conn.Exec(ctx, "ALTER DATABASE "+ident(name)+" WITH ALLOW_CONNECTIONS "+strconv.FormatBool(allow))
 	return err
 }
 

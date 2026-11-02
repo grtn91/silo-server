@@ -6,28 +6,30 @@ import (
 	"testing"
 
 	"github.com/Silo-Server/silo-server/internal/branding"
-	"github.com/Silo-Server/silo-server/internal/catalog"
-	"github.com/Silo-Server/silo-server/internal/config"
 )
 
-// TestEverySettingIsClassified: the restore table is an allowlist, so a new
-// admin setting is never offered by accident, and never silently left out:
-// every key with an admin default, every sensitive key, and every branding
-// asset key must have a class and a known page.
-func TestEverySettingIsClassified(t *testing.T) {
-	keys := config.AdminSettingDefaultKeys()
-	for key := range catalog.SensitiveSettingKeys {
-		keys = append(keys, key)
-	}
-	keys = append(keys, branding.AssetSettingKeys()...)
-	for _, key := range keys {
+// TestEverySettingHasAPage: every registered setting a selective restore
+// may write is on a settings page, and a page's server-specific class
+// agrees with the setting's kind (SettingKindOf).
+func TestEverySettingHasAPage(t *testing.T) {
+	assets := branding.AssetSettingKeys()
+	for _, key := range settingRegistry() {
+		kind, _ := SettingKindOf(key)
 		rule, ok := classifySetting(key)
-		if !ok {
-			t.Errorf("setting %q is not classified in settingRules", key)
-			continue
-		}
-		if _, ok := settingsPageByID(rule.page); !ok {
-			t.Errorf("setting %q names unknown page %q", key, rule.page)
+		switch {
+		case kind == SettingKindServerSpecific:
+			if ok && rule.class != SettingServerSpecific {
+				t.Errorf("%s is server-specific, but its page %q shows it as %s", key, rule.page, rule.class)
+			}
+		case slices.Contains(assets, key):
+		case !ok:
+			t.Errorf("setting %s (%s) is on no settings page", key, kind)
+		case rule.class == SettingServerSpecific:
+			t.Errorf("setting %s is %s, but its page %q shows it as server-specific", key, kind, rule.page)
+		default:
+			if _, known := settingsPageByID(rule.page); !known {
+				t.Errorf("setting %s names unknown page %q", key, rule.page)
+			}
 		}
 	}
 }
@@ -56,38 +58,31 @@ func TestServerSpecificSettingsAreNeverOffered(t *testing.T) {
 	}
 }
 
-// TestTrustSettingsAreServerSpecific: every network-security and sign-in
-// trust toggle is server-specific, never restored, and every admin setting
-// named like one (private destinations, trusted proxies, origins, TLS
-// verification, sign-up and sign-in switches) is in trustSettings, so a
-// new one cannot be restored from a backup without a decision.
-// TestAccessSettingsAreComparedOnRestore: every setting that decides who
-// can reach this server or what a viewer sees is either never restored or
-// restored only when it grants no more than the live value
-// (config.AccessSettingWider), so offering one means comparing it.
+// TestAccessSettingsAreComparedOnRestore: an access setting (accessSettings)
+// a selective restore offers is compared with the live value; every other
+// one is server-specific and never written.
 func TestAccessSettingsAreComparedOnRestore(t *testing.T) {
-	for _, key := range config.AccessSettingKeys() {
-		if _, offered := RestorableSetting(key); !offered {
-			t.Errorf("access setting %s is not offered: drop it from config.accessSettings or classify it", key)
+	for _, key := range AccessSettingKeys() {
+		rule, ok := classifySetting(key)
+		if !ok {
+			t.Errorf("access setting %s is not classified", key)
+			continue
 		}
-		if slices.Contains(trustSettings, key) {
-			t.Errorf("access setting %s is also a trust setting a restore never writes", key)
+		if _, offered := RestorableSetting(key); !offered && rule.class != SettingServerSpecific {
+			t.Errorf("access setting %s is neither offered nor server-specific: %+v", key, rule)
 		}
 	}
 }
 
-func TestTrustSettingsAreServerSpecific(t *testing.T) {
-	trusted := map[string]bool{}
-	for _, key := range trustSettings {
-		trusted[key] = true
-		if rule, ok := classifySetting(key); !ok || rule.class != SettingServerSpecific {
-			t.Errorf("%s is %+v, want server-specific", key, rule)
-		}
-	}
+// TestTrustSettingsAreStricter: every setting named like a network-security
+// or sign-in trust toggle (private destinations, trusted proxies, origins,
+// TLS verification, sign-up and sign-in switches) is a stricter setting, so
+// no restore loosens it.
+func TestTrustSettingsAreStricter(t *testing.T) {
 	looksLikeTrust := regexp.MustCompile(`allow_private|trusted|allowed_origins|cors|insecure|skip_verify|tls_verify|signup\.enabled|local_password_login|email_auto_match|self_service`)
-	for _, key := range config.AdminSettingDefaultKeys() {
-		if looksLikeTrust.MatchString(key) && !trusted[key] {
-			t.Errorf("%s looks like a trust setting; add it to trustSettings and classify it server-specific", key)
+	for _, key := range settingRegistry() {
+		if kind, _ := SettingKindOf(key); looksLikeTrust.MatchString(key) && kind != SettingKindStricter {
+			t.Errorf("%s looks like a trust setting and is %s; add it to accessSettings", key, kind)
 		}
 	}
 }

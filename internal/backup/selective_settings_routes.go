@@ -2,41 +2,18 @@ package backup
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 )
-
-// settingRoute is an outside service's address with the secrets this server
-// sends there. A restore never pairs a backup's address with this server's
-// secret: the backup's address could be anyone's.
-type settingRoute struct {
-	endpoint string
-	secrets  []string
-	// enabled turns the service on; a restore that clears the secrets turns
-	// it off until they are entered again.
-	enabled string
-}
-
-// settingRoutes are the restorable settings that name where a service
-// connects together with the secrets it sends there. The S3 and storage
-// endpoints, the search engine, AI providers, and the push relay are
-// server-specific and never restored; Discord, TMDB, MDBList, IntroDB, and
-// the watch providers connect to fixed hosts; a plugin's configuration is
-// restored whole or not at all. TestSettingRoutesAreOnOnePage keeps each
-// route on one settings page, so one page restores it.
-var settingRoutes = []settingRoute{
-	{endpoint: "email.smtp_host", secrets: []string{"email.smtp_password"}, enabled: "email.enabled"},
-	{endpoint: "ai.base_url", secrets: []string{"ai.api_key"}},
-	{endpoint: "ai.asr_base_url", secrets: []string{"ai.asr_api_key"}},
-	{endpoint: "subtitle_ai.base_url", secrets: []string{"subtitle_ai.api_key"}},
-	{endpoint: "recommendations.embedding_base_url", secrets: []string{"recommendations.embedding_auth_token", "recommendations.openai_api_key"}},
-}
 
 // guardRoutes applies settingRoutes to plans: when a restore changes a
 // service's address, each of its secrets must come from the backup too.
 // One the backup does not have, or that this server cannot read, is cleared
 // here rather than sent to the new address, and the service is turned off.
-// Every secret of a changed route is expected unchanged under the settings
-// lock (settingsUnchanged).
+// The decision rests on the route as it is here, so when a restore writes
+// any of a route's settings, every one of them is expected unchanged under
+// the settings lock (settingsUnchanged); a setting the backup does not
+// carry is added as a plan with no status, which nothing shows or writes.
 func guardRoutes(plans []settingPlan, live func(key string) string) []settingPlan {
 	index := map[string]int{}
 	for i, p := range plans {
@@ -60,7 +37,6 @@ func guardRoutes(plans []settingPlan, live func(key string) string) []settingPla
 		for _, key := range r.secrets {
 			_, inBackup := index[key]
 			p := plan(key)
-			p.expect = true
 			if inBackup && (p.preview.Status == ItemDiffers || p.preview.Status == ItemOnThisServer) {
 				continue
 			}
@@ -75,7 +51,20 @@ func guardRoutes(plans []settingPlan, live func(key string) string) []settingPla
 			p.preview.BackupValue, p.preview.CurrentValue = settingOff, live(r.enabled)
 		}
 	}
+	for _, r := range settingRoutes {
+		if !slices.ContainsFunc(r.keys(), func(key string) bool { i, ok := index[key]; return ok && plans[i].writes() }) {
+			continue
+		}
+		for _, key := range r.keys() {
+			plan(key).expect = true
+		}
+	}
 	return plans
+}
+
+// writes reports whether a restore writes the plan's setting.
+func (p settingPlan) writes() bool {
+	return p.preview.Status == ItemDiffers || p.preview.Status == SettingCleared
 }
 
 // settingCounts tallies a settings page's plans by status.

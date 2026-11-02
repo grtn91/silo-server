@@ -1,6 +1,7 @@
 package backup
 
 import (
+	"errors"
 	"slices"
 	"testing"
 )
@@ -47,10 +48,45 @@ func TestGuardRoutesNeverSendsALiveSecretElsewhere(t *testing.T) {
 			if ok && p.preview.Status == SettingCleared {
 				t.Fatalf("password cleared: %+v", p)
 			}
-			if _, ok := status(plans, enabled); ok {
-				t.Fatal("email turned off")
+			if on, ok := status(plans, enabled); ok && on.writes() {
+				t.Fatalf("email turned off: %+v", on)
 			}
 		})
+	}
+}
+
+// TestRoutesAreRecheckedUnderTheLock: a restore that writes any setting of
+// a route, the same address with the backup's password included, expects
+// the route's address, secrets, switch, and transport unchanged under the
+// settings lock, and stops the write when an admin changed one meanwhile.
+func TestRoutesAreRecheckedUnderTheLock(t *testing.T) {
+	const host, password, enabled = "email.smtp_host", "email.smtp_password", "email.enabled"
+	live := map[string]string{host: "mail.example.com", password: "the live password", enabled: "true", settingSMTPSecurity: "tls"}
+	plans := guardRoutes([]settingPlan{
+		{page: pageEmail, value: live[host], live: live[host], preview: PreviewSetting{Key: host, Status: ItemOnThisServer}},
+		{page: pageEmail, value: "the backup's password", live: live[password], preview: PreviewSetting{Key: password, Status: ItemDiffers}},
+	}, func(key string) string { return live[key] })
+	values, expected := map[string]string{}, map[string]string{}
+	for _, p := range plans {
+		if p.writes() {
+			values[p.preview.Key] = p.value
+		}
+		if p.expect {
+			expected[p.preview.Key] = p.live
+		}
+	}
+	for _, key := range []string{host, password, enabled, settingSMTPSecurity} {
+		if expected[key] != live[key] {
+			t.Fatalf("expected %v, want every route setting as read", expected)
+		}
+	}
+	check := settingsUnchanged(values, expected)
+	if err := check(live); err != nil {
+		t.Fatalf("an unchanged route: %v", err)
+	}
+	moved := map[string]string{host: "mail.elsewhere.example", password: "a new password", enabled: "true", settingSMTPSecurity: "tls"}
+	if err := check(moved); !errors.Is(err, errSettingsChanged) {
+		t.Fatalf("a route changed under the restore = %v, want errSettingsChanged", err)
 	}
 }
 

@@ -100,7 +100,7 @@ func (p *planner) planSettings(ctx context.Context) ([]settingPlan, error) {
 		if !have {
 			live = ""
 		}
-		switch _, wider := config.AccessSettingWider(e.Key, value, live); {
+		switch _, wider := AccessSettingWider(e.Key, value, live); {
 		case have && current == value:
 			plan.preview.Status = ItemOnThisServer
 		case wider:
@@ -155,9 +155,12 @@ func settingsPageItems(plans []settingPlan) []PreviewItem {
 		item := PreviewItem{ID: page.ID, Kind: KindSettingsPage, Label: page.Title, Status: ItemOnThisServer, Reason: ReasonSame}
 		var counts settingCounts
 		for _, plan := range list {
+			if plan.preview.Status == "" {
+				continue // compared under the lock, not restored
+			}
 			item.Settings = append(item.Settings, plan.preview)
 			counts.add(plan)
-			if plan.preview.Status == ItemDiffers || plan.preview.Status == SettingCleared {
+			if plan.writes() {
 				item.RestartRequired = item.RestartRequired || plan.preview.RestartRequired
 				item.ExternalService = item.ExternalService || plan.preview.Class == SettingExternalService
 			}
@@ -202,7 +205,7 @@ func (a *applier) applySettingsPage(ctx context.Context, tx pgx.Tx, id string) (
 			continue
 		}
 		counts.add(p)
-		if p.preview.Status == ItemDiffers || p.preview.Status == SettingCleared {
+		if p.writes() {
 			values[p.preview.Key] = p.value
 		}
 		if p.expect {
@@ -244,12 +247,12 @@ var errSettingsChanged = errors.New("a setting this restore compared changed sin
 
 // settingsUnchanged checks, under the settings lock, what planSettings
 // checked before it: no access setting of values grants more than the
-// stored value (config.AccessSettingWider), and each expected row is as it
+// stored value (AccessSettingWider), and each expected row is as it
 // was read.
 func settingsUnchanged(values, expected map[string]string) func(stored map[string]string) error {
 	return func(stored map[string]string) error {
 		for key, value := range values {
-			if _, wider := config.AccessSettingWider(key, value, stored[key]); wider {
+			if _, wider := AccessSettingWider(key, value, stored[key]); wider {
 				return fmt.Errorf("%w: %s", errSettingsChanged, key)
 			}
 		}

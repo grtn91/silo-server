@@ -179,7 +179,7 @@ func RestoreSwap(ctx context.Context, src *Source, loader DatabaseLoader, ctl Co
 	if err := clearLostSettings(ctx, loader, restoredURL, m, opts.Validate, opts.Cipher, out); err != nil {
 		return discard(err)
 	}
-	if err := carryIdleCredentials(ctx, ctl, live, loader, restoredURL, opts.LiveURL, out); err != nil {
+	if err := carryLiveState(ctx, ctl, live, loader, restoredURL, opts, out); err != nil {
 		return discard(err)
 	}
 	// A subtitle the backup left out may still be in the live storage the
@@ -255,16 +255,19 @@ func lockLive(ctx context.Context, ctl ControlDB, liveURL string) (string, func(
 	return live, unlock, err
 }
 
-// carryIdleCredentials carries the live server's credentials into the
-// restored database. They are as they will be at the swap only while no
-// other client is on the live database: one that connected since preflight
-// stops the restore here, and the swap checks again once the live database
-// is closed (swap.run).
-func carryIdleCredentials(ctx context.Context, ctl ControlDB, live string, loader DatabaseLoader, restoredURL, liveURL string, out io.Writer) error {
+// carryLiveState carries the live server's credentials into the restored
+// database, and keeps its stricter access settings and security switches.
+// They are as they will be at the swap only while no other client is on the
+// live database: one that connected since preflight stops the restore here,
+// and the swap checks again once the live database is closed (swap.run).
+func carryLiveState(ctx context.Context, ctl ControlDB, live string, loader DatabaseLoader, restoredURL string, opts SwapOptions, out io.Writer) error {
 	if err := checkLiveIdle(ctx, ctl, live); err != nil {
 		return err
 	}
-	return carryCredentials(ctx, loader, restoredURL, liveURL, out)
+	if err := carryCredentials(ctx, loader, restoredURL, opts.LiveURL, out); err != nil {
+		return err
+	}
+	return keepStricterSettings(ctx, loader, restoredURL, opts.LiveURL, opts.Cipher, out)
 }
 
 // checkLiveIdle requires that no client other than this command is on the

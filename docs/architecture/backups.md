@@ -547,11 +547,11 @@ grouped by the admin page that edits each key: a key or prefix with its class.
   server has them. `TestTrustSettingsAreServerSpecific` fails on a setting
   named like one that is not in the list.
 - A restore never widens access. The access settings
-  (`config.accessSettings`: `access.unrated_content`, the Jellyfin and
+  (`accessSettings`, shared with the full restore: `access.unrated_content`, the Jellyfin and
   Audiobookshelf sign-in switches, access and refresh token and Jellyfin
   session lifetimes, and the identity provider's re-check interval and
   outage policy) are offered, but a value that grants more than the live one
-  (`config.AccessSettingWider`; a value that does not parse counts as wider)
+  (`AccessSettingWider`; a value that does not parse counts as wider)
   is never written: the preview marks it `kept_stricter` and the report says
   the stricter current value was kept. The write compares again under the
   settings lock (`accessUnchanged`, the admin settings write path's guard),
@@ -1234,14 +1234,43 @@ neither list.
   server's value (`stricterFlags`), so it never turns back on what an admin
   turned off since the backup: an account's `enabled`, `break_glass`, and
   `local_password_login_enabled` (off wins) and `password_change_required`
-  (on wins), and the `enabled` of a plugin installation that signs people in
-  (one with sign-in bindings or an `auth_provider.v1` capability), whose
-  carried sign-in links then cannot sign anyone in. A row is the live one
-  when its id and username (an account) or plugin id match. The command
+  (on wins), and the `enabled` of every plugin installation, plugin task
+  binding, and plugin catalog (off wins): plugins run as the server, so one
+  turned off during an incident stays off, and a sign-in provider's carried
+  links then sign no one in. A plugin installation or catalog the backup
+  has and the live server no longer does comes back off, never on. Nothing
+  a full restore does turns a plugin on; the admin does. A row is the live
+  one when its id and username (an account), plugin id, catalog URL, or
+  installation and capability (a task binding) match. The command
   lists each switch it kept. Grants through policy rather than a switch
   (`users.role`, `is_owner`, access group and per-account permissions) are
   restored as the backup has them; the credential carry above refuses
   credentials whose account gains authority that way.
+- Every server setting has exactly one kind (`SettingKindOf`,
+  `settings_classes.go`), which both restores read: restored as the backup
+  has it, server-specific (never written by a selective restore), stricter
+  of backup and live (`accessSettings`), or part of a service route
+  (`settingRoutes`: an address and the secrets sent there, restored
+  together). `TestEverySettingIsClassified` enumerates the registries (admin
+  defaults, sensitive settings, branding assets, rate limits, and the keys
+  the server writes for itself) and fails on a setting with no kind or an
+  entry that names none.
+- It also keeps the live value of each stricter setting the backup would
+  widen (`accessSettings` in `settings_access.go`): who may sign in and how (local password
+  sign-in, email auto-match, sign-up, self-service password reset, the
+  Jellyfin and Audiobookshelf sign-in surfaces), session, token, and
+  provider re-check lifetimes and the provider outage policy, what a
+  rating-capped profile sees (`access.unrated_content`), private-network
+  destinations, trusted proxies (a list that trusts any network the live
+  one does not is wider), mail transport security, and the sign-in rate
+  limits (`ratelimit.enabled`, `ratelimit.auth.*`, `ratelimit.ip.*`), and
+  the delivery switches (`email.enabled` and the email, Web Push, webhook,
+  Apple and Android push, Discord, server-channel, and fan-out notification
+  switches), so a channel an admin turned off stays off while its live
+  destinations are carried. The
+  live row is copied as stored, so an encrypted value stays bound to its
+  key name; values are compared decrypted, and one that does not decrypt
+  counts as wider. The command lists each setting it kept.
 - Separate mode (`--into`) restores a copy, not the live server: it deletes
   the backup's carried credentials and carries none.
 

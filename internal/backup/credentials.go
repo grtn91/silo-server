@@ -423,9 +423,8 @@ func carriedGrants(ctx context.Context, tx pgx.Tx, tables []secretTable, live []
 type liveCredentials struct {
 	authority map[int]accountAuthority
 	grants    map[grantKey]access.EffectiveUserPolicy
-	// stricter is each stricterFlags entry's live rows at its stricter
-	// value.
-	stricter []string
+	// stricter is each stricterFlags entry's live rows.
+	stricter []liveFlags
 }
 
 // readLiveCredentials reads each credential table of liveURL as one JSON

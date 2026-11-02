@@ -32,6 +32,16 @@ func (h *LibraryCollectionHandler) TemplateCollectionDefaults(bundleID, template
 	return tmpl.Title, input, tmpl.NeedsSetup(), true, nil
 }
 
+// SmartCollectionRestored refreshes a restored smart collection's item
+// count, as creating one in the editor does (refreshSmartCountAsync), but
+// in the caller's time.
+func (h *LibraryCollectionHandler) SmartCollectionRestored(ctx context.Context, collectionID string) error {
+	if h.SmartCountRefresher == nil {
+		return nil
+	}
+	return h.SmartCountRefresher.RefreshOne(ctx, collectionID)
+}
+
 // TemplateTitle is the title of templateID in this server's catalog.
 func (h *LibraryCollectionHandler) TemplateTitle(templateID string) (string, bool) {
 	tmpl, ok := h.templateRegistry().Get(templateID)

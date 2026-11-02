@@ -24,7 +24,15 @@ type stricterFlag struct {
 	scope string
 	// describe names a kept row in the restore's output.
 	describe string
+	// absentOff also sets the stricter value on a restored row the live
+	// server no longer has (removed after the backup), described by
+	// describeAbsent: it comes back, but never switched on.
+	absentOff      bool
+	describeAbsent string
 }
+
+// columnEnabled is the switch column most flagged tables name.
+const columnEnabled = "enabled"
 
 // The keys a row is matched by.
 const (
@@ -40,7 +48,7 @@ const (
 // the backup has them, and switches in credential tables, which the
 // restore already carries from the live server (secretTables).
 var stricterFlags = []stricterFlag{
-	{table: tableUsers, column: "enabled", stricter: false, key: accountKey, scope: everyRow,
+	{table: tableUsers, column: columnEnabled, stricter: false, key: accountKey, scope: everyRow,
 		describe: `format('account %s kept disabled', t.username)`},
 	{table: tableUsers, column: "break_glass", stricter: false, key: accountKey, scope: everyRow,
 		describe: `format('account %s kept without break-glass sign-in', t.username)`},
@@ -48,23 +56,41 @@ var stricterFlags = []stricterFlag{
 		describe: `format('account %s kept without password sign-in', t.username)`},
 	{table: tableUsers, column: "password_change_required", stricter: true, key: accountKey, scope: everyRow,
 		describe: `format('account %s still must change its password', t.username)`},
-	// A sign-in provider an admin turned off; its carried sign-in links
-	// cannot sign anyone in while it stays off.
-	{table: "plugin_installations", column: "enabled", stricter: false, key: pluginKey,
-		scope: `(EXISTS (SELECT 1 FROM plugin_auth_bindings b WHERE b.plugin_installation_id = t.id)
-			OR EXISTS (SELECT 1 FROM plugin_capabilities c WHERE c.plugin_installation_id = t.id AND c.capability_type = 'auth_provider.v1'))`,
-		describe: `format('sign-in provider %s kept off', t.plugin_id)`},
+	// Plugins run as the server: one an admin turned off stays off (its
+	// carried sign-in links then sign no one in), and one removed since
+	// the backup comes back off. Nothing a restore does turns one on.
+	{table: "plugin_installations", column: columnEnabled, stricter: false, key: pluginKey, scope: everyRow,
+		describe: `format('plugin %s kept off', t.plugin_id)`, absentOff: true,
+		describeAbsent: `format('plugin %s restored off: removed after the backup', t.plugin_id)`},
+	{table: "plugin_task_bindings", column: columnEnabled, stricter: false, key: `t.plugin_installation_id::text || ':' || t.capability_id`, scope: everyRow,
+		describe: `format('plugin task %s kept off', t.capability_id)`},
+	// A plugin catalog an admin turned off stays off, and one removed since
+	// comes back off, so nothing installs or updates from it.
+	{table: "plugin_repositories", column: columnEnabled, stricter: false, key: `t.url`, scope: everyRow,
+		describe: `format('plugin catalog %s kept off', t.url)`, absentOff: true,
+		describeAbsent: `format('plugin catalog %s restored off: removed after the backup', t.url)`},
 }
 
-// readStricterFlags reads, in the live snapshot tx, each flag's live rows
-// at the stricter value as a JSON array of {id, key}.
-func readStricterFlags(ctx context.Context, tx pgx.Tx) ([]string, error) {
-	out := make([]string, len(stricterFlags))
+// liveFlags is what readStricterFlags reads for one flag: the live rows at
+// its stricter value, and, for an absentOff flag, every live row, each a
+// JSON array of {id, key}.
+type liveFlags struct {
+	stricter, present string
+}
+
+// readStricterFlags reads each flag's live rows in the live snapshot tx.
+func readStricterFlags(ctx context.Context, tx pgx.Tx) ([]liveFlags, error) {
+	out := make([]liveFlags, len(stricterFlags))
 	for i, f := range stricterFlags {
-		sql := fmt.Sprintf(`SELECT coalesce(json_agg(json_build_object('id', t.id, 'key', %s)), '[]')::text
-			FROM %s t WHERE t.%s = $1 AND %s`, f.key, f.table, f.column, f.scope)
-		if err := tx.QueryRow(ctx, sql, f.stricter).Scan(&out[i]); err != nil {
+		rows := fmt.Sprintf(`SELECT coalesce(json_agg(json_build_object('id', t.id, 'key', %s)), '[]')::text FROM %s t`, f.key, f.table)
+		if err := tx.QueryRow(ctx, rows+fmt.Sprintf(` WHERE t.%s = $1 AND %s`, f.column, f.scope), f.stricter).Scan(&out[i].stricter); err != nil {
 			return nil, fmt.Errorf("%s.%s: %w", f.table, f.column, err)
+		}
+		out[i].present = "[]"
+		if f.absentOff {
+			if err := tx.QueryRow(ctx, rows).Scan(&out[i].present); err != nil {
+				return nil, fmt.Errorf("%s: %w", f.table, err)
+			}
 		}
 	}
 	return out, nil
@@ -72,7 +98,7 @@ func readStricterFlags(ctx context.Context, tx pgx.Tx) ([]string, error) {
 
 // keepStricterFlags sets, in the restored database, each flag of a row
 // that is also live at its stricter value, and returns what it kept.
-func keepStricterFlags(ctx context.Context, tx pgx.Tx, live []string) ([]string, error) {
+func keepStricterFlags(ctx context.Context, tx pgx.Tx, live []liveFlags) ([]string, error) {
 	var kept []string
 	for i, f := range stricterFlags {
 		// A backup taken before the column existed has nothing to keep;
@@ -87,15 +113,30 @@ func keepStricterFlags(ctx context.Context, tx pgx.Tx, live []string) ([]string,
 		}
 		sql := fmt.Sprintf(`UPDATE %[1]s t SET %[2]s = $2 FROM json_to_recordset($1::json) AS l(id bigint, key text)
 			WHERE t.id = l.id AND %[3]s = l.key AND t.%[2]s IS DISTINCT FROM $2 RETURNING %[4]s`, f.table, f.column, f.key, f.describe)
-		rows, err := tx.Query(ctx, sql, live[i], f.stricter)
+		names, err := collectKept(ctx, tx, sql, live[i].stricter, f.stricter)
 		if err != nil {
 			return nil, fmt.Errorf("%s.%s: %w", f.table, f.column, err)
 		}
-		names, err := pgx.CollectRows(rows, pgx.RowTo[string])
-		if err != nil {
+		kept = append(kept, names...)
+		if !f.absentOff {
+			continue
+		}
+		sql = fmt.Sprintf(`UPDATE %[1]s t SET %[2]s = $2 WHERE t.%[2]s IS DISTINCT FROM $2 AND NOT EXISTS (
+			SELECT 1 FROM json_to_recordset($1::json) AS l(id bigint, key text) WHERE t.id = l.id AND %[3]s = l.key) RETURNING %[4]s`,
+			f.table, f.column, f.key, f.describeAbsent)
+		if names, err = collectKept(ctx, tx, sql, live[i].present, f.stricter); err != nil {
 			return nil, fmt.Errorf("%s.%s: %w", f.table, f.column, err)
 		}
 		kept = append(kept, names...)
 	}
 	return kept, nil
+}
+
+// collectKept runs an UPDATE … RETURNING a description of each row.
+func collectKept(ctx context.Context, tx pgx.Tx, sql string, args ...any) ([]string, error) {
+	rows, err := tx.Query(ctx, sql, args...)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, pgx.RowTo[string])
 }

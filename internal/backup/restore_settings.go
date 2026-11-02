@@ -2,7 +2,6 @@ package backup
 
 import (
 	"slices"
-	"sort"
 	"strings"
 
 	"github.com/Silo-Server/silo-server/internal/branding"
@@ -63,17 +62,21 @@ const (
 	pageEmail      = "email"
 )
 
+// settingRateLimitOn is the switch that throttles sign-in.
+const settingRateLimitOn = "ratelimit.enabled"
+
 type settingRule struct {
 	page  string
 	class SettingClass
 }
 
-// settingRulesByPage is the allowlist, grouped by the admin page that edits
-// each setting: every restorable key or key prefix (ending in "." or "_")
-// with its class. Exact keys win over prefixes, and a longer prefix over a
-// shorter one. A key that matches nothing is never offered, and
-// TestEverySettingIsClassified fails for any admin setting default left out,
-// so a new setting must be classified here.
+// settingRulesByPage places each setting on the admin page that edits it,
+// with how the review shows it: portable, connecting to an outside service,
+// or server-specific. Whether a restore writes a setting at all is its
+// kind (SettingKindOf, the one classification both restores read); a key's
+// server-specific class here must match that kind, which
+// TestEverySettingHasAPage checks with every other setting having a page.
+// Exact keys win over prefixes, and a longer prefix over a shorter one.
 var settingRulesByPage = []struct {
 	page  string
 	rules map[string]SettingClass
@@ -82,7 +85,7 @@ var settingRulesByPage = []struct {
 		"server.identity_id":       SettingServerSpecific,
 		"server.public_url":        SettingServerSpecific,
 		"server.local_url":         SettingServerSpecific,
-		"clientip.trusted_proxies": SettingServerSpecific,
+		"clientip.trusted_proxies": SettingPortable,
 		"database.":                SettingServerSpecific,
 		"redis.":                   SettingServerSpecific,
 		"userdb.":                  SettingServerSpecific,
@@ -113,19 +116,17 @@ var settingRulesByPage = []struct {
 	{pageSignIn, map[string]SettingClass{
 		settingJWTSecret: SettingServerSpecific,
 		"auth.":          SettingPortable,
-		// Who may sign in and how (trustSettings): kept as the live server
-		// has them, so a restore cannot reopen a door closed since.
-		"auth.email_auto_match":               SettingServerSpecific,
-		"auth.local_password_login":           SettingServerSpecific,
-		"signup.":                             SettingServerSpecific,
-		"password_reset.self_service_enabled": SettingServerSpecific,
-		"password_reset.":                     SettingPortable,
+		// Who may sign in and how: restored only when no wider than here
+		// (SettingKindStricter).
+		"signup.":         SettingPortable,
+		"password_reset.": SettingPortable,
 	}},
 	{"security", map[string]SettingClass{
-		"ratelimit.":     SettingServerSpecific,
-		"media_servers.": SettingPortable,
-		// Reaching private networks (trustSettings).
-		"media_servers.allow_private_destinations": SettingServerSpecific,
+		"ratelimit.":       SettingServerSpecific,
+		settingRateLimitOn: SettingPortable,
+		"ratelimit.auth.":  SettingPortable,
+		"ratelimit.ip.":    SettingPortable,
+		"media_servers.":   SettingPortable,
 	}},
 	{pageLibrary, map[string]SettingClass{
 		"access.":    SettingPortable,
@@ -191,14 +192,11 @@ var settingRulesByPage = []struct {
 		"notifications.discord_enabled":        SettingExternalService,
 		"notifications.discord.":               SettingExternalService,
 		"notifications.":                       SettingPortable,
-		// Reaching private networks (trustSettings).
-		"notifications.webhooks.allow_private_destinations": SettingServerSpecific,
 	}},
 	{"compatibility", map[string]SettingClass{
 		settingABSJWTSecret:               SettingServerSpecific,
 		"jellyfin_compat.public_url":      SettingServerSpecific,
 		"jellyfin_compat.web_install_dir": SettingServerSpecific,
-		"jellyfin_compat.server_id":       SettingServerSpecific,
 		// Where the server downloads the Jellyfin web client it serves.
 		"jellyfin_compat.web_source_url": SettingExternalService,
 		"jellyfin_compat.":               SettingPortable,
@@ -247,20 +245,6 @@ var settingRules = func() map[string]settingRule {
 	return out
 }()
 
-// trustSettings are the network-security and sign-in trust toggles: whether
-// webhooks and media-server connections may reach private networks, which
-// proxies the client address is trusted from, and who may sign in or sign
-// up and how. A restore never writes them: a backup is only as trustworthy
-// as its destination, and one of these turned on would let a profile reach
-// this server's private network or let someone sign in. They stay as the
-// live server has them. TestTrustSettingsAreServerSpecific checks the list
-// and that any setting named like one is in it.
-var trustSettings = []string{
-	"notifications.webhooks.allow_private_destinations", "media_servers.allow_private_destinations",
-	"clientip.trusted_proxies", "auth.email_auto_match", "auth.local_password_login",
-	"signup.enabled", "password_reset.self_service_enabled",
-}
-
 // classifySetting finds a key's rule: the exact key, else the longest
 // matching prefix.
 func classifySetting(key string) (settingRule, bool) {
@@ -282,28 +266,19 @@ func classifySetting(key string) (settingRule, bool) {
 	return settingRules[best], true
 }
 
-// RestorableSetting reports the page and class of a key a restore offers.
-// Server-specific keys, keys another section restores, and unclassified keys
-// are not offered.
+// RestorableSetting reports the page and class of a key a selective restore
+// offers: one whose kind is not server-specific (SettingKindOf), on a page
+// that edits it. Keys another section restores (branding assets) and keys
+// with no page are not offered.
 func RestorableSetting(key string) (settingRule, bool) {
+	if kind, ok := SettingKindOf(key); !ok || kind == SettingKindServerSpecific {
+		return settingRule{}, false
+	}
 	rule, ok := classifySetting(key)
 	if !ok || (rule.class != SettingPortable && rule.class != SettingExternalService) {
 		return settingRule{}, false
 	}
 	return rule, true
-}
-
-// ServerSpecificSettings lists the keys and prefixes (ending in "." or "_")
-// a restore never writes, sorted.
-func ServerSpecificSettings() []string {
-	var out []string
-	for key, rule := range settingRules {
-		if rule.class == SettingServerSpecific {
-			out = append(out, key)
-		}
-	}
-	sort.Strings(out)
-	return out
 }
 
 // SettingsPages lists the pages in display order.
