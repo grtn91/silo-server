@@ -807,6 +807,12 @@ func (s *Service) preview(ctx context.Context, src restoreSource) (*RestorePrevi
 			}
 			section.Items = append(section.Items, items...)
 		}
+		for _, e := range rs.Unusable {
+			if e.Section == spec.id {
+				section.Items = append(section.Items, PreviewItem{ID: e.ID, Kind: e.Kind, Label: e.Label, Status: ItemNotOnThisServer,
+					Reason: ReasonUnreadable, Message: e.Message, Requires: []string{}, MissingBlobs: []string{}})
+			}
+		}
 		out.Sections = append(out.Sections, section)
 	}
 	return out, nil

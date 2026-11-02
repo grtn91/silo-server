@@ -8,6 +8,10 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"maps"
+	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -212,14 +216,9 @@ func TestReadRestoreSetRefusesHostileArchives(t *testing.T) {
 		"blob key outside prefixes":    section(SectionLibraries, func(s *SectionIndex) { s.Blobs = append(s.Blobs, "profile-avatars/a.jpg") }),
 		"server id with a slash":       func(i *RestoreSetIndex, _ *[]testEntry) { i.ServerID = "../x" },
 		"not a restore set":            func(i *RestoreSetIndex, _ *[]testEntry) { i.Format = "something-else" },
-		"relative library path": replace("libraries.json", func(e *testEntry) {
-			e.data = mustJSON(LibrariesDocument{Libraries: []LibraryEntry{{ID: 3, Name: "a", Type: "movies", Paths: []string{"media/../etc"}}}})
-		}),
 		"document points at an unlisted blob": replace("libraries.json", func(e *testEntry) {
 			e.data = mustJSON(LibrariesDocument{Libraries: []LibraryEntry{{ID: 3, Name: "a", Type: "movies", Paths: []string{"/a"}, Poster: "library-posters/other.jpg"}}})
 		}),
-		"branding entry for another setting": brandingCase(BrandingEntry{Key: "setup.completed", Ref: "evil.example", Blob: "branding/mark/evil.example"}),
-		"branding ref with a path":           brandingCase(BrandingEntry{Key: "branding.mark_ref", Ref: "../x.webp", Blob: "branding/x.webp"}),
 		"plugin document names another plugin": replace("plugins/tmdb/plugin.json", func(e *testEntry) {
 			var doc PluginDocument
 			_ = json.Unmarshal(e.data, &doc)
@@ -363,17 +362,6 @@ func TestReadRestoreSetReadsEveryFormatVersion(t *testing.T) {
 		}, true},
 		{"version 2 with home sections", 2, func(i *RestoreSetIndex, e *[]testEntry) { dropTemplates(i, e) }, false},
 		{"version 2 with template collections", 2, func(i *RestoreSetIndex, e *[]testEntry) { dropSection(i, e, SectionHomeSections) }, false},
-		{"a section carrying a collection its configuration does not name", 3, func(i *RestoreSetIndex, e *[]testEntry) {
-			for j := range *e {
-				if (*e)[j].name == homeSectionsDocumentName {
-					var doc HomeSectionsDocument
-					_ = json.Unmarshal((*e)[j].data, &doc)
-					doc.Sections[1].Config = json.RawMessage(`{"library_collection_id":"c1"}`)
-					(*e)[j].data = mustJSON(doc)
-				}
-			}
-			resyncDigests(i, *e)
-		}, false},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			index, entries := testRestoreSet()
@@ -401,4 +389,107 @@ func TestReadRestoreSetReportsMissingBlobs(t *testing.T) {
 	if len(rs.MissingBlobs) != 1 || rs.MissingBlobs[0] != "library-posters/3.jpg" {
 		t.Fatalf("missing = %v", rs.MissingBlobs)
 	}
+}
+
+// TestReadRestoreSetLeavesOutUnusableEntries: an entry holding a value no
+// restore could write is left out and listed, and the rest of the set stays
+// readable; nothing it names is written.
+func TestReadRestoreSetLeavesOutUnusableEntries(t *testing.T) {
+	editDocument := func(name string, into any, edit func()) func(*RestoreSetIndex, *[]testEntry) {
+		return func(_ *RestoreSetIndex, entries *[]testEntry) {
+			for j := range *entries {
+				if (*entries)[j].name == name {
+					_ = json.Unmarshal((*entries)[j].data, into)
+					edit()
+					(*entries)[j].data = mustJSON(into)
+				}
+			}
+		}
+	}
+	var libraries LibrariesDocument
+	var sections HomeSectionsDocument
+	for name, c := range map[string]struct {
+		edit    func(*RestoreSetIndex, *[]testEntry)
+		section string
+		gone    func(*RestoreSet) bool
+	}{
+		"relative library path": {editDocument("libraries.json", &libraries, func() { libraries.Libraries[0].Paths = []string{"media/../etc"} }),
+			SectionLibraries, func(rs *RestoreSet) bool { return len(rs.Libraries.Libraries) == 0 }},
+		"branding entry for another setting": {brandingCase(BrandingEntry{Key: "setup.completed", Ref: "evil.example", Blob: "branding/mark/evil.example"}),
+			SectionCollections, func(rs *RestoreSet) bool { return len(rs.Collections.Branding) == 0 }},
+		"branding ref with a path": {brandingCase(BrandingEntry{Key: "branding.mark_ref", Ref: "../x.webp", Blob: "branding/x.webp"}),
+			SectionCollections, func(rs *RestoreSet) bool { return len(rs.Collections.Branding) == 0 }},
+		"a section carrying a collection its configuration does not name": {editDocument(homeSectionsDocumentName, &sections, func() {
+			sections.Sections[1].Config = json.RawMessage(`{"library_collection_id":"c1"}`)
+		}), SectionHomeSections, func(rs *RestoreSet) bool { return len(rs.HomeSections.Sections) == 1 }},
+	} {
+		t.Run(name, func(t *testing.T) {
+			index, entries := testRestoreSet()
+			c.edit(&index, &entries)
+			resyncDigests(&index, entries)
+			rs, err := ReadRestoreSet(context.Background(), bytes.NewReader(buildTar(t, index, entries)), ReadOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(rs.Unusable) != 1 || rs.Unusable[0].Section != c.section || !c.gone(rs) {
+				t.Fatalf("unusable = %+v", rs.Unusable)
+			}
+		})
+	}
+}
+
+// A PAX sparse entry would read as a regular file of its logical size, with
+// holes filled from nothing; the reader refuses it before reading on.
+func TestReadRestoreSetRefusesSparseEntries(t *testing.T) {
+	index, entries := testRestoreSet()
+	const name = "blobs/library-posters/3.jpg"
+	sparseMap := []byte("1\n0\n1\n")
+	for i := range entries {
+		if entries[i].name == name {
+			entries[i].data = append(append(sparseMap, make([]byte, 512-len(sparseMap))...), 'x')
+		}
+	}
+	data := withPAXRecords(t, buildTar(t, index, entries), name, map[string]string{"GNU.sparse.major": "1", "GNU.sparse.minor": "0",
+		"GNU.sparse.name": name, "GNU.sparse.realsize": strconv.Itoa(1 << 30)})
+	_, err := ReadRestoreSet(context.Background(), bytes.NewReader(data), ReadOptions{ExtractDir: t.TempDir()})
+	if err == nil || !strings.Contains(err.Error(), "sparse") {
+		t.Fatalf("read = %v, want a refused sparse file", err)
+	}
+}
+
+// withPAXRecords puts a PAX extended header with records ahead of the entry
+// named name: archive/tar's writer will not write GNU sparse records.
+func withPAXRecords(t *testing.T, archive []byte, name string, records map[string]string) []byte {
+	t.Helper()
+	var body []byte
+	for _, key := range slices.Sorted(maps.Keys(records)) {
+		rec := " " + key + "=" + records[key] + "\n"
+		n := len(rec) + 1
+		for len(strconv.Itoa(n))+len(rec) != n {
+			n = len(strconv.Itoa(n)) + len(rec)
+		}
+		body = append(body, strconv.Itoa(n)+rec...)
+	}
+	header := make([]byte, 512)
+	copy(header, "PaxHeaders/x")
+	copy(header[100:], "0000644\x00")
+	copy(header[124:], fmt.Sprintf("%011o\x00", len(body)))
+	copy(header[136:], "00000000000\x00")
+	header[156] = 'x'
+	copy(header[257:], "ustar\x0000")
+	copy(header[148:], "        ")
+	sum := 0
+	for _, b := range header {
+		sum += int(b)
+	}
+	copy(header[148:], fmt.Sprintf("%06o\x00 ", sum))
+	block := slices.Concat(header, body)
+	block = append(block, make([]byte, (512-len(body)%512)%512)...)
+	for off := 0; off+512 <= len(archive); off += 512 {
+		if bytes.Equal(bytes.TrimRight(archive[off:off+100], "\x00"), []byte(name)) && string(archive[off+257:off+262]) == "ustar" {
+			return append(append(append([]byte{}, archive[:off]...), block...), archive[off:]...)
+		}
+	}
+	t.Fatalf("no header for %s", name)
+	return nil
 }

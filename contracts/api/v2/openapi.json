@@ -4039,7 +4039,8 @@
               "not_in_backup",
               "changed_since_preview",
               "template_not_available",
-              "collection_not_mapped"
+              "collection_not_mapped",
+              "unreadable"
             ],
             "type": "string"
           },
@@ -4276,7 +4277,8 @@
               "not_in_backup",
               "changed_since_preview",
               "template_not_available",
-              "collection_not_mapped"
+              "collection_not_mapped",
+              "unreadable"
             ],
             "type": "string"
           },

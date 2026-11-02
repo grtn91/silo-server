@@ -386,16 +386,26 @@ segment, backslash, or NUL; no duplicate paths, sections, or item ids;
 `restore-set.json` first; every other file listed in the index with its size
 and digest, and every listed file present; blobs only under their section's
 prefixes and only keys the section references, or variants stored in a
-referenced artwork original's directory; branding entries only for a
-branding asset setting (`branding.AssetSettingKeys`) whose reference is one
-file name naming the entry's own blob, because a branding entry is written as
-a setting; documents that decode strictly
+referenced artwork original's directory; documents that decode strictly
 (unknown fields and trailing data refused) and match the index counts; and
 limits on entries (200,000), document size (64 MiB), plugin archive and blob
 size (256 MiB), total bytes (32 GiB), and JSON nesting (32). A plugin archive
 also gets the installer's normal checks when it is installed. Readers accept
 every format version up to theirs and refuse a newer one with "This backup is
 from a newer Silo. Upgrade this server first."
+
+Any of those failures refuses the whole set. An entry whose own values no
+restore could write is left out instead, and the rest stays readable
+(`RestoreSet.Unusable`): a setting key that is not one, a library without an
+id, name, type, or clean absolute folders, a collection, template
+collection, or section with no valid id, title, scope, type, or JSON, a
+section carrying a collection its configuration does not name, item artwork
+that does not say what it is, a plugin whose configuration keys repeat or
+whose values are not JSON, and a branding entry that is not for a branding
+asset setting (`branding.AssetSettingKeys`) or whose reference is not one
+file name naming its own blob (a branding entry is written as a setting).
+The preview lists each as an unchoosable item with reason `unreadable`; an
+id listed twice still refuses the set.
 
 A referenced blob absent from the archive was missing when the backup was
 taken; the preview and the report list it with the item.

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -32,6 +33,10 @@ func wireBackupRestore(deps Dependencies, admin *handlers.AdminHandler, librarie
 		},
 		CreateJob: func(ctx context.Context, userID int, req backup.RestoreRequest) (*models.AdminJob, error) {
 			return jobs.Create(ctx, adminjob.CreateJobInput{JobType: adminjob.JobTypeBackupRestore, CreatedByUserID: userID, RequestPayload: req, Message: "Queued restore"})
+		},
+		CancelJob: func(ctx context.Context, id string) error {
+			_, err := jobs.Cancel(ctx, id, "Canceled: the restore was queued after the backup lock was lost", time.Now().UTC())
+			return err
 		},
 		ActiveRestore: ActiveBackupRestore(jobs),
 	}

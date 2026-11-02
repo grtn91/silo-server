@@ -14420,7 +14420,8 @@ export interface components {
         | "not_in_backup"
         | "changed_since_preview"
         | "template_not_available"
-        | "collection_not_mapped";
+        | "collection_not_mapped"
+        | "unreadable";
       /** @description Items (section:id) that must be chosen with this one: a collection whose library is restored by the same request */
       requires: string[];
       restart_required: boolean;
@@ -14519,7 +14520,8 @@ export interface components {
         | "not_in_backup"
         | "changed_since_preview"
         | "template_not_available"
-        | "collection_not_mapped";
+        | "collection_not_mapped"
+        | "unreadable";
       restart_keys: string[];
       restart_required: boolean;
       /** @enum {string} */
