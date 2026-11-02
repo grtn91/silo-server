@@ -127,7 +127,7 @@ func seedRoundTrip(t *testing.T, pool *pgxpool.Pool, settings *catalog.Encrypted
 	setSetting(t, pool, settings, seed.secretKey, seed.secretValue)
 	setSetting(t, pool, settings, "branding.mark_light_ref", suffix+".webp")
 	// A signing key, which no restore brings back (rotatedSettings).
-	setSetting(t, pool, settings, "auth.jwt_secret", "backup-jwt-"+suffix)
+	setSetting(t, pool, settings, settingJWTSecret, "backup-jwt-"+suffix)
 	// The source's recorded stores, which a separate restore must not keep.
 	for _, key := range storageIdentities {
 		setSetting(t, pool, settings, key, "local|/elsewhere")
@@ -158,6 +158,10 @@ func seedRoundTrip(t *testing.T, pool *pgxpool.Pool, settings *catalog.Encrypted
 	// An API key, which a full restore replaces with the live ones and a
 	// separate restore leaves out (secretTables, secretCarried).
 	exec(`INSERT INTO api_keys (user_id, label, key_hash) VALUES ($1, 'in backup', encode(sha256(convert_to($2, 'UTF8')), 'hex'))`, userID, "in-backup-"+suffix)
+	// A browser push subscription, which a full restore also takes from the
+	// live server.
+	exec(`INSERT INTO web_push_subscriptions (id, user_id, profile_id, endpoint, p256dh, auth, device_name, enabled, consecutive_failures, created_at, updated_at)
+		VALUES ($1, $2, $3, 'https://push.example.test/'||$1, 'key', 'auth', 'Browser', true, 0, now(), now())`, "push-"+suffix, userID, profileID)
 	seed.userID = userID
 	t.Cleanup(func() { _, _ = pool.Exec(context.Background(), `DELETE FROM user_profiles WHERE id = $1`, profileID) })
 	// An uploaded subtitle, which the backup keeps with
@@ -333,8 +337,10 @@ func checkCredentials(t *testing.T, loader PGLoader, pool *pgxpool.Pool, dsn, in
 		}
 	}
 	// After the backup: the backed-up key is revoked, one is created for
-	// the backed-up account, and one for an account the backup lacks.
+	// the backed-up account, and one for an account the backup lacks; the
+	// browser that subscribed to push notifications is removed.
 	exec(`DELETE FROM api_keys WHERE user_id = $1`, userID)
+	exec(`DELETE FROM web_push_subscriptions WHERE user_id = $1`, userID)
 	exec(`INSERT INTO api_keys (user_id, label, key_hash) VALUES ($1, 'after backup', encode(sha256(convert_to($2, 'UTF8')), 'hex'))`, userID, "live-"+suffix)
 	var newUser, keptID int64
 	if err := pool.QueryRow(ctx, `INSERT INTO users (role, username) VALUES ('user', $1) RETURNING id`, "after-backup-"+suffix).Scan(&newUser); err != nil {
@@ -366,6 +372,10 @@ func checkCredentials(t *testing.T, loader PGLoader, pool *pgxpool.Pool, dsn, in
 	var invited int
 	if err := restored.QueryRow(ctx, `SELECT count(*) FROM invitations WHERE token_hash = $1`, "invite-"+suffix).Scan(&invited); err != nil || invited != 1 {
 		t.Fatalf("restored %d copies of the live invitation (%v), want 1", invited, err)
+	}
+	var subscriptions int
+	if err := restored.QueryRow(ctx, `SELECT count(*) FROM web_push_subscriptions WHERE user_id = $1`, userID).Scan(&subscriptions); err != nil || subscriptions != 0 {
+		t.Fatalf("restored %d push subscriptions removed since the backup (%v), want none", subscriptions, err)
 	}
 	rows, err := restored.Query(ctx, `SELECT label FROM api_keys WHERE user_id = $1`, userID)
 	if err != nil {
@@ -512,16 +522,19 @@ func checkAnotherKey(t *testing.T, src *Source, loader PGLoader, pool *pgxpool.P
 		t.Fatalf("%d encrypted settings left, want only the new signing keys; output %q must name %s and not the signing key", left, out.String(), secretKey)
 	}
 	// The signing key is a new one, encrypted with this server's key.
-	jwt, err := catalog.NewEncryptedSettingsRepo(catalog.NewServerSettingsRepo(restored), other).Get(ctx, "auth.jwt_secret")
+	jwt, err := catalog.NewEncryptedSettingsRepo(catalog.NewServerSettingsRepo(restored), other).Get(ctx, settingJWTSecret)
 	if err != nil || jwt == "" || strings.HasPrefix(jwt, "backup-jwt-") {
 		t.Fatalf("restored signing key = %q, %v; want a new one", jwt, err)
 	}
 }
 
 // secretColumn is a column name that can hold a bearer secret or a public
-// capability; notSecretColumn excludes names it matches that never do.
+// capability, or name a destination that receives data without a session;
+// notSecretColumn excludes names it matches that never do.
 var (
-	secretColumn    = `token|secret|slug|key_hash|password|pin_hash|ticket|api_key(_ref|_hash)?$|flow_hash|binder_hash|code_challenge|(^|_)codes?(_hash)?$`
+	secretColumn = `token|secret|slug|key_hash|password|pin_hash|ticket|api_key(_ref|_hash)?$|flow_hash|binder_hash|code_challenge|(^|_)codes?(_hash)?$` +
+		// Destinations that receive data without a session.
+		`|endpoint|p256dh|(^|_)auth$|subscription|webhook|callback|url_ciphertext|channel_id|installation_key|_ciphertext$`
 	notSecretColumn = `_codes$|status_code$|warning_code$|failure_code$|token_type$|token_expir|password_login_enabled$|password_change_required$`
 )
 
@@ -684,14 +697,18 @@ func TestBackupAndDeleteWithOnePoolConnectionDB(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	store, err := blobstore.NewFilesystem(t.TempDir())
+	settings := catalog.NewEncryptedSettingsRepo(catalog.NewServerSettingsRepo(pool), cipher)
+	// The stores as the server opens them: the first write records the
+	// storage identity through the settings, and so through the pool.
+	stores, _, err := blobstore.Open(ctx, blobstore.Options{Backend: blobstore.BackendLocal, LocalPath: t.TempDir(), Settings: settings})
 	if err != nil {
 		t.Fatal(err)
 	}
+	store := stores.Operational
 	serverID := "one-conn-" + randomHex(t, 4)
 	svc := New(Options{
-		Pool: pool, DatabaseURL: dsn, Settings: catalog.NewEncryptedSettingsRepo(catalog.NewServerSettingsRepo(pool), cipher),
-		Stores: blobstore.Stores{Assets: store, Operational: store}, Destination: NewStoreDestination(store),
+		Pool: pool, DatabaseURL: dsn, Settings: settings,
+		Stores: stores, Destination: NewStoreDestination(store),
 		Locker: PostgresLocker{Pool: pool}, Status: PostgresStatus{Pool: pool},
 		ServerID:  func(context.Context) (string, error) { return serverID, nil },
 		FindTools: func(context.Context) (Tools, error) { return tools, nil },

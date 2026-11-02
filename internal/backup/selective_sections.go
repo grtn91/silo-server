@@ -461,6 +461,9 @@ func (a *applier) restoreManagedCollection(ctx context.Context, tx pgx.Tx, e Hom
 		return "", err
 	}
 	if existing != "" {
+		if err := catalog.LockLibraryCollectionInTx(ctx, tx, existing); err != nil {
+			return "", err
+		}
 		_, err = catalog.AddMissingItemsInTx(ctx, tx, existing, items)
 		return existing, err
 	}

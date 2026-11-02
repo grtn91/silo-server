@@ -361,6 +361,10 @@ func (a *applier) applyTemplateCollection(ctx context.Context, tx pgx.Tx, id str
 func (a *applier) updateTemplateCollection(ctx context.Context, tx pgx.Tx, t TemplateCollectionEntry, plan templatePlan, asCollection CollectionEntry, libMap map[int]int, item ReportItem) (applied, error) {
 	u := plan.custom.update
 	u.ID = plan.local.id
+	// The collection's parent first, as for an admin collection.
+	if err := catalog.LockLibraryCollectionInTx(ctx, tx, plan.local.id); err != nil {
+		return applied{}, err
+	}
 	if err := a.templateImages(ctx, t, plan.local.id, plan.custom, &u, &item); err != nil {
 		return applied{}, err
 	}

@@ -65,6 +65,12 @@ func NewStoreDestination(store blobstore.Store) Destination { //nolint:iface // 
 
 func (d StoreDestination) Name() string { return DestinationDefault }
 
+// RecordIdentity records the store's identity before a backup writes while
+// it holds the snapshot connection (blobstore.RecordIdentity).
+func (d StoreDestination) RecordIdentity(ctx context.Context) error {
+	return blobstore.RecordIdentity(ctx, d.Store)
+}
+
 // Put writes key and leaves it readable by this account only: a backup holds
 // password hashes and settings, and the store's own modes (0755 folders,
 // 0644 files) would let any account on the host that can reach the store

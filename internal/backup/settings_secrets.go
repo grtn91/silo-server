@@ -26,10 +26,16 @@ import (
 // anyway (secretTables), so nothing legitimate needs the old ones.
 var rotatedSettings = map[string]func([]byte) string{
 	// cmd/silo generates it at startup when empty.
-	"auth.jwt_secret": base64.StdEncoding.EncodeToString,
+	settingJWTSecret: base64.StdEncoding.EncodeToString,
 	// internal/audiobooks generates it on first use when empty.
-	"audiobooks.abs.jwt_secret": hex.EncodeToString,
+	settingABSJWTSecret: hex.EncodeToString,
 }
+
+// The signing key settings, named once for this package.
+const (
+	settingJWTSecret    = "auth.jwt_secret"           //nolint:gosec // G101: a setting name, not a credential
+	settingABSJWTSecret = "audiobooks.abs.jwt_secret" //nolint:gosec // G101: a setting name, not a credential
+)
 
 // restoredSecretSettings are the other sensitive settings
 // (catalog.SensitiveSettingKeys): credentials an operator entered for other

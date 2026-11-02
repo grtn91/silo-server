@@ -232,6 +232,15 @@ func (r *LibraryCollectionRepository) AddItemIfAbsent(ctx context.Context, colle
 // triggers can run. Definition updates already acquire parents first. This
 // ordering prevents items->revision->parent and membership->revision inversions
 // between these repository writers, including the legacy entry points.
+// LockLibraryCollectionInTx takes a collection's parent lock, the first
+// lock of every edit of an existing collection: a caller that then creates a
+// group, adds items, or regroups a membership (each of which can take a
+// library's order revision) takes it before any of them, as the library
+// editor takes the parents before the order revision.
+func LockLibraryCollectionInTx(ctx context.Context, tx pgx.Tx, id string) error {
+	return lockLibraryCollectionParent(ctx, tx, id)
+}
+
 func lockLibraryCollectionParent(ctx context.Context, tx pgx.Tx, id string) error {
 	var found string
 	err := tx.QueryRow(ctx, `SELECT id FROM library_collections WHERE id=$1 FOR NO KEY UPDATE`, id).Scan(&found)

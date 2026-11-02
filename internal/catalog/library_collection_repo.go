@@ -1053,8 +1053,15 @@ func AddMissingItemsInTx(ctx context.Context, tx pgx.Tx, collectionID string, me
 // GroupUngroupedMembershipInTx puts a collection's membership in one library
 // into groupID, at the end of that group's order, only while the membership
 // is ungrouped, in the caller's transaction. It reports whether it changed
-// anything; a membership an admin grouped is left alone.
+// anything; a membership an admin grouped is left alone. It takes the
+// collection-editing locks in their order: the collection parent, then the
+// library's order revision, then the membership row. MoveAndReorder takes
+// the library's parents before anything else, so it waits on the parent
+// here instead of holding the membership row this needs.
 func GroupUngroupedMembershipInTx(ctx context.Context, tx pgx.Tx, collectionID string, libraryID int, groupID string) (bool, error) {
+	if err := lockLibraryCollectionParent(ctx, tx, collectionID); err != nil {
+		return false, err
+	}
 	if err := lockLibraryCollectionOrderRevisions(ctx, tx, []int{libraryID}); err != nil {
 		return false, err
 	}

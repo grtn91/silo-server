@@ -674,6 +674,36 @@ are written under ids the restore just took, so a legitimate restore finds
 them absent or equal; an archive naming a live asset's key cannot replace
 it, whether or not the item's transaction later commits.
 
+Before its first item, a restore records each store's identity
+(`blobstore.RecordIdentity`), which a store opened with settings would do on
+its first write through a pool connection; items write files inside their
+transactions, and on a one-connection pool that second connection never
+comes.
+
+### Lock order
+
+An item takes the locks the editor or API path for the same rows takes, in
+the same order, so the two wait for each other instead of deadlocking:
+
+- Admin collections: the collection parent (`FOR NO KEY UPDATE`), then the
+  library's collection order revision, then membership rows. The library
+  editor's move and reorder takes every parent of the library first, in id
+  order, so a restore holding one parent never holds what the editor waits
+  on. Restoring onto an existing collection (admin, template, or a page
+  section's managed one) takes its parent first in the item's transaction
+  (`catalog.LockLibraryCollectionInTx`), before it creates a group, adds
+  items, or regroups a membership, any of which takes the order revision
+  (`TestGroupingWaitsForTheEditorDB`). The catalog functions take the parent
+  again themselves, which is free in the same transaction, so no caller can
+  skip it.
+- Page sections and featured sections: the section editor's order (see
+  `selective_sections.go`).
+- Accounts and profiles: `userdata.Preparer`'s order, the account locks, then
+  each data type's own, then data rows.
+- Libraries, plugins, and settings write through the editor's own functions
+  (`catalog.CreateFolderInTx`, the plugin installer, the admin settings write
+  path) and take their locks.
+
 ### Follow-ups
 
 Some work runs only after an item commits: a restored library's sections,
@@ -1025,19 +1055,25 @@ that holds a bearer secret or a public capability, each one way:
 - Carried from the live server: long-lived credentials that clients and
   other services present to Silo (API keys, pending invitations, invite
   codes, autoscan webhook tokens, audiobook RSS feed links, Plex and
-  Jellyfin webhook sync secrets with their profile mappings). A restore
+  Jellyfin webhook sync secrets with their profile mappings), and the
+  destinations that receive notifications without a session (browser and
+  mobile push registrations, notification webhooks, notification email
+  addresses, Discord links, server notification channels): one removed
+  since the backup would receive them again. A restore
   never brings back the backup's rows: one revoked after the backup would
   work again, and one created since would stop working. They stay in the
   dump (`marker_edit_audit` refers to API keys), and the restore replaces
   them as below.
 - Restored with the data: what looks like a secret admits no one to this
-  server or belongs to the record it comes with (outbound provider tokens
-  and signing secrets, push registrations, URL slugs, worker leases,
-  account passwords and profile PINs with their accounts).
+  server or belongs to the record it comes with (outbound provider tokens,
+  URL slugs, worker leases, delivery histories, account passwords and
+  profile PINs with their accounts).
 
 `TestSecretTablesAreClassifiedDB` scans the schema for secret-like column
-names and fails on a table missing from the list, so a new credential
-table needs a decision before it ships.
+names (tokens, secrets, slugs, hashes, codes) and destination-like ones
+(push endpoints and keys, subscriptions, webhooks, callbacks, encrypted
+URLs, channel ids) and fails on a table missing from the list, so a new
+credential or destination table needs a decision before it ships.
 
 Sensitive settings (`catalog.SensitiveSettingKeys`) are classified the same
 way in `internal/backup/settings_secrets.go`. The signing keys Silo
