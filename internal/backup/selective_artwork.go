@@ -149,7 +149,7 @@ func (a *applier) applyBranding(ctx context.Context, tx pgx.Tx, id string) (appl
 		// The setting already names the file just written back.
 		return applied{item: item}, nil
 	}
-	_, after, err := a.s.targets.ApplySettings(ctx, tx, map[string]string{entry.Key: entry.Ref})
+	_, after, err := a.s.targets.ApplySettings(ctx, tx, map[string]string{entry.Key: entry.Ref}, nil)
 	if err != nil {
 		return applied{}, err
 	}

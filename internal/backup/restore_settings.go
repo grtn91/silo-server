@@ -38,7 +38,7 @@ type SettingsPage struct {
 // page edits.
 var settingsPages = []SettingsPage{
 	{"general", "General"}, {pageAppearance, "Appearance"}, {"storage", "Storage"}, {"logging", "Logging"},
-	{"sign-in", "Sign-in"}, {"security", "Security"}, {pageLibrary, "Library & Metadata"}, {"search", "Search"},
+	{pageSignIn, "Sign-in"}, {"security", "Security"}, {pageLibrary, "Library & Metadata"}, {"search", "Search"},
 	{"playback", "Playback"}, {"downloads", "Downloads"}, {"requests", "Requests"}, {"providers", "Providers"},
 	{"ai", "AI Services"}, {"email", "Email"}, {"notifications", "Notifications"}, {"compatibility", "Compatibility"},
 	{"recommendations", "Recommendations"}, {"nodes", "Nodes"}, {pageBackups, "Backups"}, {pageOther, "Other settings"},
@@ -59,6 +59,7 @@ const (
 	pageAppearance = "appearance"
 	pageBackups    = "backups"
 	pageLibrary    = "library"
+	pageSignIn     = "sign-in"
 )
 
 type settingRule struct {
@@ -108,7 +109,7 @@ var settingRulesByPage = []struct {
 		"opslog.":          SettingPortable,
 		"policy.":          SettingPortable,
 	}},
-	{"sign-in", map[string]SettingClass{
+	{pageSignIn, map[string]SettingClass{
 		settingJWTSecret: SettingServerSpecific,
 		"auth.":          SettingPortable,
 		// Who may sign in and how (trustSettings): kept as the live server

@@ -187,6 +187,13 @@ func (p *planner) planLibraries(ctx context.Context) ([]libraryPlan, error) {
 			continue
 		}
 		plan.item.Status = ItemNotOnThisServer
+		if check := p.s.targets.CheckLibrary; check != nil {
+			if err := check(libraryInput(e)); err != nil {
+				plan.item.Reason, plan.item.Message = ReasonUnreadable, refusedMessage(err)
+				out = append(out, plan)
+				continue
+			}
+		}
 		var inUse string
 		for _, path := range e.Paths {
 			if local, ok := byPath[path]; ok {
@@ -479,6 +486,36 @@ func settingsPageItems(plans []settingPlan) []PreviewItem {
 
 // ---- Collections and artwork ----
 
+// collectionInput is the fields of c an editor's create command checks.
+func collectionInput(c CollectionEntry) catalog.CreateLibraryCollectionInput {
+	return catalog.CreateLibraryCollectionInput{
+		LibraryID: c.LibraryID, Slug: c.Slug, Title: c.Title, Description: c.Description, CollectionType: c.CollectionType,
+		Visibility: c.Visibility, SortOrder: c.SortOrder, Featured: c.Featured, SourceURL: c.SourceURL,
+		QueryDefinition: c.QueryDefinition, SortConfig: c.SortConfig, SourceConfig: c.SourceConfig, SyncSchedule: c.SyncSchedule,
+	}
+}
+
+// checkCollection runs CheckCollection when this server has it.
+func (p *planner) checkCollection(in catalog.CreateLibraryCollectionInput) error {
+	if p.s.targets.CheckCollection == nil {
+		return nil
+	}
+	return p.s.targets.CheckCollection(in)
+}
+
+// truncateText cuts s to at most limit bytes on a rune boundary.
+func truncateText(s string, limit int) string {
+	if len(s) <= limit {
+		return s
+	}
+	return strings.ToValidUTF8(s[:limit], "")
+}
+
+// refusedMessage says why an editor refuses an entry.
+func refusedMessage(err error) string {
+	return truncateText("It cannot be restored: "+err.Error(), 500)
+}
+
 // collectionPlan is one backup collection against this server.
 type collectionPlan struct {
 	item    PreviewItem
@@ -500,6 +537,10 @@ func (p *planner) planCollection(ctx context.Context, c CollectionEntry, libMap 
 		if strings.HasPrefix(key, "collection-images/") && !p.rs.HasBlob(key) {
 			plan.item.MissingBlobs = append(plan.item.MissingBlobs, key)
 		}
+	}
+	if err := p.checkCollection(collectionInput(c)); err != nil {
+		plan.item.Status, plan.item.Reason, plan.item.Message = ItemNotOnThisServer, ReasonUnreadable, refusedMessage(err)
+		return plan, nil
 	}
 	libraries := []int{c.LibraryID}
 	for _, l := range c.Libraries {

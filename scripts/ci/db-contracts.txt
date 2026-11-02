@@ -782,6 +782,7 @@
 ./internal/backup TestBackupAndDeleteWithOnePoolConnectionDB
 ./internal/backup TestEveryTableIsClassifiedDB
 ./internal/backup TestSelectiveRestoreDB
+./internal/backup TestRestoreRechecksAccessSettingsUnderTheLockDB
 ./internal/backup TestTemplateCollectionsAndHomeSectionsDB
 ./internal/backup TestIdentityTwinsRestoreOneToOneDB
 ./internal/plugins TestRestoreInstallationDB

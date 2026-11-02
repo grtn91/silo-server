@@ -472,6 +472,15 @@ only after the admin confirms (`accept_unauthenticated`), its preview
 included. Previews of one archive share a read (`restoreSetCache`); the read
 stops when every preview waiting on it has gone.
 
+A restored library, admin collection, template collection, or section
+meets the editor's own checks, run through restore targets so they are the
+editor's code: the library create command's (`CheckRestoredLibrary`), the
+admin collection create command's (`CheckRestoredCollection`), and the
+section editor's (`CheckRestoredSection`). One the editor would refuse is not
+offered, with its message. No entry may encode to more than the v2 API's
+request body cap (1 MiB; a collection's item list is not counted), as no
+editor request could write more for one.
+
 Any of those failures refuses the whole set. An entry whose own values no
 restore could write is left out instead, and the rest stays readable
 (`RestoreSet.Unusable`): a setting key that is not one, a library without an
@@ -533,8 +542,11 @@ grouped by the admin page that edits each key: a key or prefix with its class.
   outage policy) are offered, but a value that grants more than the live one
   (`config.AccessSettingWider`; a value that does not parse counts as wider)
   is never written: the preview marks it `kept_stricter` and the report says
-  the stricter current value was kept. `TestAccessSettingsAreComparedOnRestore`
-  requires every access setting to be offered, so none is compared in vain.
+  the stricter current value was kept. The write compares again under the
+  settings lock (`accessUnchanged`, the admin settings write path's guard),
+  so a stricter value an admin saves after the plan is kept: the item starts
+  again from its read. `TestAccessSettingsAreComparedOnRestore` requires
+  every access setting to be offered, so none is compared in vain.
 
 A key the table does not match is never offered. `TestEverySettingIsClassified`
 fails for any admin setting default, sensitive setting, or branding asset key

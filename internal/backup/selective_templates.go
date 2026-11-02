@@ -98,6 +98,15 @@ func (p *planner) planTemplateCollection(ctx context.Context, t TemplateCollecti
 	if _, ok := p.s.targets.TemplateTitle(t.TemplateID); !ok {
 		return notAvailable(fmt.Sprintf("This server's collection templates do not include %q.", t.TemplateID))
 	}
+	// The fields an admin changed are checked as the editor checks them.
+	if err := p.checkCollection(catalog.CreateLibraryCollectionInput{
+		LibraryID: t.LibraryID, Title: t.Title, Description: t.Description, Visibility: t.Visibility, SortOrder: t.SortOrder,
+		Featured: t.Featured, SourceURL: t.SourceURL, SortConfig: t.SortConfig, SourceConfig: t.SourceConfig, SyncSchedule: t.SyncSchedule,
+		ManagementMode: managementTemplateBundle, ManagementKey: t.ManagementKey,
+	}); err != nil {
+		plan.item.Status, plan.item.Reason, plan.item.Message = ItemNotOnThisServer, ReasonUnreadable, refusedMessage(err)
+		return plan, nil
+	}
 	var ok bool
 	if plan.scope, plan.item.Requires, ok = templateScope(t, libMap, restorable); !ok {
 		plan.item.Status, plan.item.Reason = ItemNotOnThisServer, ReasonLibraryNotRestorable

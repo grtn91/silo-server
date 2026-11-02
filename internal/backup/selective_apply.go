@@ -22,6 +22,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/backup/userdata"
 	"github.com/Silo-Server/silo-server/internal/blobstore"
 	"github.com/Silo-Server/silo-server/internal/catalog"
+	"github.com/Silo-Server/silo-server/internal/config"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/plugins"
 	"github.com/Silo-Server/silo-server/internal/sections"
@@ -287,7 +288,7 @@ func (a *applier) applyWithRetry(ctx context.Context, tx pgx.Tx, section, id str
 // from its read: a deadlock or serialization failure, or a section whose
 // references changed under it.
 func retryableItemError(err error) bool {
-	if errors.Is(err, sections.ErrReferencesChanged) {
+	if errors.Is(err, sections.ErrReferencesChanged) || errors.Is(err, errAccessTightened) {
 		return true
 	}
 	pgErr, ok := errors.AsType[*pgconn.PgError](err)
@@ -594,14 +595,10 @@ func (a *applier) applyLibrary(ctx context.Context, tx pgx.Tx, id string) (appli
 		return applied{}, err
 	}
 	realtime, ungrouped := e.RealtimeMonitoring, e.CollectionUngroupedSortOrder
-	folder, err := catalog.CreateFolderInTx(ctx, tx, catalog.CreateFolderInput{
-		ID: newID, Paths: e.Paths, Type: e.Type, Name: e.Name, MetadataLanguage: e.MetadataLanguage,
-		ChapterThumbnailsEnabled: e.ChapterThumbnailsEnabled, IntroDetectionEnabled: e.IntroDetectionEnabled,
-		TrickplayEnabled: e.TrickplayEnabled, TrailerKinds: e.TrailerKinds, RealtimeMonitoring: &realtime,
-		Disabled: !e.Enabled, AutoTranslateMetadata: e.AutoTranslateMetadata, PosterPath: poster,
-		CollectionUngroupedSortOrder: &ungrouped,
-		BoxSetsEnabled:               e.BoxSetsEnabled, BoxSetMinMovies: e.BoxSetMinMovies, BoxSetsInSearch: e.BoxSetsInSearch,
-	})
+	input := libraryInput(e)
+	input.ID, input.PosterPath = newID, poster
+	input.RealtimeMonitoring, input.CollectionUngroupedSortOrder = &realtime, &ungrouped
+	folder, err := catalog.CreateFolderInTx(ctx, tx, input)
 	if err != nil {
 		return applied{}, err
 	}
@@ -613,6 +610,17 @@ func (a *applier) applyLibrary(ctx context.Context, tx pgx.Tx, id string) (appli
 		return applied{}, err
 	}
 	return applied{item: item, mapLibrary: [2]int{e.ID, folder.ID}, after: a.s.CompleteFollowUps}, nil
+}
+
+// libraryInput is the library e creates, before its id and poster.
+func libraryInput(e LibraryEntry) catalog.CreateFolderInput {
+	return catalog.CreateFolderInput{
+		Paths: e.Paths, Type: e.Type, Name: e.Name, MetadataLanguage: e.MetadataLanguage,
+		ChapterThumbnailsEnabled: e.ChapterThumbnailsEnabled, IntroDetectionEnabled: e.IntroDetectionEnabled,
+		TrickplayEnabled: e.TrickplayEnabled, TrailerKinds: e.TrailerKinds, Disabled: !e.Enabled,
+		AutoTranslateMetadata: e.AutoTranslateMetadata,
+		BoxSetsEnabled:        e.BoxSetsEnabled, BoxSetMinMovies: e.BoxSetMinMovies, BoxSetsInSearch: e.BoxSetsInSearch,
+	}
 }
 
 // restoreLibraryPoster writes the poster under the new library's key before
@@ -735,7 +743,7 @@ func (a *applier) applySettingsPage(ctx context.Context, tx pgx.Tx, id string) (
 	if a.s.targets.ApplySettings == nil {
 		return applied{}, errors.New("settings restore is not available on this server")
 	}
-	restartKeys, after, err := a.s.targets.ApplySettings(ctx, tx, values)
+	restartKeys, after, err := a.s.targets.ApplySettings(ctx, tx, values, accessUnchanged(values))
 	if err != nil {
 		return applied{}, err
 	}
@@ -745,6 +753,26 @@ func (a *applier) applySettingsPage(ctx context.Context, tx pgx.Tx, id string) (
 	item.RestartKeys = restartKeys
 	item.RestartRequired = len(restartKeys) > 0
 	return applied{item: item, after: after}, nil
+}
+
+// errAccessTightened stops a settings write whose access setting the
+// stored value, read under the settings lock, now makes wider: an admin made
+// it stricter since the item was planned. The item starts again from its
+// read and keeps the stricter value.
+var errAccessTightened = errors.New("an access setting was made stricter since the restore read it")
+
+// accessUnchanged checks, under the settings lock, that no access setting
+// of values grants more than the stored value (config.AccessSettingWider),
+// as planSettings checked before the lock.
+func accessUnchanged(values map[string]string) func(stored map[string]string) error {
+	return func(stored map[string]string) error {
+		for key, value := range values {
+			if _, wider := config.AccessSettingWider(key, value, stored[key]); wider {
+				return fmt.Errorf("%w: %s", errAccessTightened, key)
+			}
+		}
+		return nil
+	}
 }
 
 // ---- Collections and artwork ----

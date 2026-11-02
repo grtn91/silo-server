@@ -192,6 +192,8 @@ type selectiveFixture struct {
 	calls         []int
 	created       []int
 	failFollowUps bool
+	// beforeSettings runs ahead of each settings write, before its lock.
+	beforeSettings func()
 }
 
 func newSelectiveFixture(t *testing.T) *selectiveFixture {
@@ -227,8 +229,18 @@ func newSelectiveFixture(t *testing.T) *selectiveFixture {
 	f.svc.SetRestoreTargets(RestoreTargets{
 		CheckFolder:  func(_ context.Context, path string) error { _, err := os.Stat(path); return err },
 		TrackArtwork: catalog.NewArtworkRevisionTracker(pool).TrackArtworkRevision,
-		ApplySettings: func(ctx context.Context, tx pgx.Tx, values map[string]string) ([]string, func(context.Context), error) {
-			err := f.settings.UpdateAtomicWithTx(ctx, tx, func(map[string]string, pgx.Tx) (map[string]string, error) { return values, nil })
+		ApplySettings: func(ctx context.Context, tx pgx.Tx, values map[string]string, check func(map[string]string) error) ([]string, func(context.Context), error) {
+			if f.beforeSettings != nil {
+				f.beforeSettings()
+			}
+			err := f.settings.UpdateAtomicWithTx(ctx, tx, func(stored map[string]string, _ pgx.Tx) (map[string]string, error) {
+				if check != nil {
+					if err := check(stored); err != nil {
+						return nil, err
+					}
+				}
+				return values, nil
+			})
 			return nil, func(context.Context) {}, err
 		},
 		LibraryCreated: func(_ context.Context, id int) error {
@@ -491,6 +503,52 @@ func (f *selectiveFixture) checkConflictingBlob(t *testing.T, seed selectiveSeed
 //     and the encrypted value are restored, and a before-restore backup is
 //     recorded;
 //   - running the same restore again changes nothing and runs no follow-up.
+//
+// TestRestoreRechecksAccessSettingsUnderTheLockDB: an access setting an
+// admin makes stricter after the restore planned its page, but before the
+// settings write takes its lock, keeps the admin's value. The item starts
+// again from its read and leaves the setting out.
+func TestRestoreRechecksAccessSettingsUnderTheLockDB(t *testing.T) {
+	f := newSelectiveFixture(t)
+	ctx := t.Context()
+	const key = config.AuthRefreshTokenExpirySettingKey
+	setSetting(t, f.pool, f.settings, key, "7d")
+	source, err := backupUnderLock(t, f.svc, KindManual)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.settings.Set(ctx, key, "30d"); err != nil {
+		t.Fatal(err)
+	}
+	preview, err := f.svc.Preview(ctx, source.ID, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	page := previewItem(t, preview, SectionSettings, pageSignIn)
+	if !page.Selectable {
+		t.Fatalf("sign-in page before the edit = %+v, want a stricter value to restore", page)
+	}
+	edited := false
+	f.beforeSettings = func() {
+		if !edited {
+			edited = true
+			if err := f.settings.Set(context.Background(), key, "1d"); err != nil {
+				t.Error(err)
+			}
+		}
+	}
+	report, err := f.restore(t, source.ID, preview.Digest, map[string][]string{SectionSettings: {pageSignIn}}, &testFence{pool: f.pool})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if item := reportItem(t, report, SectionSettings, pageSignIn); item.Outcome != OutcomeLeftOut || item.Reason != ReasonKeptStricter {
+		t.Fatalf("sign-in page = %+v, want left out, kept_stricter", item)
+	}
+	if got, err := f.settings.Get(ctx, key); err != nil || got != "1d" {
+		t.Fatalf("%s = %q, %v; want the admin's 1d", key, got, err)
+	}
+}
+
 func TestSelectiveRestoreDB(t *testing.T) {
 	f := newSelectiveFixture(t)
 	ctx := t.Context()

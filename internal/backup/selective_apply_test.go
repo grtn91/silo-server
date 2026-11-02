@@ -410,6 +410,7 @@ func TestSelectiveRestoreAuthenticatesTheManifest(t *testing.T) {
 func TestRetryableItemError(t *testing.T) {
 	for err, want := range map[error]bool{
 		fmt.Errorf("writing: %w", sections.ErrReferencesChanged): true,
+		fmt.Errorf("settings: %w", errAccessTightened):           true,
 		&pgconn.PgError{Code: "40P01"}:                           true,
 		fmt.Errorf("item: %w", &pgconn.PgError{Code: "40001"}):   true,
 		&pgconn.PgError{Code: "23505"}:                           false,

@@ -123,6 +123,14 @@ func (p *planner) planHomeSection(ctx context.Context, e HomeSectionEntry, libMa
 		plan.item.Status, plan.item.Message = ItemNotOnThisServer, "This server cannot restore page sections."
 		return plan, nil
 	}
+	if c := e.Collection; c != nil {
+		in := collectionInput(c.CollectionEntry)
+		in.ManagementMode, in.ManagementSource, in.ManagementKey = managementSection, c.ManagementSource, c.ManagementKey
+		if err := p.checkCollection(in); err != nil {
+			plan.item.Status, plan.item.Reason, plan.item.Message = ItemNotOnThisServer, ReasonUnreadable, refusedMessage(err)
+			return plan, nil
+		}
+	}
 	libraries := sectionConfigLibraries(e.Config)
 	if e.LibraryID != nil {
 		libraries = append([]int{*e.LibraryID}, libraries...)
