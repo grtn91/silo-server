@@ -364,7 +364,11 @@ func (s *Service) locateConfirmed(ctx context.Context, src restoreSource, accept
 // cachedSet is the located restore set as previews share it.
 func (s *Service) cachedSet(ctx context.Context, located locatedSource) (*RestoreSet, error) {
 	return s.restoreSets.get(ctx, located.digest, func(ctx context.Context) (*RestoreSet, error) {
-		return s.openRestoreSet(ctx, located, nil)
+		rs, err := s.openRestoreSet(ctx, located, nil)
+		if rs != nil {
+			rs.fromUnverified = !located.authenticated
+		}
+		return rs, err
 	})
 }
 

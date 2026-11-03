@@ -66,6 +66,12 @@ const (
 	maxRestoreSetDecoded = maxRestoreSetMetadata
 	// maxJSONElements bounds one array or object of a document.
 	maxJSONElements = 1_000_000
+	// maxCollectionItems bounds the item lists of a set's collections
+	// together: a large library's collections list a few hundred thousand.
+	maxCollectionItems = 1_000_000
+	// blobIndexCost is about what one blob costs the set's maps and
+	// lookups: its key in blobs, blobSizes, and the index's directories.
+	blobIndexCost = 256
 	// maxRestoreSetTrailer bounds the bytes after the tar end marker.
 	maxRestoreSetTrailer = 1 << 20
 )
@@ -104,6 +110,9 @@ type RestoreSet struct {
 	metadataBytes int64
 	indexOnce     sync.Once
 	index         *restoreSetIndex
+	// fromUnverified marks a cached set of a backup this server cannot
+	// verify; the cache keeps one at a time.
+	fromUnverified bool
 }
 
 // HasBlob reports whether the archive carries key.
@@ -555,6 +564,11 @@ func (p *restoreSetParser) finish() error {
 		}
 	}
 	sort.Strings(p.rs.MissingBlobs)
+	defer func() {
+		// What the set holds once read: its documents decoded (jsonsize's
+		// estimate) and its blob index, besides the bytes counted as read.
+		p.rs.metadataBytes += p.decoded + int64(len(p.rs.blobs))*blobIndexCost
+	}()
 	for _, si := range p.index.Sections {
 		count, err := p.decodeSection(si)
 		if err != nil {

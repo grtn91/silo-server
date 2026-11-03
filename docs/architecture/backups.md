@@ -485,7 +485,13 @@ over the collections, template collections, and section-managed collections
 it commits; the rest are left out with `over_restore_budget`, since a
 library's collections are listed whole. The collection editors have no
 per-field limits besides the request body cap, so a restore applies none of
-its own to single fields. A set lists at most the first 100 entries of a section it
+its own to single fields. A set's collections list at most 1,000,000 items together. The preview
+cache charges each set what it holds once read: the bytes read, jsonsize's
+estimate of its decoded documents, and its blob index; and it keeps at most
+one set of a backup this server cannot verify, dropping the older one. A
+restore job claimed while the request that queued it still holds the
+subsystem lock waits up to 10 seconds for it (`lockWithin`) before it
+gives up. A set lists at most the first 100 entries of a section it
 leaves out, and one more entry counting the rest, so a preview of a set of
 malformed entries stays small. A plugin archive is checked against its
 digest and discarded, never installed ([Plugins](#plugins)). Readers accept

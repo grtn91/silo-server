@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/Silo-Server/silo-server/internal/branding"
+	"github.com/Silo-Server/silo-server/internal/catalog"
 )
 
 // SettingClass says whether a restore offers a setting.
@@ -138,8 +139,8 @@ var settingRulesByPage = []struct {
 	}},
 	{"search", map[string]SettingClass{
 		"catalog.search.provider":                SettingServerSpecific,
-		"catalog.search.meilisearch.url":         SettingServerSpecific,
-		"catalog.search.meilisearch.api_key":     SettingServerSpecific,
+		catalog.SearchSettingMeilisearchURL:      SettingServerSpecific,
+		catalog.SearchSettingMeilisearchAPIKey:   SettingServerSpecific,
 		"catalog.search.meilisearch.index":       SettingServerSpecific,
 		"catalog.search.meilisearch.index_types": SettingPortable,
 		"catalog.search.meilisearch.":            SettingPortable,

@@ -198,6 +198,13 @@ func (p *restoreSetParser) validateCollections() error {
 		seen[id] = true
 		return nil
 	}
+	items := 0
+	for _, c := range d.Collections {
+		items += len(c.Items)
+	}
+	if items > maxCollectionItems {
+		return fmt.Errorf("its collections list more than %d items", maxCollectionItems)
+	}
 	collections := d.Collections[:0]
 	for _, c := range d.Collections {
 		if err := p.requireCollectionImages(c.Poster, c.Backdrop); err != nil {
