@@ -236,6 +236,10 @@ type DatabaseLoader interface {
 	// ServerID reads the server identity (serveridentity.Key) dbURL's
 	// settings hold, or "" when they hold none.
 	ServerID(ctx context.Context, dbURL string) (string, error)
+	// InterruptWork ends the work queued or running in the restored
+	// database dbURL and gives it liveURL's storage transition target
+	// (none for ""), returning what it changed.
+	InterruptWork(ctx context.Context, dbURL, liveURL string) ([]string, error)
 	// Extensions lists the extensions the dump at dumpPath creates.
 	Extensions(ctx context.Context, dumpPath string) ([]string, error)
 	// Superuser reports whether the role dbURL connects as is a superuser.
@@ -408,6 +412,9 @@ func RestoreSeparate(ctx context.Context, src *Source, loader DatabaseLoader, op
 	// A copy is not the live server: it gets none of the backup's
 	// credentials and none of the live ones.
 	if err := carryCredentials(ctx, loader, opts.Into, "", out); err != nil {
+		return RestoreReport{}, err
+	}
+	if err := interruptWork(ctx, loader, opts.Into, "", out); err != nil {
 		return RestoreReport{}, err
 	}
 	// The copy's files land in an empty directory, so a subtitle the backup
