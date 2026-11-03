@@ -232,37 +232,6 @@ func (p *planner) planLibraries(ctx context.Context) ([]libraryPlan, error) {
 	return out, nil
 }
 
-// costlyLibraryOptions names the options of e, among those that send
-// library data to outside services (with their charges) or run long jobs
-// beyond a new library's defaults, that e turns on: what a restore from an
-// unverified set leaves off (withoutCostlyOptions).
-func costlyLibraryOptions(e LibraryEntry) []string {
-	var out []string
-	for _, o := range []struct {
-		on    bool
-		label string
-	}{
-		{e.AutoTranslateMetadata, "AI translation of metadata"},
-		{e.TrickplayEnabled, "trickplay previews"},
-		{e.IntroDetectionEnabled, "intro detection"},
-		{e.ChapterThumbnailsEnabled, "chapter thumbnails"},
-		{e.BoxSetsEnabled, "box sets"},
-	} {
-		if o.on {
-			out = append(out, o.label)
-		}
-	}
-	return out
-}
-
-// withoutCostlyOptions is in with every option costlyLibraryOptions names
-// off.
-func withoutCostlyOptions(in catalog.CreateFolderInput) catalog.CreateFolderInput {
-	in.AutoTranslateMetadata, in.TrickplayEnabled, in.IntroDetectionEnabled, in.ChapterThumbnailsEnabled, in.BoxSetsEnabled =
-		false, false, false, false, false
-	return in
-}
-
 // joinLabels joins labels as a list in a sentence: "a", "a and b",
 // "a, b, and c".
 func joinLabels(labels []string) string {

@@ -179,6 +179,9 @@ func (s *Service) readSelected(ctx, work context.Context, req RestoreRequest, wa
 type applier struct {
 	s  *Service
 	rs *RestoreSet
+	// seasonal counts the seasonal sections this restore wrote
+	// (maxRestoredSeasonal).
+	seasonal int
 	// serverID is this server's identity; home sections match by id only
 	// when the backup is this server's.
 	serverID string

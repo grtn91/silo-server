@@ -612,9 +612,14 @@ grouped by the admin page that edits each key: a key or prefix with its class.
   a restore creates (an admin collection, or one a section carries) keeps
   its source but gets no sync schedule (`applier.createCollection`, which
   every creation goes through); and a template collection keeps this
-  server's source and sync schedule. The preview says what is left
-  off; for a verified backup it names the library options the restore
-  turns on.
+  server's source and sync schedule; a seasonal section comes back
+  disabled (the seasonal task fetches the MDBList lists of every enabled
+  one). `unverifiedWorkFields` lists every such item field, with where the
+  restore leaves it inactive, and `TestUnverifiedWorkIsClassified` walks
+  it. The preview says what is left off; for a verified backup it names the
+  library options the restore turns on and the lists a seasonal section
+  fetches. One restore writes at most 50 seasonal sections, and a seasonal
+  task run fetches at most 200 lists, taking the rest in turn on later runs.
 - Every collection a restore or import writes from a document stores its
   source as the editors build one (`collectionutil.CanonicalCollectionSource`):
   each list URL the sync fetches (an MDBList collection's, a `tmdb_list`
