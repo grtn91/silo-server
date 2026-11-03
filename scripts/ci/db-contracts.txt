@@ -792,6 +792,7 @@
 ./internal/backup TestManagedSectionPointedElsewhereIsRestoredDB
 ./internal/backup TestSelectiveRestoreOnOneConnectionDB
 ./internal/backup TestAccountsAndImportOnOneConnectionDB
+./internal/backup TestImportsReadInBatchesDB
 ./internal/api/handlers TestRestoredRateLimitsUseTheirWritePathDB
 ./internal/backup TestIdentityTwinsRestoreOneToOneDB
 ./internal/backup TestLayoutCollectionsMapAcrossServersDB

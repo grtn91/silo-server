@@ -15,6 +15,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/Silo-Server/silo-server/internal/access"
@@ -1418,4 +1420,102 @@ func TestAccountsAndImportOnOneConnectionDB(t *testing.T) {
 		_, err = transfer.Import(t.Context(), ProfileImportScope{UserID: user, ProfileID: dst}, data)
 		return err
 	})
+}
+
+// countingTx counts the statements an import sends.
+type countingTx struct {
+	pgx.Tx
+	n int
+}
+
+func (c *countingTx) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+	c.n++
+	return c.Tx.Exec(ctx, sql, args...)
+}
+
+func (c *countingTx) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
+	c.n++
+	return c.Tx.Query(ctx, sql, args...) //nolint:rowserrcheck // passes the rows to the caller, which checks them
+}
+
+func (c *countingTx) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
+	c.n++
+	return c.Tx.QueryRow(ctx, sql, args...)
+}
+
+func (c *countingTx) SendBatch(ctx context.Context, b *pgx.Batch) pgx.BatchResults {
+	c.n += b.Len()
+	return c.Tx.SendBatch(ctx, b)
+}
+
+// unknownItems matches no item, so an import plans and reads but writes no
+// item rows.
+type unknownItems struct{}
+
+func (unknownItems) Resolve(context.Context, string) (string, bool, error) { return "", false, nil }
+
+// TestImportsReadInBatchesDB: an import of 100,000 distinct entries of any
+// data type sends a bounded number of statements, not one per entry: reads
+// are batched as writes are, and the types that cap their entries stop at
+// the cap.
+func TestImportsReadInBatchesDB(t *testing.T) {
+	pool, _ := testDB(t)
+	ctx := t.Context()
+	sfx := randomHex(t, 4)
+	user := testAccount(t, pool, "batch-"+sfx, "h", nil, nil)
+	profile := "batch-" + sfx
+	testProfile(t, pool, user, profile, "Batch", true, "")
+	for name, d := range importerSamples {
+		t.Run(name, func(t *testing.T) {
+			id, _, _ := strings.Cut(name, " ")
+			dt, _ := userDataType(id)
+			entries := make([]string, 100_000)
+			for i := range entries {
+				e := strings.ReplaceAll(d.entry, `"m1"`, fmt.Sprintf(`"m%d"`, i))
+				e = strings.ReplaceAll(e, `"s1"`, fmt.Sprintf(`"s%d"`, i))
+				e = strings.ReplaceAll(e, `"c1"`, fmt.Sprintf(`"c%d"`, i))
+				e = strings.ReplaceAll(e, `"name":"A"`, fmt.Sprintf(`"name":"A%d"`, i))
+				entries[i] = e
+			}
+			doc := json.RawMessage(d.head + strings.Join(entries, ",") + d.tail)
+			tx, err := pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = tx.Rollback(context.Background()) }()
+			counted := &countingTx{Tx: tx}
+			target := userdata.Target{Owner: userdata.Owner{UserID: user, ProfileID: profile}, Items: unknownItems{}, Now: time.Now(), Untrusted: true,
+				Library: func(int) (int, bool) { return 0, false }, Profile: func(string) (string, bool) { return "", false }}
+			if _, err := dt.Validate(doc); err != nil {
+				return // refused before an import plans anything
+			}
+			if _, err := dt.Import(ctx, counted, target, doc); err != nil {
+				t.Fatal(err)
+			}
+			if counted.n > 10_000 {
+				t.Fatalf("100,000 entries sent %d statements", counted.n)
+			}
+		})
+	}
+	// Watchlist titles outside the library, at their cap, in a profile's own
+	// export: the profile's titles are read once.
+	titles := make([]string, 10_000)
+	for i := range titles {
+		titles[i] = fmt.Sprintf(`{"media_type":"movie","tmdb_id":%d,"imdb_id":"","tvdb_id":0,"title":"T","year":2001,"poster_path":"","certification":"","added_at":%s}`, i+1, sampleAt)
+	}
+	doc := json.RawMessage(`{"favorites":[],"watchlist":[],"titles":[` + strings.Join(titles, ",") + `]}`)
+	dt, _ := userDataType(userdata.Favorites)
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+	counted := &countingTx{Tx: tx}
+	target := userdata.Target{Owner: userdata.Owner{UserID: user, ProfileID: profile}, Items: unknownItems{}, Now: time.Now(), Untrusted: true}
+	if _, err := dt.Import(ctx, counted, target, doc); err != nil {
+		t.Fatal(err)
+	}
+	if counted.n > 10 {
+		t.Fatalf("10,000 watchlist titles sent %d statements", counted.n)
+	}
 }

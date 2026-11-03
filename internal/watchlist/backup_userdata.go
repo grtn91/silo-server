@@ -131,6 +131,9 @@ func decodeFavorites(data json.RawMessage) (favoritesDocument, userdata.Summary,
 	if err := userdata.DecodeStrict(data, &doc); err != nil {
 		return doc, sum, err
 	}
+	if len(doc.Titles) > maxImportedTitles {
+		return doc, sum, fmt.Errorf("more than %d watchlist titles", maxImportedTitles)
+	}
 	sum.Count = len(doc.Favorites) + len(doc.Watchlist) + len(doc.Titles)
 	if err := userdata.CheckEntries("favorites", sum.Count); err != nil {
 		return doc, sum, err
@@ -195,6 +198,10 @@ func (BackupData) Prepare(ctx context.Context, tx pgx.Tx, docs []userdata.Prepar
 	return EnsureTitlesInTx(ctx, tx, snaps, now)
 }
 
+// maxImportedTitles bounds the watchlist titles outside the library one
+// document carries: a profile's watchlist holds a few hundred.
+const maxImportedTitles = 10_000
+
 func (BackupData) Import(ctx context.Context, tx pgx.Tx, target userdata.Target, data json.RawMessage) (userdata.Result, error) {
 	doc, _, err := decodeFavorites(data)
 	if err != nil {
@@ -222,13 +229,17 @@ func (BackupData) Import(ctx context.Context, tx pgx.Tx, target userdata.Target,
 // account has listed the title.
 func importTitles(ctx context.Context, tx pgx.Tx, target userdata.Target, titles []watchedTitle, res *userdata.Result) error {
 	missing := 0
+	var listed map[string]bool
+	if target.Untrusted && len(titles) > 0 {
+		// The profile's titles are read once, not once per title.
+		var err error
+		if listed, err = ProfileTitlesInTx(ctx, tx, target.UserID, target.ProfileID); err != nil {
+			return fmt.Errorf("reading the profile's watchlist: %w", err)
+		}
+	}
 	for _, w := range titles {
 		if target.Untrusted {
-			has, err := ProfileHasTitleInTx(ctx, tx, target.UserID, target.ProfileID, w.snapshot())
-			if err != nil {
-				return fmt.Errorf("reading the profile's watchlist: %w", err)
-			}
-			if has {
+			if listed[w.snapshot().TitleKey()] {
 				res.Unchanged++
 			} else {
 				missing++
