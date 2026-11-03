@@ -185,6 +185,22 @@ func waitingForWrapper(t *testing.T, pool *pgxpool.Pool) int {
 	return n
 }
 
+// startupWaitTimeout bounds every wait on a test channel here, so a server
+// that fails or stalls fails the test instead of hanging the package.
+const startupWaitTimeout = 2 * time.Minute
+
+// awaitStartup receives a server's result, failing after startupWaitTimeout.
+func awaitStartup(t *testing.T, ch <-chan error, what string) error {
+	t.Helper()
+	select {
+	case err := <-ch:
+		return err
+	case <-time.After(startupWaitTimeout):
+		t.Fatalf("waited %s for %s", startupWaitTimeout, what)
+		return nil
+	}
+}
+
 // TestStartupMigrationsSerializeServersDB: while one server backs up and
 // migrates, another blocks on the wrapper and then finds nothing pending;
 // one whose wait runs out fails naming SILO_MIGRATION_WAIT.
@@ -197,11 +213,20 @@ func TestStartupMigrationsSerializeServersDB(t *testing.T) {
 	go func() {
 		first <- migrateAtStartup(ctx, pool, StartupOptions{BeforeMigrate: func(context.Context) (Guard, error) {
 			close(entered)
-			<-release
+			select {
+			case <-release:
+			case <-ctx.Done():
+			}
 			return nil, nil
 		}}, startupMigrations(pool, ""))
 	}()
-	<-entered
+	select {
+	case <-entered:
+	case err := <-first:
+		t.Fatalf("the first server returned %v before it reached its backup", err)
+	case <-time.After(startupWaitTimeout):
+		t.Fatal("the first server never reached its backup")
+	}
 
 	err := migrateAtStartup(ctx, pool, StartupOptions{Wait: 200 * time.Millisecond, BeforeMigrate: noBackupExpected(t)}, startupMigrations(pool, ""))
 	if err == nil || !strings.Contains(err.Error(), migrationWaitEnv) {
@@ -227,10 +252,10 @@ func TestStartupMigrationsSerializeServersDB(t *testing.T) {
 	default:
 	}
 	close(release)
-	if err := <-first; err != nil {
+	if err := awaitStartup(t, first, "the first server"); err != nil {
 		t.Fatalf("first server: %v", err)
 	}
-	if err := <-second; err != nil {
+	if err := awaitStartup(t, second, "the second server"); err != nil {
 		t.Fatalf("second server: %v", err)
 	}
 	if !tablePresent(t, pool, "legacy_2") {

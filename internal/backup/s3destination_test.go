@@ -172,7 +172,7 @@ func TestBackupFoldersAreDeletedManifestFirst(t *testing.T) {
 				t.Fatal("a delete that stopped partway succeeded")
 			}
 			folders, err := svc.folders(ctx, target{Destination: dest}, "server")
-			if err != nil || len(folders) != 1 || folders[0].manifest != nil || len(srv.Keys(testBucket, "silo/"+prefix)) != 3 {
+			if err != nil || len(folders) != 1 || folders[0].manifest != nil || !folders[0].noManifest || len(srv.Keys(testBucket, "silo/"+prefix)) != 3 {
 				t.Fatalf("after a partial delete: folders %+v, %v; want one incomplete folder of 3 objects", folders, err)
 			}
 		})
@@ -215,6 +215,21 @@ func TestBackupListingsAreBounded(t *testing.T) {
 		t.Fatalf("listing the server's folders took %d requests", n)
 	}
 
+	// The folder listed only in part is unknown: never swept or rotated.
+	svc := New(Options{Destination: dest})
+	listed, err := svc.folders(ctx, target{Destination: dest}, "server")
+	if err != nil || len(listed) != 3 {
+		t.Fatalf("folders = %+v, %v", listed, err)
+	}
+	for _, f := range listed {
+		if f.id == "20261029T040000Z-manual" && (!f.unreadable || f.noManifest) {
+			t.Fatalf("the overflowed folder = %+v, want unreadable", f)
+		}
+	}
+	if swept := planSweep(listed, time.Date(2027, 1, 1, 0, 0, 0, 0, time.UTC)); strings.Join(swept, ",") != "20261028T040000Z-nightly,20261031T040000Z-nightly" {
+		t.Fatalf("the sweep would delete %v, want only the two folders with no manifest", swept)
+	}
+
 	before = srv.ListRequests()
 	children, err := childFolders(ctx, dest, RootPrefix, maxOtherServers+2)
 	if err != nil || strings.Join(otherServerIDs(children, "server"), ",") != "other-a,other-b" {
@@ -227,6 +242,33 @@ func TestBackupListingsAreBounded(t *testing.T) {
 	before = srv.ListRequests()
 	if _, err := listObjects(ctx, dest, server+"20261030T040000Z-overwritten-blobs/", 100); !errors.Is(err, ErrTooManyObjects) || srv.ListRequests()-before != 1 {
 		t.Fatalf("a capped listing = %v after %d requests", err, srv.ListRequests()-before)
+	}
+}
+
+// cappedListing answers every listing as one that reached its cap.
+type cappedListing struct{ Destination }
+
+func (cappedListing) ListPage(context.Context, string, string, int) ([]blobstore.ObjectInfo, string, error) {
+	return nil, "", ErrTooManyObjects
+}
+
+// TestRotationActsOnlyOnACompleteListing: a listing that reaches its cap
+// (or fails) deletes nothing that run, neither rotating nor sweeping.
+func TestRotationActsOnlyOnACompleteListing(t *testing.T) {
+	srv := s3test.New(t, testBucket)
+	key := testArchiveKey(t, "server-a")
+	dest := NewS3Destination(s3TestConfig(srv))
+	svc := New(Options{Destination: dest, ArchiveKey: key, KeyCheck: key.Check, ManifestKey: seedManifestKey(t, "server-a"),
+		ActiveRestore: func(context.Context) (*RestoreRequest, error) { return nil, nil }})
+	old := time.Date(2026, 9, 1, 4, 0, 0, 0, time.UTC)
+	for i := range config.DefaultBackupKeep + 2 {
+		putEncryptedBackup(t, srv, "server-a", "server", FolderName(old.Add(time.Duration(i)*24*time.Hour), KindNightly), []byte("set"))
+	}
+	srv.Put(testBucket, "silo/"+folderPrefix("server", FolderName(old.Add(-48*time.Hour), KindNightly))+"db.dump.age", []byte("left"))
+	before := srv.Keys(testBucket, "")
+	rotated, swept, warnings := svc.rotate(t.Context(), nil, target{Destination: cappedListing{dest}, key: key}, "server", nil, false)
+	if len(rotated) != 0 || len(swept) != 0 || len(warnings) == 0 || len(srv.Keys(testBucket, "")) != len(before) {
+		t.Fatalf("rotation on a capped listing = rotated %v, swept %v, warnings %v", rotated, swept, warnings)
 	}
 }
 

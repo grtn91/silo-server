@@ -26,12 +26,19 @@ type folder struct {
 	kind Kind
 	at   time.Time
 	// manifest is nil for an incomplete folder, and for one whose manifest
-	// did not verify (tampered).
+	// did not verify (tampered) or could not be read (unreadable).
 	manifest *Manifest
 	// tampered is set when the folder's manifest named this server's
 	// SECRET_KEY and did not verify: nothing in it is trusted, and the
 	// sweep leaves the folder for the admin to look at.
 	tampered bool
+	// unreadable is set when the folder lists a manifest that could not be
+	// read for any other reason (a timeout, a destination error): what it
+	// holds is unknown, so it is neither rotated nor swept.
+	unreadable bool
+	// noManifest is set only when a complete listing of the folder showed
+	// no manifest object: the one state the sweep deletes.
+	noManifest bool
 	// verified is set when the manifest verified under this server's
 	// SECRET_KEY, or the service checks none (tests).
 	verified bool
@@ -111,13 +118,16 @@ func planRotation(folders []folder, keep int, now time.Time, pinned map[string]b
 	return deletes
 }
 
-// planSweep returns incomplete folders (no manifest) whose name and newest
-// object are both older than a day. The sweep runs under the subsystem lock,
-// so no backup is writing to any folder it sees.
+// planSweep returns incomplete folders whose name and newest object are
+// both older than a day. It deletes only a folder a complete listing showed
+// without a manifest object (noManifest): one whose manifest could not be
+// read, or did not verify, may be a complete backup and is left alone. The
+// sweep runs under the subsystem lock, so no backup is writing to any
+// folder it sees.
 func planSweep(folders []folder, now time.Time) []string {
 	var deletes []string
 	for _, f := range folders {
-		if f.manifest != nil || f.tampered {
+		if !f.noManifest {
 			continue
 		}
 		if now.Sub(f.at) > incompleteSweepAge && now.Sub(f.newest) > incompleteSweepAge {
@@ -129,10 +139,11 @@ func planSweep(folders []folder, now time.Time) []string {
 }
 
 // folders lists this server's backup folders at t, reading each manifest
-// (listBackupFolders bounds the listing). A folder whose manifest lists an
-// object that is not there, or not at its recorded size, is incomplete: a
-// delete that stopped partway, which the sweep finishes. One with more
-// objects than Silo writes is left alone, like a tampered one.
+// (listBackupFolders bounds the listing; a listing that fails or reaches a
+// cap is an error, so nothing acts on part of it). A folder whose manifest
+// lists an object that is not there, or not at its recorded size, is
+// incomplete but keeps its manifest, so the sweep leaves it. One with more
+// objects than Silo writes was listed only in part and is unreadable.
 func (s *Service) folders(ctx context.Context, t target, serverID string) ([]folder, error) {
 	listed, err := listBackupFolders(ctx, t, serverPrefix(serverID))
 	if err != nil {
@@ -151,22 +162,28 @@ func (s *Service) folders(ctx context.Context, t target, serverID string) ([]fol
 			sizes[strings.TrimPrefix(obj.Key, folderPrefix(serverID, l.id))] = obj.Size
 		}
 		if l.overflow {
-			f.tampered = true
+			// Only part of it was listed: what it holds is unknown.
+			f.unreadable = true
 			slog.WarnContext(ctx, "backup folder holds more objects than a backup writes; leaving it alone", "component", "backup", "id", l.id)
 			out = append(out, f)
 			continue
 		}
-		if _, ok := sizes[ManifestName]; ok {
-			m, err := s.readManifest(ctx, t, serverID, l.id)
-			switch {
-			case err != nil:
-				f.tampered = errors.Is(err, ErrManifestTampered)
-				slog.WarnContext(ctx, "unreadable backup manifest", "component", "backup", "id", l.id, "error", err)
-			case !m.objectsPresent(sizes):
-				slog.WarnContext(ctx, "backup manifest lists objects that are gone; the folder is incomplete", "component", "backup", "id", l.id)
-			default:
-				f.manifest, f.verified = m, m.authenticated || s.opts.ManifestKey == nil
-			}
+		// From here the folder's listing is complete.
+		if _, ok := sizes[ManifestName]; !ok {
+			f.noManifest = true
+			out = append(out, f)
+			continue
+		}
+		m, err := s.readManifest(ctx, t, serverID, l.id)
+		switch {
+		case err != nil:
+			f.tampered = errors.Is(err, ErrManifestTampered)
+			f.unreadable = !f.tampered
+			slog.WarnContext(ctx, "unreadable backup manifest", "component", "backup", "id", l.id, "error", err)
+		case !m.objectsPresent(sizes):
+			slog.WarnContext(ctx, "backup manifest lists objects that are gone; the folder is incomplete", "component", "backup", "id", l.id)
+		default:
+			f.manifest, f.verified = m, m.authenticated || s.opts.ManifestKey == nil
 		}
 		out = append(out, f)
 	}

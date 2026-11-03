@@ -58,19 +58,28 @@ the private bucket ([Destinations](#destinations), [Encryption](#encryption)).
   incomplete folder as `in_progress` only while the published active
   operation (see [Status](#status)) is that backup, and `incomplete`
   otherwise. So is a folder whose manifest lists an object that is not
-  there, or not at its recorded size: a delete that stopped partway. The
-  sweep deletes incomplete folders whose name and newest object are both
-  older than 24 hours.
+  there, or not at its recorded size, in a complete listing of the folder:
+  it keeps its manifest, so the sweep leaves it for the admin. The sweep
+  deletes incomplete folders whose name and newest object are both older
+  than 24 hours, and only a folder a complete, error-free listing showed
+  without a manifest object (`folder.noManifest`): deleting a complete
+  backup is the one mistake it must not make. A folder whose manifest is
+  listed but could not be read (a timeout, a destination error), or that
+  holds more objects than a listing reads of it (below), is `unreadable`:
+  listed with that status and the `backup_unreadable` warning, never
+  rotated, not counted toward `backup.keep`, and never swept. A failed or
+  capped listing skips rotation and the sweep for that run.
 - **Listings are bounded.** Anyone who can write a bucket, or answer for its
   endpoint, could otherwise hold enough keys, or page without end, to
   exhaust the server's memory on every scheduled backup. Every listing pages
   through `Destination.ListPage` (at most 1,000 objects a request) and stops
   at a cap (`listing_bounded.go`): one server's backup folders are read in
-  key order, at most 2,000 folders and 1,000 requests, and a child that is
-  not a backup folder (a full restore's overwritten files) is skipped by
-  listing after it, as a delimiter would. A folder with more than 32
-  objects, which no backup writes, is read only that far and left alone like
-  a tampered one. Other servers' folders are named one request each, at most
+  key order, at most 2,000 folders and 1,000 requests (past either the
+  listing fails, so nothing is rotated or swept), and a child that is not a
+  backup folder (a full restore's overwritten files) is skipped by listing
+  after it, as a delimiter would. A folder with more than 32 objects, which
+  no backup writes, is read only that far and is `unreadable`: its contents
+  are unknown. Other servers' folders are named one request each, at most
   100, and the upload sweep reads at most 100,000 objects.
 
 ### Manifest

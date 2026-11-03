@@ -71,6 +71,13 @@ func TestPlanRotation(t *testing.T) {
 			want:    []string{id(KindNightly, 1), id(KindNightly, 2)},
 		},
 		{
+			name: "an unreadable folder is neither rotated nor counted toward keep",
+			folders: []folder{{id: id(KindNightly, 0), kind: KindNightly, at: day(0), unreadable: true}, backup(KindNightly, 1, clean),
+				backup(KindNightly, 2, clean), {id: id(KindNightly, 9), kind: KindNightly, at: day(9), unreadable: true}},
+			keep: 1,
+			want: []string{id(KindNightly, 2)},
+		},
+		{
 			name:    "with every copy warned, keep applies as is",
 			folders: []folder{backup(KindNightly, 0, warned), backup(KindNightly, 1, warned), backup(KindNightly, 2, warned)},
 			keep:    1,
@@ -109,17 +116,31 @@ func TestPlanRotation(t *testing.T) {
 	}
 }
 
-func TestPlanSweepDeletesOnlyOldIncompleteFolders(t *testing.T) {
+// TestPlanSweepDeletesOnlyFoldersSeenWithoutAManifest: the sweep deletes a
+// folder only when a complete listing showed no manifest object in it and
+// it is over a day old. A folder whose manifest could not be read, or did
+// not verify, may be a complete backup and is kept.
+func TestPlanSweepDeletesOnlyFoldersSeenWithoutAManifest(t *testing.T) {
 	now := time.Date(2026, 10, 31, 12, 0, 0, 0, time.UTC)
 	old, recent := now.Add(-25*time.Hour), now.Add(-time.Hour)
-	folders := []folder{
-		{id: "old-incomplete", at: old, newest: old},
-		{id: "old-but-recently-written", at: old, newest: recent},
-		{id: "recent-incomplete", at: recent, newest: recent},
-		{id: "old-complete", at: old, newest: old, manifest: &Manifest{}},
-	}
-	if got := planSweep(folders, now); !slices.Equal(got, []string{"old-incomplete"}) {
-		t.Fatalf("planSweep = %v, want [old-incomplete]", got)
+	for _, tt := range []struct {
+		name   string
+		folder folder
+		swept  bool
+	}{
+		{"an old folder with no manifest", folder{at: old, newest: old, noManifest: true}, true},
+		{"an old folder written to recently", folder{at: old, newest: recent, noManifest: true}, false},
+		{"a recent folder with no manifest", folder{at: recent, newest: recent, noManifest: true}, false},
+		{"a complete backup", folder{at: old, newest: old, manifest: &Manifest{}}, false},
+		{"a manifest that could not be read", folder{at: old, newest: old, unreadable: true}, false},
+		{"a manifest that did not verify", folder{at: old, newest: old, tampered: true}, false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.folder.id = "folder"
+			if got := planSweep([]folder{tt.folder}, now); (len(got) == 1) != tt.swept {
+				t.Fatalf("planSweep = %v, want swept %v", got, tt.swept)
+			}
+		})
 	}
 }
 

@@ -202,7 +202,7 @@ func TestBeforeUpgradeWaitsForANightlyBackupDB(t *testing.T) {
 		}
 		nightly <- err
 	}()
-	<-blocking.entered
+	awaitBefore(t, blocking.entered, nightly, "the nightly backup to start writing its dump")
 
 	svc := New(opts)
 	if held, err := svc.BeforeUpgrade(ctx, UpgradeOptions{Wait: 300 * time.Millisecond}); err == nil || !strings.Contains(err.Error(), "SILO_MIGRATION_WAIT") {
@@ -220,7 +220,7 @@ func TestBeforeUpgradeWaitsForANightlyBackupDB(t *testing.T) {
 		upgraded <- err
 	}()
 	close(blocking.release)
-	if err := <-nightly; err != nil {
+	if err := await(t, nightly, "the nightly backup to finish"); err != nil {
 		t.Fatalf("nightly backup: %v", err)
 	}
 	slot, err := opts.Status.Read(ctx)
@@ -229,7 +229,7 @@ func TestBeforeUpgradeWaitsForANightlyBackupDB(t *testing.T) {
 	}
 	// The slot is done, and the before-upgrade backup runs anyway and
 	// leaves it as the nightly run recorded it.
-	if err := <-upgraded; err != nil {
+	if err := await(t, upgraded, "the before-upgrade backup to finish"); err != nil {
 		t.Fatalf("before-upgrade backup after the nightly one: %v", err)
 	}
 	if after, err := opts.Status.Read(ctx); err != nil || after.LastNightlySlot == nil || !after.LastNightlySlot.Equal(*slot.LastNightlySlot) {

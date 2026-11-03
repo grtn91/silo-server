@@ -136,7 +136,10 @@ go there) and the user store is PostgreSQL (a restore's own backup needs it).
   `no_backups_at_destination` (backups completed before, but none is at the
   current destination: it was switched, and earlier copies stay where they
   were written), `destination_unavailable`,
-  `sqlite_user_store`, `pg_dump_missing`, `pg_dump_too_old`, and
+  `sqlite_user_store`, `pg_dump_missing`, `pg_dump_too_old`,
+  `backup_unreadable` (some backups' manifests could not be read just now;
+  those backups have the status `unreadable`, and are kept, neither rotated
+  nor swept, until they read), and
   `key_not_confirmed` (backups are `encrypted` and the current `SECRET_KEY`
   was never confirmed, or changed since: encrypted backups, and uploads to a
   bucket, are paused).
