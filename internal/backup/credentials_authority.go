@@ -179,6 +179,12 @@ func grantOf(table string, row map[string]any) (inviteeGrant, bool) {
 	switch table {
 	case "invite_codes":
 		return inviteeGrant{role: models.RoleUser}, true
+	case "plugin_auth_bindings":
+		// An account a provider creates is a user in the default group
+		// (auth.AccountResolver); one the provider makes an admin is the
+		// provider's decision, on both servers alike.
+		on, _ := row[columnAutoProvision].(bool)
+		return inviteeGrant{role: models.RoleUser}, on
 	case "invitations":
 		g := inviteeGrant{role: models.RoleUser}
 		if role, ok := row["role"].(string); ok {
