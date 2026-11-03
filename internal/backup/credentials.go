@@ -308,6 +308,12 @@ var secretTables = []secretTable{
 		key: "plugin_installation_id, host_scope, state_key", same: []string{columnInstallation, "host_scope", "state_key"}, credential: everyRow, owned: pluginInstalled,
 		describe: `format('state %L of plugin installation %s', r.state_key, r.plugin_installation_id)`,
 	}},
+	// Stream nodes are what clients' requests are routed through, some with
+	// the client's bearer: a node removed since the backup stays removed.
+	{name: "stream_nodes", handling: secretCarried, why: "stream nodes, which clients' requests are routed through", carry: &carrySpec{
+		key: "id", same: []string{"id", "url"}, credential: everyRow, owned: everyRow,
+		describe: `format('stream node %s %L', r.id, r.name)`,
+	}},
 	{name: "notification_server_channels", handling: secretCarried, why: "server notification channels", carry: &carrySpec{
 		key: "id", same: []string{"id"}, credential: everyRow, owned: everyRow,
 		describe: `format('server notification channel %s %L', r.id, r.name)`,

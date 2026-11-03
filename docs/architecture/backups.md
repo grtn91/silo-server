@@ -1032,6 +1032,16 @@ that holds a bearer secret or a public capability, each one way:
   work again, and one created since would stop working. They stay in the
   dump (`marker_edit_audit` refers to API keys), and the restore replaces
   them as below.
+- What the server runs or routes clients through is the live server's:
+  stream nodes are carried like the credentials above (a node removed
+  since the backup stays removed), and each plugin installation the live
+  server has, by id and plugin, takes the live release (version, install
+  path, repository, stored archive, and capabilities;
+  `CarryPluginReleases`), so a release replaced since the backup is never
+  launched again. An installation whose id is another plugin here, and
+  every installation of another deployment's backup or a separate
+  restore, comes back off and is listed; one only the backup has is off
+  by its stricter switch. The trusted proxies are a stricter-of setting.
 - Restored with live credentials (`secretScrubbed`): connections to outside
   services that other restored data refers to (history import sources,
   subtitle provider accounts, autoscan targets, request integrations). The
