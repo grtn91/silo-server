@@ -115,9 +115,6 @@ func (c *settingCounts) notes() []string {
 	return notes
 }
 
-// settingOff is a switch setting turned off.
-const settingOff = "false"
-
 // msgUnverifiedServices says why settings that connect to outside services
 // are left out of an unverified backup's restore.
 const msgUnverifiedServices = "Settings that connect to outside services are not restored from a backup this server cannot verify."

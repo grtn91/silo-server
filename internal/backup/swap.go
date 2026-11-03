@@ -283,6 +283,9 @@ func carryLiveState(ctx context.Context, ctl ControlDB, live string, loader Data
 	if err := carryCredentials(ctx, loader, restoredURL, carryFrom, out); err != nil {
 		return err
 	}
+	if err := carryOutboundSettings(ctx, loader, restoredURL, carryFrom, out); err != nil {
+		return err
+	}
 	if err := interruptWork(ctx, loader, restoredURL, opts.LiveURL, out); err != nil {
 		return err
 	}

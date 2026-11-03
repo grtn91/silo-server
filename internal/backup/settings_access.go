@@ -58,7 +58,7 @@ var accessSettings = func() map[string]widerFunc {
 		settingSMTPSecurity:                                 byRank(map[string]int64{smtpStartTLS: 0, smtpTLS: 0, smtpNone: 1}),
 		// What delivers notifications and mail to destinations without a
 		// session: a channel an admin turned off stays off.
-		"email.enabled":                               on,
+		settingEmailEnabled:                           on,
 		"notifications.email_enabled":                 on,
 		"notifications.web_push_enabled":              on,
 		"notifications.webhooks_enabled":              on,
@@ -103,6 +103,11 @@ const (
 	smtpStartTLS, smtpTLS     = "starttls", "tls"
 	smtpNone                  = "none"
 	settingReleaseEvents      = "notifications.release_events_enabled"
+	settingEmailEnabled       = "email.enabled"
+	settingSMTPHost           = "email.smtp_host"
+	settingSMTPPassword       = "email.smtp_password" //nolint:gosec // G101: a setting key, not a credential
+	settingAIBaseURL          = "ai.base_url"
+	settingAIKey              = "ai.api_key"
 )
 
 // widerFunc reports whether restored grants more than live, both effective

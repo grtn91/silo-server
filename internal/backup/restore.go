@@ -236,6 +236,10 @@ type DatabaseLoader interface {
 	// ServerID reads the server identity (serveridentity.Key) dbURL's
 	// settings hold, or "" when they hold none.
 	ServerID(ctx context.Context, dbURL string) (string, error)
+	// CarryOutboundSettings gives dbURL liveURL's outbound settings, each
+	// bundle as a unit, clearing the secrets of one liveURL lacks ("" for
+	// none), and returns the bundles carried and cleared.
+	CarryOutboundSettings(ctx context.Context, dbURL, liveURL string) (carried, cleared []string, err error)
 	// InterruptWork ends the work queued or running in the restored
 	// database dbURL and gives it liveURL's storage transition target
 	// (none for ""), returning what it changed.
@@ -412,6 +416,9 @@ func RestoreSeparate(ctx context.Context, src *Source, loader DatabaseLoader, op
 	// A copy is not the live server: it gets none of the backup's
 	// credentials and none of the live ones.
 	if err := carryCredentials(ctx, loader, opts.Into, "", out); err != nil {
+		return RestoreReport{}, err
+	}
+	if err := carryOutboundSettings(ctx, loader, opts.Into, "", out); err != nil {
 		return RestoreReport{}, err
 	}
 	if err := interruptWork(ctx, loader, opts.Into, "", out); err != nil {

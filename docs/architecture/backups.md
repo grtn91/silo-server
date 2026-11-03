@@ -924,6 +924,24 @@ encrypted `server_settings` row this key cannot open and prints their key
 names (never values) for the admin to enter again. Rows are only deleted,
 never renamed: a value is bound to its key name.
 
+### Connections to outside services
+
+Where this server connects outside and how it signs in there never comes
+from the backup on its own. `outboundBundles` (`internal/backup/settings_outbound.go`)
+groups those settings into units: each endpoint and secret route of
+`settingRoutes` (SMTP, AI providers, speech, subtitle AI, embeddings), the
+AI provider list, the ChatGPT credentials, the push relay, the search
+engine's address and key, the Discord application, and the API keys and
+client secrets of metadata, request, and watch-sync services. On a full
+restore of this deployment's backup each unit the live server has is taken
+from it whole, so an SMTP host and password changed since the backup stay
+changed. A unit the live server lacks, and every unit of another
+deployment's backup or a separate restore, keeps the backup's other values
+with its secrets cleared and its switch off, and the command lists it for
+re-entry. `TestEveryCredentialSettingIsDecided` fails on an encrypted
+setting that is neither in a unit nor this server's own (signing keys,
+storage, Redis, the web push key pair).
+
 ### Interrupted work
 
 Nothing the backup had queued or running runs by itself after a full

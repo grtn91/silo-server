@@ -94,3 +94,27 @@ func TestEverySwitchSettingIsDecided(t *testing.T) {
 		}
 	}
 }
+
+// TestEveryCredentialSettingIsDecided: every encrypted setting is either
+// one a full restore takes from the live server (outboundBundles), or one
+// of this server's own keys and storage, which a restore handles on its own
+// (signing keys rotate, storage is checked against this deployment's, a
+// storage transition is the live server's, Redis is this server's), and
+// every outbound setting is a classified one.
+func TestEveryCredentialSettingIsDecided(t *testing.T) {
+	own := func(key string) bool {
+		return key == settingJWTSecret || key == settingABSJWTSecret || key == "storage.transition.target" ||
+			key == "notifications.web_push.vapid_keypair" || strings.HasPrefix(key, "s3.") || strings.HasPrefix(key, "redis.")
+	}
+	outbound := outboundKeys()
+	for key := range catalog.SensitiveSettingKeys {
+		if !own(key) && !slices.Contains(outbound, key) {
+			t.Errorf("encrypted setting %s is neither carried from the live server (outboundBundles) nor this server's own", key)
+		}
+	}
+	for _, key := range outbound {
+		if _, ok := SettingKindOf(key); !ok {
+			t.Errorf("outbound setting %s has no kind", key)
+		}
+	}
+}
