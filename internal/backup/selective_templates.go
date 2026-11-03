@@ -291,6 +291,10 @@ func jsonEqual(a, b json.RawMessage) bool {
 }
 
 func (a *applier) applyTemplateCollection(ctx context.Context, tx pgx.Tx, id string) (applied, error) {
+	return a.withCollectionBudget(id, a.writeTemplateCollection)(ctx, tx)
+}
+
+func (a *applier) writeTemplateCollection(ctx context.Context, tx pgx.Tx, id string) (applied, error) {
 	item := ReportItem{Kind: KindTemplateCollection, Label: id}
 	t := indexed(a.rs.Collections.TemplateCollections, a.rs.lookup().templates, id)
 	if t == nil {

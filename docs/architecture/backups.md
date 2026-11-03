@@ -479,7 +479,13 @@ a branding asset, a page section, and each account's profiles) is left out
 as unusable when it encodes to more than 1 MiB, the v2 API's request body
 cap (`maxRestoredEntryBytes`), and a stored thumbhash is the one computed
 from the restored image (item artwork) or one of thumbhash form, never
-anything else. A set lists at most the first 100 entries of a section it
+anything else. A selective restore also writes at most 16 MiB of collection metadata
+(every field but the item list) in all and 8 MiB into one library, counted
+over the collections, template collections, and section-managed collections
+it commits; the rest are left out with `over_restore_budget`, since a
+library's collections are listed whole. The collection editors have no
+per-field limits besides the request body cap, so a restore applies none of
+its own to single fields. A set lists at most the first 100 entries of a section it
 leaves out, and one more entry counting the rest, so a preview of a set of
 malformed entries stays small. A plugin archive is checked against its
 digest and discarded, never installed ([Plugins](#plugins)). Readers accept

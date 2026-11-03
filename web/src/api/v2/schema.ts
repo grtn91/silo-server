@@ -14446,7 +14446,8 @@ export interface components {
         | "files_missing_here"
         | "needs_install"
         | "kept_stricter"
-        | "unverified_backup";
+        | "unverified_backup"
+        | "over_restore_budget";
       /** @description Items (section:id) that must be chosen with this one: a collection whose library is restored by the same request */
       requires: string[];
       restart_required: boolean;
@@ -14550,7 +14551,8 @@ export interface components {
         | "files_missing_here"
         | "needs_install"
         | "kept_stricter"
-        | "unverified_backup";
+        | "unverified_backup"
+        | "over_restore_budget";
       restart_keys: string[];
       restart_required: boolean;
       /** @enum {string} */

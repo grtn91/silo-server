@@ -371,6 +371,10 @@ func (p *planner) planHomeSections(ctx context.Context, libMap map[int]int, rest
 }
 
 func (a *applier) applyHomeSection(ctx context.Context, tx pgx.Tx, id string) (applied, error) {
+	return a.withCollectionBudget(id, a.writeHomeSection)(ctx, tx)
+}
+
+func (a *applier) writeHomeSection(ctx context.Context, tx pgx.Tx, id string) (applied, error) {
 	item := ReportItem{Kind: KindHomeSection, Label: id}
 	e := indexed(a.rs.HomeSections.Sections, a.rs.lookup().sections, id)
 	if e == nil {

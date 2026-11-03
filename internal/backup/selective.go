@@ -82,6 +82,9 @@ const (
 	// outside services, which a backup this server cannot verify never
 	// restores.
 	ReasonUnverifiedBackup = "unverified_backup"
+	// ReasonOverRestoreBudget: the item's collection metadata would take
+	// one restore, or one library, past what a restore writes.
+	ReasonOverRestoreBudget = "over_restore_budget"
 )
 
 // Report outcomes.

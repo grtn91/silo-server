@@ -65,7 +65,7 @@ type AdminBackupRestoreItem struct {
 	Label           string                         `json:"label"`
 	Status          string                         `json:"status" enum:"on_this_server,not_on_this_server,differs,folder_missing,ambiguous,needs_another_key"`
 	Selectable      bool                           `json:"selectable" doc:"Whether the item can be chosen. Items on this server already have nothing to restore."`
-	Reason          string                         `json:"reason,omitempty" enum:"same,path_in_use,folder_missing,library_not_restorable,library_not_mapped,ambiguous_name,needs_another_key,config_needs_another_key,other_version,item_not_on_this_server,file_missing,not_in_backup,changed_since_preview,template_not_available,collection_not_mapped,unreadable,files_missing_here,needs_install,kept_stricter,unverified_backup"`
+	Reason          string                         `json:"reason,omitempty" enum:"same,path_in_use,folder_missing,library_not_restorable,library_not_mapped,ambiguous_name,needs_another_key,config_needs_another_key,other_version,item_not_on_this_server,file_missing,not_in_backup,changed_since_preview,template_not_available,collection_not_mapped,unreadable,files_missing_here,needs_install,kept_stricter,unverified_backup,over_restore_budget"`
 	Message         string                         `json:"message,omitempty" doc:"What restoring the item does or why it cannot be chosen, for display"`
 	Requires        []string                       `json:"requires" doc:"Items (section:id) that must be chosen with this one: a collection whose library is restored by the same request"`
 	RestartRequired bool                           `json:"restart_required"`
@@ -148,7 +148,7 @@ type AdminBackupRestoreReportItem struct {
 	Kind            string   `json:"kind" enum:"settings_page,plugin,library,collection,template_collection,item_artwork,branding,home_section"`
 	Label           string   `json:"label"`
 	Outcome         string   `json:"outcome" enum:"restored,unchanged,left_out,failed"`
-	Reason          string   `json:"reason,omitempty" enum:"same,path_in_use,folder_missing,library_not_restorable,library_not_mapped,ambiguous_name,needs_another_key,config_needs_another_key,other_version,item_not_on_this_server,file_missing,not_in_backup,changed_since_preview,template_not_available,collection_not_mapped,unreadable,files_missing_here,needs_install,kept_stricter,unverified_backup" doc:"Why a left_out item was left out"`
+	Reason          string   `json:"reason,omitempty" enum:"same,path_in_use,folder_missing,library_not_restorable,library_not_mapped,ambiguous_name,needs_another_key,config_needs_another_key,other_version,item_not_on_this_server,file_missing,not_in_backup,changed_since_preview,template_not_available,collection_not_mapped,unreadable,files_missing_here,needs_install,kept_stricter,unverified_backup,over_restore_budget" doc:"Why a left_out item was left out"`
 	Message         string   `json:"message,omitempty"`
 	Error           string   `json:"error,omitempty" doc:"Why a failed item failed"`
 	RestartRequired bool     `json:"restart_required"`
