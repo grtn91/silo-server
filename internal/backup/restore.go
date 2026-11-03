@@ -582,7 +582,8 @@ func writeBlobsFromTar(ctx context.Context, path string, stores blobStores, befo
 		return 0, err
 	}
 	defer func() { _ = f.Close() }()
-	tr := tar.NewReader(newTarGuard(f))
+	guard := newTarGuard(f)
+	tr := tar.NewReader(guard)
 	count := 0
 	for {
 		if err := ctx.Err(); err != nil {
@@ -593,6 +594,9 @@ func writeBlobsFromTar(ctx context.Context, path string, stores blobStores, befo
 			return count, nil
 		}
 		if err != nil {
+			return count, fmt.Errorf("reading blobs.tar: %w", err)
+		}
+		if err := guard.checkEntry(h.Size); err != nil {
 			return count, fmt.Errorf("reading blobs.tar: %w", err)
 		}
 		entry, err := parseBlobEntry(h)

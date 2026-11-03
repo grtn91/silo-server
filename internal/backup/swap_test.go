@@ -1176,8 +1176,9 @@ func TestValidateAuthenticatesTheManifest(t *testing.T) {
 // TestTarGuardRefusesWhatTheWriterNeverMakes: an archive's headers are
 // checked before tar.Reader expands them. Regular files, with PAX records
 // for long names and large sizes, read as before; an old-GNU sparse
-// header with 50,000 extension blocks, a directory, a link, and an
-// oversized PAX record are refused at their header, without expanding them.
+// header with 50,000 extension blocks, a directory, a link, an oversized
+// PAX record, a PAX key given twice, and a PAX key the writer never emits
+// are refused at their header, without expanding them.
 func TestTarGuardRefusesWhatTheWriterNeverMakes(t *testing.T) {
 	var ok bytes.Buffer
 	tw := tar.NewWriter(&ok)
@@ -1191,9 +1192,14 @@ func TestTarGuardRefusesWhatTheWriterNeverMakes(t *testing.T) {
 		_, _ = tw.Write(bytes.Repeat([]byte("x"), int(h.Size)))
 	}
 	_ = tw.Close()
-	tr := tar.NewReader(newTarGuard(bytes.NewReader(ok.Bytes())))
+	guard := newTarGuard(bytes.NewReader(ok.Bytes()))
+	tr := tar.NewReader(guard)
 	for range 2 {
-		if _, err := tr.Next(); err != nil {
+		h, err := tr.Next()
+		if err != nil {
+			t.Fatalf("a regular archive: %v", err)
+		}
+		if err := guard.checkEntry(h.Size); err != nil {
 			t.Fatalf("a regular archive: %v", err)
 		}
 	}
@@ -1217,11 +1223,30 @@ func TestTarGuardRefusesWhatTheWriterNeverMakes(t *testing.T) {
 		return raw
 	}
 	sparse := append(header('S', 0), bytes.Repeat(append(make([]byte, 511), 1), 50_000)...)
+	// pax is a PAX record of records, then a regular header of size 0.
+	pax := func(records ...string) []byte {
+		var body []byte
+		for _, r := range records {
+			n := len(r) + 3
+			for len(fmt.Sprintf("%d %s\n", n, r)) != n {
+				n++
+			}
+			body = append(body, fmt.Sprintf("%d %s\n", n, r)...)
+		}
+		out := append(header('x', int64(len(body))), body...)
+		out = append(out, make([]byte, (512-len(body)%512)%512)...)
+		return append(out, header('0', 0)...)
+	}
 	for name, archive := range map[string][]byte{
 		"old GNU sparse":   sparse,
 		"directory":        header('5', 0),
 		"symlink":          header('2', 0),
 		"oversized record": append(header('x', maxPAXRecord+1), make([]byte, maxPAXRecord+512)...),
+		// tar.Reader keeps the last of a repeated key; the guard would
+		// have read the first, and taken what follows for data.
+		"size given twice":    pax("size=100000", "size=0"),
+		"path given twice":    pax("path=a", "path=b"),
+		"a GNU sparse record": pax("GNU.sparse.size=1000"),
 	} {
 		var before, after runtime.MemStats
 		runtime.GC()
