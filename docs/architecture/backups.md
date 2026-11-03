@@ -762,9 +762,12 @@ as an admin save would. Only a collection the section manages stands for the
 carried one: a managed section pointed at an ordinary collection since the
 backup lists "collection replaced", whatever that collection holds, and the
 restore points it back at its managed collection (the one still here with
-its management key, or a new one). A missing one is created, with its backup
-id when no section here has it, so a profile override naming it by id
-resolves. The
+its management key, or a new one). The key's section id and each
+`library:<id>` it names are this server's (`remapManagementKey`), and a
+collection here with that key is reused only when its libraries are the
+mapped ones (`collectionScopeIs`); otherwise a new one is created under a
+key of its own. A missing one is created, with its backup id when no
+section here has it, so a profile override naming it by id resolves. The
 section editor's checks (`SectionHandler.CheckRestoredSection`: type,
 scope, configuration, recipe) run first, the write locks the collections it
 names as every section writer does (`sections.WriteSectionInTx`), and a
@@ -811,7 +814,10 @@ check and its commit, and a slow original worker's next item finds the job no
 longer running under its claim and writes nothing. An item's commit writes
 its heartbeat at `clock_timestamp()`, the commit's time: `NOW()` is the
 transaction's start, which an item longer than the stale window would leave
-already stale for the updater waiting behind it. Running the same restore
+already stale for the updater waiting behind it. Every heartbeat only moves
+forward (`GREATEST(heartbeat_at, clock_timestamp())`), so an ordinary
+heartbeat that waited on the row behind an item cannot write its older
+start over the item's commit. Running the same restore
 again is safe.
 
 ### Blobs a restore writes
@@ -1278,7 +1284,9 @@ inventory tables, each present with a count or absent; a kind matching the
 id; a valid server id), `db.dump` and `blobs.tar` match their checksums,
 `blobs.tar` holds the manifest's file count (each header checked before
 `tar.Reader` expands it, `tarGuard`: only regular files and PAX records of at
-most 8 KiB, so no sparse map or long-name record is expanded), every entry is a regular file
+most 8 KiB holding only the keys the writer emits (`path`, `size`, `mtime`),
+each once, so no sparse map or long-name record is expanded, and every entry
+`tar.Reader` returns must have the size the guard let its data run for), every entry is a regular file
 in its store's backup namespaces, and no two entries land on the same object
 (stores that share one root count as one place), the backup's goose version
 is not newer than this binary's newest migration, the backup applied no

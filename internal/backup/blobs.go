@@ -235,7 +235,8 @@ func validateBlobArchive(ctx context.Context, path string, physical func(store s
 		physical = func(store string) (string, bool) { return store, true }
 	}
 	seen := map[string]string{}
-	tr := tar.NewReader(newTarGuard(f))
+	guard := newTarGuard(f)
+	tr := tar.NewReader(guard)
 	for count := 0; ; count++ {
 		if err := ctx.Err(); err != nil {
 			return count, err
@@ -245,6 +246,9 @@ func validateBlobArchive(ctx context.Context, path string, physical func(store s
 			return count, nil
 		}
 		if err != nil {
+			return count, fmt.Errorf("reading blobs.tar: %w", err)
+		}
+		if err := guard.checkEntry(h.Size); err != nil {
 			return count, fmt.Errorf("reading blobs.tar: %w", err)
 		}
 		entry, err := parseBlobEntry(h)

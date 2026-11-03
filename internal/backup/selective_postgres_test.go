@@ -1108,6 +1108,65 @@ func TestRestoreRefusesCollectionSourcesTheEditorWouldDB(t *testing.T) {
 	}
 }
 
+// TestManagedCollectionKeysMapLibrariesDB: a section-managed collection's
+// management key names its library; restored where the backup's library is
+// another one here, the key names that one, and a collection here holding
+// the backup's key for the library with the backup's old id is not reused.
+func TestManagedCollectionKeysMapLibrariesDB(t *testing.T) {
+	f := newSelectiveFixture(t)
+	ctx, pool := t.Context(), f.pool
+	wirePageTargets(f, new(bool), &[]string{})
+	s := seedPages(t, f)
+	keyFor := func(library int) string { return "trakt:trending:movie:library:" + strconv.Itoa(library) }
+	dbExec(t, pool, `UPDATE library_collections SET management_key = $2 WHERE id = $1`, s.managedCollection, keyFor(s.library))
+	backup, err := backupUnderLock(t, f.svc, KindManual)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Here the backup's library has another id: the library with its old
+	// id now has other folders, and a new one has the backup's.
+	var folder string
+	if err := pool.QueryRow(ctx, `SELECT path FROM media_folder_paths WHERE media_folder_id = $1`, s.library).Scan(&folder); err != nil {
+		t.Fatal(err)
+	}
+	dbExec(t, pool, `UPDATE media_folder_paths SET path = $2 WHERE media_folder_id = $1`, s.library, folder+"-elsewhere")
+	moved, err := catalog.NewFolderRepository(pool).Create(ctx, catalog.CreateFolderInput{Paths: []string{folder}, Type: "movies", Name: "Moved " + s.suffix})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = pool.Exec(context.Background(), `DELETE FROM media_folders WHERE id = $1`, moved.ID) })
+	// The section shows another collection, so the restore looks for its
+	// own by key.
+	repo := catalog.NewLibraryCollectionRepository(pool)
+	ordinary, err := repo.Create(ctx, catalog.CreateLibraryCollectionInput{LibraryID: s.library, Slug: "ordinary-" + s.suffix, Title: "Ordinary " + s.suffix})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dbExec(t, pool, `UPDATE page_sections SET config = jsonb_build_object('library_collection_id', $2::text) WHERE id = $1`, s.managed, ordinary.ID)
+	dbExec(t, pool, `DELETE FROM library_collection_items WHERE collection_id = $1`, s.managedCollection)
+	preview, err := f.svc.Preview(ctx, backup.ID, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := homeSectionItemID(s.managed)
+	report := f.restoreRequest(t, RestoreRequest{BackupID: backup.ID, Digest: preview.Digest, Selection: map[string][]string{SectionHomeSections: {id}}})
+	if got := reportItem(t, report, SectionHomeSections, id); got.Outcome != OutcomeRestored {
+		t.Fatalf("restoring it = %+v", got)
+	}
+	var shown, key string
+	var library int
+	if err := pool.QueryRow(ctx, `SELECT c.id, c.management_key, c.library_id FROM page_sections p
+		JOIN library_collections c ON c.id = p.config->>'library_collection_id' WHERE p.id = $1`, s.managed).Scan(&shown, &key, &library); err != nil {
+		t.Fatal(err)
+	}
+	if shown == s.managedCollection || key != keyFor(moved.ID) || library != moved.ID {
+		t.Fatalf("restored section shows %s (key %q, library %d), want a new collection in library %d keyed for it", shown, key, library, moved.ID)
+	}
+	if n := countRows(t, pool, `SELECT count(*) FROM library_collection_items WHERE collection_id = $1`, s.managedCollection); n != 0 {
+		t.Fatalf("the other library's collection got %d of the backup's items", n)
+	}
+}
+
 // TestRestoredLibrarySectionsWaitForTheRestoreDB: a library the restore
 // recreates gets its default sections only after the restore wrote its saved
 // ones, and only where it wrote none. A default renamed before the backup
