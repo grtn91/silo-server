@@ -9,6 +9,8 @@ import "strings"
 //     that grants access or reaches a device, each left out of the dump,
 //     carried from the live server on a full restore, or restored with a
 //     reason;
+//   - liveTables: tables a restore takes from the live server by a step
+//     of their own;
 //   - loggedTables: logs and queues the dump leaves out;
 //   - restoredDataTables: the server's data, restored as the backup has it;
 //   - serverStateTables: state of the running server (caches, queues, job,
@@ -21,6 +23,12 @@ import "strings"
 // TestEveryTableIsClassifiedDB reads every table after the migrations and
 // fails on one in none of the lists, in more than one, or on a listed name
 // that is not a table. A layer that adds a table classifies it here.
+
+// liveTables are restored from the live server by a step of their own
+// rather than as the backup has them: the custom access policies
+// (CarryPolicies), whose documents and versions reference each other and
+// carry as one unit.
+var liveTables = []string{"policy_documents", "policy_document_versions"}
 
 // loggedTables are the logs and queues whose rows the dump leaves out:
 // large, rebuildable, or disposable. media_intro_fingerprints is left out
@@ -48,8 +56,8 @@ var restoredDataTables = strings.Fields(`
 	media_request_events media_request_follows media_request_targets media_requests
 	media_root_overrides movie_availability notification_preferences observed_media_locations
 	page_sections people plugin_archives plugin_capabilities plugin_installations 
-	 plugin_task_bindings podcast_feeds policy_document_versions
-	policy_documents profile_series_interest profile_series_notification_mutes request_group_limits
+	 plugin_task_bindings podcast_feeds 
+	 profile_series_interest profile_series_notification_mutes request_group_limits
 	request_routes request_routing request_settings request_user_limits scanned_media_groups
 	scanned_media_roots season_localizations seasons server_settings skipped_media_roots
 	stale_media_ids task_schedules task_triggers tmdb_movie_collections user_audio_preferences

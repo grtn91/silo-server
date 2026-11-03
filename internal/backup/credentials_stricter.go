@@ -192,8 +192,6 @@ var restoredFlagColumns = map[string]string{
 	"movie_match_queue.rerun_requested":                       whyQueue,
 	"page_sections.enabled":                                   whyShown,
 	"page_sections.featured":                                  whyShown,
-	"policy_document_versions.compiled_ok":                    "a policy version's compile result",
-	"policy_documents.enabled":                                "a policy can allow or deny, so neither value of its switch is the stricter one",
 	"profile_series_interest.continue_watching":               whyDerived,
 	"profile_series_interest.favorite":                        whyDerived,
 	"profile_series_interest.next_up_candidate":               whyDerived,
