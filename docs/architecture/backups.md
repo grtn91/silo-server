@@ -1355,7 +1355,7 @@ it is written, since other writers share the disk.
 
 **Completion freezes the digest.** It takes the subsystem lock (a busy lock
 answers 409, and the parts stay for another try), moves the session to
-`checking`, publishes the `upload` operation, and, with a 10-minute deadline
+`checking`, publishes the `upload` operation, and, with a 20-minute deadline
 that closes the part being read when it passes (so a stalled read cannot
 keep the lock), reads the parts in order
 through `ReadRestoreSet`, the same checks a backup's restore set gets. The
