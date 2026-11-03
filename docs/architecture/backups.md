@@ -626,6 +626,11 @@ grouped by the admin page that edits each key: a key or prefix with its class.
   server's source and sync schedule. The preview says what is left
   off; for a verified backup it names the library options the restore
   turns on.
+- Every collection a restore or import writes from a document stores its
+  source as the editors build one (`collectionutil.CanonicalCollectionSource`):
+  each list URL the sync fetches (an MDBList collection's, a `tmdb_list`
+  source's) goes through its canonicalizer and is stored canonical; a
+  collection with any other URL is refused (`planner.checkCollection`).
 
 A key the table does not match is never offered. `TestEverySettingIsClassified`
 fails for any admin setting default, sensitive setting, or branding asset key
