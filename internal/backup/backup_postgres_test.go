@@ -474,6 +474,7 @@ func checkCredentials(t *testing.T, loader PGLoader, pool *pgxpool.Pool, dsn, in
 	}
 	checkCarryAuthority(t, loader, pool, dsn, into, restored, userID, keptID, liveKeys)
 	checkCarryInvitation(t, loader, pool, dsn, into, restored, "invite-"+suffix)
+	checkCarryAutoProvision(t, loader, pool, dsn, into, restored)
 	checkAccountRollback(t, loader, pool, dsn, into, userID, newUser)
 	checkStricterFlags(t, loader, pool, dsn, into, restored, userID)
 	checkStricterSettings(t, loader, pool, dsn, into, restored)
@@ -645,6 +646,61 @@ func checkStricterFlags(t *testing.T, loader PGLoader, pool *pgxpool.Pool, dsn, 
 		if !slices.Contains(carried.Stricter, want) {
 			t.Fatalf("reported %v, want %q", carried.Stricter, want)
 		}
+	}
+}
+
+// checkCarryAutoProvision: a sign-in provider that creates accounts is
+// carried with account creation off, and reported, when an account it
+// creates would get more under the backup's default group than here; it
+// keeps creating them under the same policy.
+func checkCarryAutoProvision(t *testing.T, loader PGLoader, pool *pgxpool.Pool, dsn, into string, restored *pgxpool.Pool) {
+	t.Helper()
+	ctx := t.Context()
+	var installation, binding int64
+	if err := pool.QueryRow(ctx, `INSERT INTO plugin_installations (plugin_id, version, install_path, enabled) VALUES ('provisioning-sso', '1.0.0', '/plugins/x', true) RETURNING id`).Scan(&installation); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), `DELETE FROM plugin_installations WHERE id = $1`, installation)
+	})
+	if _, err := restored.Exec(ctx, `INSERT INTO plugin_installations (id, plugin_id, version, install_path, enabled) VALUES ($1, 'provisioning-sso', '1.0.0', '/plugins/x', true)`, installation); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `INSERT INTO plugin_auth_bindings (plugin_installation_id, capability_id, auto_provision) VALUES ($1, 'oidc', true) RETURNING id`, installation).Scan(&binding); err != nil {
+		t.Fatal(err)
+	}
+	var allowed bool
+	if err := pool.QueryRow(ctx, `SELECT download_allowed FROM access_groups WHERE is_default`).Scan(&allowed); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), `UPDATE access_groups SET download_allowed = $1 WHERE is_default`, allowed)
+	})
+	for db, allow := range map[*pgxpool.Pool]bool{pool: false, restored: true} {
+		if _, err := db.Exec(ctx, `UPDATE access_groups SET download_allowed = $1 WHERE is_default`, allow); err != nil {
+			t.Fatal(err)
+		}
+	}
+	provisions := func() bool {
+		t.Helper()
+		var on bool
+		if err := restored.QueryRow(ctx, `SELECT auto_provision FROM plugin_auth_bindings WHERE id = $1`, binding).Scan(&on); err != nil {
+			t.Fatal(err)
+		}
+		return on
+	}
+	limited := func(c CarriedCredentials) bool {
+		return slices.ContainsFunc(c.Limited, func(s string) bool { return strings.HasPrefix(s, fmt.Sprintf("sign-in provider %d (oidc)", binding)) })
+	}
+	carried, err := loader.CarryCredentials(ctx, into, dsn)
+	if err != nil || !limited(carried) || provisions() {
+		t.Fatalf("carried %+v (%v), provisions %v; want the provider kept with account creation off", carried, err, provisions())
+	}
+	if _, err := restored.Exec(ctx, `UPDATE access_groups SET download_allowed = false WHERE is_default`); err != nil {
+		t.Fatal(err)
+	}
+	if carried, err = loader.CarryCredentials(ctx, into, dsn); err != nil || limited(carried) || !provisions() {
+		t.Fatalf("carried %+v (%v), provisions %v; want account creation kept under the same policy", carried, err, provisions())
 	}
 }
 

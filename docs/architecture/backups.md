@@ -481,9 +481,15 @@ neither list.
   reason. An invitation or invite code is also dropped when the account it
   would create gets a wider effective policy under the restored data than
   live: its role and libraries applied to its access group, or the default
-  group when it names none, as account creation resolves them. The command
-  counts what it kept per kind and lists what it dropped by id and label,
-  never key material. Identity sequences move past the ids written. Live rows are
+  group when it names none, as account creation resolves them. A sign-in
+  provider that creates accounts on first sign-in (`auto_provision`) is
+  compared the same way, for the user it would create in the default group;
+  where that is wider it is carried with account creation off, so people
+  already linked still sign in, and listed. These are every way a new
+  account appears without an admin: an invite-code signup also needs
+  `signup.enabled`, kept at the stricter of the two servers' values. The
+  command counts what it kept per kind and lists what it dropped or kept
+  with less by id and label, never key material. Identity sequences move past the ids written. Live rows are
   encrypted with this server's key, so they stay readable after
   `--accept-lost-credentials`.
 - Carrying from the live server is for the deployment the backup came from:

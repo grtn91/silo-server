@@ -65,6 +65,15 @@ type carrySpec struct {
 	owners []string
 	// describe names a dropped row, over r, without any key material.
 	describe string
+	// limit, when set, turns a switch off on a carried row instead of
+	// dropping it.
+	limit *carryLimit
+}
+
+// carryLimit carries a row with column false where keep, over the live row
+// r, does not hold, and reports it with why.
+type carryLimit struct {
+	column, keep, why string
 }
 
 // everyRow is a carrySpec.credential that selects every row.
@@ -72,8 +81,9 @@ const everyRow = "true"
 
 // Columns several carried tables share.
 const (
-	columnUserID   = "user_id"
-	columnDeviceID = "device_id"
+	columnUserID        = "user_id"
+	columnDeviceID      = "device_id"
+	columnAutoProvision = "auto_provision"
 )
 
 // ownerCarried is the SQL condition, over the live row r, that the account
@@ -194,9 +204,16 @@ var secretTables = []secretTable{
 		owners: []string{columnUserID}, owned: ownerCarried(columnUserID) + ` AND ` + pluginInstalled,
 		describe: `format('sign-in link %s %L (account %s)', r.id, r.username, r.user_id)`,
 	}},
+	// A provider that creates accounts on first sign-in grants them as an
+	// invite code does: it keeps creating them only where the account it
+	// would create gets no wider a policy under the restored data than live
+	// (carried_grants). Otherwise it is carried with account creation off,
+	// so the people already linked still sign in.
 	{name: "plugin_auth_bindings", handling: secretCarried, why: "sign-in providers", carry: &carrySpec{
 		key: "id", same: []string{"id", "plugin_installation_id", "capability_id"}, credential: everyRow, owned: pluginInstalled,
 		describe: `format('sign-in provider %s (%s)', r.id, r.capability_id)`,
+		limit: &carryLimit{column: columnAutoProvision, keep: grantCarried("plugin_auth_bindings"),
+			why: "account creation turned off: a new account would get more access under the backup's access groups than here"},
 	}},
 
 	// Destinations that receive notifications without a session: one removed
@@ -301,6 +318,9 @@ type CarriedCredentials struct {
 	// Stricter names the security switches kept at the live server's
 	// stricter value (stricterFlags).
 	Stricter []string
+	// Limited names the rows carried with a switch turned off (carryLimit),
+	// and why.
+	Limited []string
 }
 
 // carryCredentials replaces the restored database's credentials with the
@@ -328,6 +348,9 @@ func carryCredentials(ctx context.Context, loader DatabaseLoader, dbURL, liveURL
 	if len(carriedRows.Dropped) > 0 {
 		_, _ = fmt.Fprintf(out, "Dropped %d whose owner is not in the backup or has more authority there than here: %s\n",
 			len(carriedRows.Dropped), strings.Join(carriedRows.Dropped, ", "))
+	}
+	if len(carriedRows.Limited) > 0 {
+		_, _ = fmt.Fprintf(out, "Kept %d with less than they had: %s\n", len(carriedRows.Limited), strings.Join(carriedRows.Limited, "; "))
 	}
 	if len(carriedRows.Stricter) > 0 {
 		_, _ = fmt.Fprintf(out, "Kept %d security switches as this server has them, stricter than the backup: %s\n",
@@ -491,10 +514,24 @@ func (t secretTable) carryInto(ctx context.Context, tx pgx.Tx, live string, resu
 			set = append(set, fmt.Sprintf("%s = EXCLUDED.%s", col, col))
 		}
 	}
+	values := make([]string, len(columns))
+	for i, col := range columns {
+		values[i] = "r." + col
+		if l := c.limit; l != nil && col == l.column {
+			values[i] = fmt.Sprintf("(r.%s AND (%s))", col, l.keep)
+			limited, err := collectStrings(ctx, tx, fmt.Sprintf(`SELECT %s FROM %s WHERE (%s) AND r.%s AND NOT (%s)`, c.describe, rows, c.owned, col, l.keep), live)
+			if err != nil {
+				return err
+			}
+			for _, row := range limited {
+				result.Limited = append(result.Limited, row+": "+l.why)
+			}
+		}
+	}
 	tag, err := tx.Exec(ctx, fmt.Sprintf(`INSERT INTO %s (%s) OVERRIDING SYSTEM VALUE
 		SELECT %s FROM %s WHERE %s
 		ON CONFLICT (%s) DO UPDATE SET %s`,
-		t.name, strings.Join(columns, ", "), prefixed("r.", columns), rows, c.owned, c.key, strings.Join(set, ", ")), live)
+		t.name, strings.Join(columns, ", "), strings.Join(values, ", "), rows, c.owned, c.key, strings.Join(set, ", ")), live)
 	if err != nil {
 		return err
 	}
