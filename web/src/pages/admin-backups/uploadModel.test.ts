@@ -13,6 +13,8 @@ import {
   partRange,
   retryable,
   sendParts,
+  ENCRYPTED_NOTICE,
+  sniffDecision,
   sniffRestoreSet,
 } from "./uploadModel";
 
@@ -66,6 +68,12 @@ describe("sniffRestoreSet", () => {
     expect(sniffRestoreSet(text("age-encryption.org/v1\n-> X25519"))).toBe("encrypted");
     expect(sniffRestoreSet(tarHead("db.dump"))).toBe("not_a_restore_set");
     expect(sniffRestoreSet(text("PGDMP"))).toBe("not_a_restore_set");
+  });
+
+  it("refuses only what is not a restore set, and lets the server decide an encrypted one", () => {
+    expect(sniffDecision("not_a_restore_set")).toEqual({ upload: false });
+    expect(sniffDecision("restore_set")).toEqual({ upload: true, notice: null });
+    expect(sniffDecision("encrypted")).toEqual({ upload: true, notice: ENCRYPTED_NOTICE });
   });
 });
 
