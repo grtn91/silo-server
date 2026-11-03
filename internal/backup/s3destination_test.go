@@ -100,6 +100,14 @@ func TestPartSizeGrowsWithThePreviousBackup(t *testing.T) {
 			t.Errorf("partSizeFor(%d) = %d, want %d", c.previous, got, c.want)
 		}
 	}
+	// The previous backup is the newest one this server authenticated: an
+	// unverified manifest claiming a huge object sizes nothing.
+	sized := func(gb int64) *Manifest { return &Manifest{Objects: []ObjectEntry{{Name: DumpName, Size: gb << 30}}} }
+	day := time.Date(2026, 10, 31, 4, 0, 0, 0, time.UTC)
+	folders := []folder{{at: day, manifest: sized(1), verified: true}, {at: day.AddDate(0, 0, 1), manifest: sized(5000)}}
+	if got := largestObject(folders); got != 1<<30 {
+		t.Errorf("largestObject = %d, want the verified backup's 1 GiB", got)
+	}
 }
 
 // TestRotationRecordsRefusedDeletes: a bucket that refuses deletes keeps
@@ -345,7 +353,7 @@ func TestDefaultDestinationOnAPrivateBucketIsEncrypted(t *testing.T) {
 	// The parts are sized from the previous backup on a copy; the shared
 	// default destination keeps its own.
 	const partSize = 16 << 20
-	sized, err := prepareTarget(ctx, tgt, []folder{{id: "a", at: time.Now(), manifest: &Manifest{Objects: []ObjectEntry{{Size: 9_000 * partSize / 2}}}}})
+	sized, err := prepareTarget(ctx, tgt, []folder{{id: "a", at: time.Now(), verified: true, manifest: &Manifest{Objects: []ObjectEntry{{Size: 9_000 * partSize / 2}}}}})
 	if err != nil {
 		t.Fatal(err)
 	}

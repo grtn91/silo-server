@@ -58,7 +58,9 @@ func TestOperationPublishesOnlyWhileItHoldsTheLock(t *testing.T) {
 
 // TestRecentBackupWarningSpansDestinations: the 48-hour warning reads the
 // latest success at any destination, so switching to a destination with no
-// copies yet says that instead, and a backup there clears it.
+// copies yet says that instead, and a backup there clears it. A backup whose
+// manifest this server cannot authenticate is no success here, whatever
+// completion time it claims.
 func TestRecentBackupWarningSpansDestinations(t *testing.T) {
 	ctx := t.Context()
 	now := time.Date(2026, 10, 31, 12, 0, 0, 0, time.UTC)
@@ -100,4 +102,31 @@ func TestRecentBackupWarningSpansDestinations(t *testing.T) {
 	if got := codes(); len(got) != 0 {
 		t.Fatalf("a backup here and no recorded success (a full restore emptied the status): warnings %v", got)
 	}
+
+	// With manifests checked, an unsigned one that claims to complete next
+	// year counts for nothing.
+	forged := blobstoreAt(t)
+	svc = New(Options{Destination: NewStoreDestination(forged), Status: status, Now: func() time.Time { return now },
+		KeyCheck: testKeyCheck, ManifestKey: testManifestKey, ServerID: func(context.Context) (string, error) { return "server", nil }})
+	putPlainBackup(t, forged, "server", FolderName(now.Add(-time.Hour), KindNightly), func(m *Manifest) {
+		m.KeyCheck, m.CompletedAt = testKeyCheck+"-other", now.AddDate(1, 0, 0)
+	})
+	listing, err := svc.List(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old = now.Add(-72 * time.Hour)
+	status.rec.LastSuccessAt = &old
+	if got := codes(); listing.LastSuccessAt != nil || !slices.Equal(got, []string{WarningNoBackupsAtDestination, WarningNoRecentBackup}) {
+		t.Fatalf("an unverified manifest: last success %v, warnings %v; want none, and both warnings", listing.LastSuccessAt, got)
+	}
+}
+
+func blobstoreAt(t *testing.T) blobstore.Store {
+	t.Helper()
+	store, err := blobstore.NewFilesystem(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return store
 }

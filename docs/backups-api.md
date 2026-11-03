@@ -111,7 +111,9 @@ go there) and the user store is PostgreSQL (a restore's own backup needs it).
   interrupted run.
 - `keep`: `backup.keep`, how many nightly and manual backups rotation keeps.
 - `last_success_at`: when the latest successful backup finished, at any
-  destination (the current one's newest manifest when that is later).
+  destination (the current one's newest manifest this server authenticated,
+  when that is later; an unverified manifest's completion time never
+  counts).
 - `items`: this server's backups, newest first. Each has `id`, `kind`
   (`nightly`, `manual`, `before-restore`, `before-upgrade`), `status`,
   `created_at`, `completed_at`, `size_bytes`, `silo_version`, `location`
@@ -163,7 +165,8 @@ the responding server, answering `202` with `{id, kind: "manual", status:
 `backup` task through the [admin tasks API](admin-tasks-api.md), for the
 result. It answers `409 conflict` when another backup or restore is running
 on any server, `409` with the SQLite user store message on that backend,
-`409 capability_not_configured` with no destination or no bucket set up, and
+`409 capability_not_configured` with no destination, no bucket set up, or an
+encrypted destination (a bucket) and no archive key (`SECRET_KEY` not set), and
 `409 conflict` while encrypted backups are paused for an unconfirmed key. It is not
 retried automatically.
 
@@ -182,8 +185,9 @@ running restore reads the backup.
 `manifest.json` of a backup with a manifest (`404` otherwise). With
 `{"scope": "restore-set"}` it answers `restore-set.tar` alone, and `409` for
 a backup without one. Every object downloads under its stored name
-(`db.dump`, `blobs.tar`, `restore-set.tar`, `manifest.json`, with `.age` for
-an encrypted backup), so a folder of downloads is one
+(`db.dump`, `blobs.tar`, `restore-set.tar`, `manifest.json`; in an encrypted
+backup `db.dump`, `blobs.tar`, and `restore-set.tar` end in `.age`, and
+`manifest.json`, which is never encrypted, keeps its name), so a folder of downloads is one
 `silo backup restore --from` reads, and `restore-set.tar` is the file an
 [upload](#uploads) on another server takes.
 
@@ -229,6 +233,9 @@ warns `key_not_confirmed` and encrypted backups (the `s3` destination, or
 
 A preview, a restore, or a restore-set download of an encrypted backup taken
 with another `SECRET_KEY` answers `409 conflict` naming both check values.
+That check comes first: this server cannot decrypt the backup, so
+`?accept_unauthenticated=true` does not apply. Only an unencrypted backup
+from another key reaches the `backup_unauthenticated` answer below.
 
 ### Preview a restore set
 
@@ -238,7 +245,9 @@ lock. `409` when the backup has no restore set (a before-upgrade backup),
 when it is from a newer Silo ("This backup is from a newer Silo. Upgrade this
 server first."), or when the restore set cannot be read. `409
 backup_unauthenticated` when this server cannot authenticate the backup's
-manifest (another `SECRET_KEY`, or a manifest that does not record the
+manifest (an unencrypted backup taken with another `SECRET_KEY`; an
+encrypted one is refused with `409 conflict` before this, as above; or a
+manifest that does not record the
 restore set's index digest), before anything inside the restore set is read;
 `?accept_unauthenticated=true` confirms reading it anyway.
 

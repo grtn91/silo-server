@@ -2230,8 +2230,10 @@ notices on the client. `GET /api/v2/admin/backups` therefore returns the
 conditions the dashboard shows as `warnings`: backups turned off, no
 successful backup in the last 48 hours (`no_recent_backup`), at any
 destination: the later of the status row's `last_success_at` and the newest
-complete backup at the current destination, which also covers a status row a
-full restore left empty; no backup at the current destination although one
+complete backup at the current destination whose manifest this server
+authenticated (anyone who can write the destination could set an unverified
+one's completion time in the future), which also covers a status row a
+full restore left empty; no authenticated backup at the current destination although one
 completed before (`no_backups_at_destination`, after switching
 destinations), the destination missing or unreachable, the SQLite user store, `pg_dump` missing or older than the
 server, and encrypted backups (any bucket) paused for an unconfirmed

@@ -688,13 +688,16 @@ func prepareTarget(ctx context.Context, t target, folders []folder) (target, err
 	return t, checkFreeSpace(ctx, t, folders)
 }
 
-// largestObject is the largest object of the newest complete backup: the
-// size the next backup's objects are likely to reach.
+// largestObject is the largest object of the newest complete backup whose
+// manifest this server authenticated: the size the next backup's objects
+// are likely to reach.
 func largestObject(folders []folder) int64 {
 	var largest int64
 	var newest time.Time
 	for _, f := range folders {
-		if f.manifest == nil || !f.at.After(newest) {
+		// An unverified manifest's sizes could be anyone's: a huge one
+		// would size every part to the largest S3 takes, held in memory.
+		if f.manifest == nil || !f.verified || !f.at.After(newest) {
 			continue
 		}
 		newest, largest = f.at, 0
