@@ -48,16 +48,18 @@ func (l PGLoader) CarryPolicies(ctx context.Context, dbURL, liveURL string) ([]s
 		}
 		// The live set replaces the backup's whole: documents first without
 		// their running version, then versions (the authors the restored
-		// data lacks dropped), then which version each runs.
+		// data lacks dropped), then which version each runs. Their ids are
+		// GENERATED ALWAYS identities, so the live ids override them.
 		for _, step := range []struct {
 			sql  string
 			args []any
 		}{
 			{`DELETE FROM policy_documents`, nil},
-			{`INSERT INTO policy_documents (id, domain, name, enabled, active_version_id, created_at, updated_at, revision)
+			{`INSERT INTO policy_documents (id, domain, name, enabled, active_version_id, created_at, updated_at, revision) OVERRIDING SYSTEM VALUE
 				SELECT r.id, r.domain, r.name, r.enabled, NULL, r.created_at, r.updated_at, r.revision FROM json_populate_recordset(NULL::policy_documents, $1::json) r`,
 				[]any{documents}},
 			{`INSERT INTO policy_document_versions (id, document_id, version_number, rego_source, source_sha256, compiled_ok, compile_error, created_by_user_id, comment, created_at)
+				OVERRIDING SYSTEM VALUE
 				SELECT r.id, r.document_id, r.version_number, r.rego_source, r.source_sha256, r.compiled_ok, r.compile_error,
 					(SELECT u.id FROM users u WHERE u.id = r.created_by_user_id), r.comment, r.created_at
 				FROM json_populate_recordset(NULL::policy_document_versions, $1::json) r`, []any{versions}},

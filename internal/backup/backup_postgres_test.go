@@ -1637,40 +1637,15 @@ func TestControlConnectionIsNeverOnTheLiveDatabaseDB(t *testing.T) {
 // come back turned off and are reported. Each side is a database of its
 // own.
 func TestCustomPoliciesComeFromTheLiveServerDB(t *testing.T) {
-	pool, dsn := backuptest.Database(t)
 	ctx := t.Context()
-	open := func() (*pgxpool.Pool, string) {
-		url := createDatabase(t, pool, dsn)
-		db, err := pgxpool.New(ctx, url)
-		if err != nil {
-			t.Fatal(err)
-		}
-		t.Cleanup(db.Close)
-		for _, sql := range []string{
-			`CREATE TABLE users (id integer PRIMARY KEY)`,
-			`CREATE TABLE policy_documents (id bigserial PRIMARY KEY, domain text NOT NULL, name text NOT NULL, enabled boolean NOT NULL DEFAULT false,
-				active_version_id bigint, created_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now(), revision bigint NOT NULL DEFAULT 1)`,
-			`CREATE TABLE policy_document_versions (id bigserial PRIMARY KEY, document_id bigint NOT NULL REFERENCES policy_documents(id) ON DELETE CASCADE,
-				version_number integer NOT NULL, rego_source text NOT NULL, source_sha256 text NOT NULL, compiled_ok boolean NOT NULL, compile_error text,
-				created_by_user_id integer REFERENCES users(id) ON DELETE SET NULL, comment text, created_at timestamptz NOT NULL DEFAULT now())`,
-			`ALTER TABLE policy_documents ADD FOREIGN KEY (active_version_id) REFERENCES policy_document_versions(id) ON DELETE SET NULL`,
-		} {
-			if _, err := db.Exec(ctx, sql); err != nil {
-				t.Fatal(err)
-			}
-		}
-		return db, url
-	}
+	// Two migrated databases: the policy tables' ids are GENERATED ALWAYS
+	// identities there, which an insert of explicit ids must override.
+	open := func() (*pgxpool.Pool, string) { return backuptest.Database(t) }
 	policy := func(db *pgxpool.Pool, version int, author *int) {
 		t.Helper()
 		var doc, ver int64
-		if err := db.QueryRow(ctx, `INSERT INTO policy_documents (domain, name, enabled) VALUES ('playback', 'house rules', true) RETURNING id`).Scan(&doc); err != nil {
+		if err := db.QueryRow(ctx, `INSERT INTO policy_documents (domain, name, enabled) VALUES ('scope', 'house rules', true) RETURNING id`).Scan(&doc); err != nil {
 			t.Fatal(err)
-		}
-		if author != nil {
-			if _, err := db.Exec(ctx, `INSERT INTO users (id) VALUES ($1) ON CONFLICT DO NOTHING`, *author); err != nil {
-				t.Fatal(err)
-			}
 		}
 		if err := db.QueryRow(ctx, `INSERT INTO policy_document_versions (document_id, version_number, rego_source, source_sha256, compiled_ok, created_by_user_id)
 			VALUES ($1, $2, 'package x', 'sha', true, $3) RETURNING id`, doc, version, author).Scan(&ver); err != nil {
@@ -1682,7 +1657,10 @@ func TestCustomPoliciesComeFromTheLiveServerDB(t *testing.T) {
 	}
 	live, liveURL := open()
 	restored, restoredURL := open()
-	author := 42
+	var author int
+	if err := live.QueryRow(ctx, `INSERT INTO users (username, password_hash, role, permissions) VALUES ('policy-author', 'h', 'admin', '{}') RETURNING id`).Scan(&author); err != nil {
+		t.Fatal(err)
+	}
 	policy(restored, 1, nil)
 	policy(live, 2, &author) // the live author is not in the restored data
 	if _, err := (PGLoader{}).CarryPolicies(ctx, restoredURL, liveURL); err != nil {
