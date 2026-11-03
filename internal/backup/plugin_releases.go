@@ -90,6 +90,18 @@ func copyPluginRelease(ctx context.Context, live *pgx.Conn, tx pgx.Tx, id int64)
 		set[i] = fmt.Sprintf("%s = $%d", col, i+2)
 		args = append(args, values[i])
 	}
+	// Its catalog is carried with the live catalogs (plugin_repositories);
+	// one that is not there is dropped from the reference rather than left
+	// to fail the restore on its foreign key.
+	if repo := values[0]; repo != nil {
+		var exists bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM plugin_repositories WHERE id = $1)`, repo).Scan(&exists); err != nil {
+			return err
+		}
+		if !exists {
+			args[1] = nil
+		}
+	}
 	if _, err := tx.Exec(ctx, `UPDATE plugin_installations SET `+strings.Join(set, ", ")+` WHERE id = $1`, args...); err != nil {
 		return err
 	}

@@ -721,6 +721,28 @@ func checkLiveReleasesAndNodes(t *testing.T, loader PGLoader, pool *pgxpool.Pool
 		!slices.ContainsFunc(off, func(s string) bool { return strings.Contains(s, "backup-plugin") }) {
 		t.Fatalf("an installation of another plugin here: enabled %v (%v), reported %v; want it off and reported", enabled, err, off)
 	}
+	// Reinstalled since the backup from a catalog added since: the live
+	// release names a catalog the backup does not have.
+	var catalogID int64
+	if err := pool.QueryRow(ctx, `INSERT INTO plugin_repositories (url, enabled, display_name) VALUES ($1, true, 'New catalog') RETURNING id`,
+		fmt.Sprintf("https://catalog-%d.invalid/index.json", base)).Scan(&catalogID); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), `DELETE FROM plugin_repositories WHERE id = $1`, catalogID)
+	})
+	exec(pool, `UPDATE plugin_installations SET repository_id = $2, version = '3.0.0' WHERE id = $1`, same, catalogID)
+	if _, err := loader.CarryCredentials(ctx, into, dsn); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loader.CarryPluginReleases(ctx, into, dsn); err != nil {
+		t.Fatalf("a release from a catalog added since: %v", err)
+	}
+	var repository *int64
+	if err := restored.QueryRow(ctx, `SELECT version, repository_id FROM plugin_installations WHERE id = $1`, same).Scan(&version, &repository); err != nil ||
+		version != "3.0.0" || repository == nil || *repository != catalogID {
+		t.Fatalf("reinstalled plugin = %s from %v (%v), want the live release and catalog", version, repository, err)
+	}
 	exec(pool, `INSERT INTO stream_nodes (name, type, url, enabled) VALUES ('live-node', 'transcode', 'http://live.invalid', true)`)
 	exec(restored, `INSERT INTO stream_nodes (name, type, url, enabled) VALUES ('removed-node', 'transcode', 'http://removed.invalid', true)`)
 	if _, err := loader.CarryCredentials(ctx, into, dsn); err != nil {

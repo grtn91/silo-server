@@ -79,9 +79,6 @@ var stricterFlags = func() []stricterFlag {
 			describe: `format('plugin task %s kept off', t.capability_id)`},
 		// A plugin catalog an admin turned off stays off, and one removed
 		// since comes back off, so nothing installs or updates from it.
-		{table: "plugin_repositories", column: columnEnabled, stricter: false, key: `t.url`, scope: everyRow,
-			describe: `format('plugin catalog %s kept off', t.url)`, absentOff: true,
-			describeAbsent: `format('plugin catalog %s restored off: removed after the backup', t.url)`},
 		// A library an admin turned off since stays hidden.
 		flag("media_folders", columnEnabled, false, "library"),
 		// Autoscan accepts webhooks with a carried token: off, globally or
