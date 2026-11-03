@@ -1116,6 +1116,35 @@ func checkCarryAuthority(t *testing.T, loader PGLoader, pool *pgxpool.Pool, dsn,
 	if !slices.Contains(carried.Dropped, demoted) {
 		t.Fatalf("carried %+v, want the key of an account the backup lets request more dropped", carried)
 	}
+	// The same request limits on both sides again keep the key; then its
+	// primary profile has a PIN here and none in the backup, so whoever
+	// holds the key could manage the household without the PIN: dropped,
+	// until the backup's profile has a PIN too.
+	exec(restored, `UPDATE request_user_limits SET limit_mode = 'blocked', approval_mode = 'inherit' WHERE user_id = $1`, userID)
+	keptAs := func(want bool, why string) {
+		t.Helper()
+		if carried, err = loader.CarryCredentials(ctx, into, dsn); err != nil {
+			t.Fatal(err)
+		}
+		if slices.Contains(carried.Dropped, demoted) == want {
+			t.Fatalf("carried %+v: %s", carried, why)
+		}
+	}
+	keptAs(true, "want the key kept under the same request limits")
+	var profile string
+	var pin string
+	var primary bool
+	if err := pool.QueryRow(ctx, `SELECT id, pin_hash, is_primary FROM user_profiles WHERE user_id = $1 ORDER BY id LIMIT 1`, userID).Scan(&profile, &pin, &primary); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), `UPDATE user_profiles SET pin_hash = $2, is_primary = $3 WHERE id = $1`, profile, pin, primary)
+	})
+	exec(pool, `UPDATE user_profiles SET pin_hash = 'live-pin', is_primary = true WHERE id = $1`, profile)
+	exec(restored, `UPDATE user_profiles SET pin_hash = '', is_primary = true WHERE id = $1`, profile)
+	keptAs(false, "want the key dropped: the backup's primary profile has no PIN")
+	exec(restored, `UPDATE user_profiles SET pin_hash = 'backup-pin' WHERE id = $1`, profile)
+	keptAs(true, "want the key kept: both primary profiles have a PIN")
 }
 
 // checkAnotherKey: a backup taken with another SECRET_KEY restores only

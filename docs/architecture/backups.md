@@ -570,14 +570,20 @@ neither list.
   disabled now, break-glass access, an effective account policy wider in
   any field (`access.WiderThan`: libraries, quality, stream and transcode
   caps, profiles, downloads, requests, permissions, with access groups
-  applied), or, for a profile both sides have, a restriction lifted or
-  loosened (child profile, rating or advisory-age ceiling, library
-  restriction), or a looser request policy (requests at all, without
-  limit, more titles or over a shorter window, or with automatic approval,
-  as `requests.LayeredPolicy` resolves it from the server's, the access
-  group's, and the account's limits). Changing an account's role deletes
-  its keys for the same reason. `TestAuthorityComparisonCoversEveryField`
-  fails on a field of these policies the comparison does not cover. An invitation or invite code is also dropped when the account it
+  applied), a household manager (a primary profile) without a PIN where
+  every live one has a PIN, or, for a profile both sides have, a
+  protection or restriction lifted or loosened (its PIN, becoming the
+  primary profile, child profile, rating or advisory-age ceiling, library
+  restriction, playback-quality ceiling), or a looser request policy
+  (requests at all, without limit, more titles or over a shorter window,
+  or with automatic approval, as `requests.LayeredPolicy` resolves it from
+  the server's, the access group's, and the account's limits). The PIN
+  itself rolls back with the account, as passwords do; a live credential
+  never attaches to the weaker protection. Changing an account's role
+  deletes its keys for the same reason.
+  `TestAuthorityComparisonCoversEveryField` fails on a field of these
+  policies, or of a stored profile, that the comparison does not cover
+  or name as no authority. An invitation or invite code is also dropped when the account it
   would create gets a wider effective policy under the restored data than
   live: its role and libraries applied to its access group, or the default
   group when it names none, as account creation resolves them, and the

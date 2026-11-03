@@ -30,15 +30,20 @@ type accountAuthority struct {
 	profiles map[string]profileLimits
 }
 
-// profileLimits are a profile's restrictions: a child profile, its rating
-// and advisory-age ceilings, and its library restriction.
+// profileLimits are a profile's protections and restrictions: its PIN,
+// whether it manages the household (the primary profile), a child
+// profile, its rating and advisory-age ceilings, its library restriction,
+// and its playback-quality ceiling.
 type profileLimits struct {
+	pin                bool
+	primary            bool
 	child              bool
 	ceiling            string
 	advisoryAge        *int
 	requireAdvisoryAge bool
 	restricted         bool
 	libraries          []int
+	quality            string
 }
 
 // readAuthority reads the authority of the accounts ids in tx's database;
@@ -84,9 +89,10 @@ func roleRank(user *models.User) int {
 
 func readProfileLimits(ctx context.Context, tx pgx.Tx, userID int) (map[string]profileLimits, error) {
 	rows, err := tx.Query(ctx, `
-		SELECT p.id, p.is_child, coalesce(p.max_content_rating, ''), p.max_advisory_age::int, p.require_advisory_age,
-			p.library_restrictions_enabled,
-			coalesce((SELECT array_agg(a.library_id ORDER BY a.library_id) FROM user_profile_allowed_libraries a WHERE a.profile_id = p.id), '{}')
+		SELECT p.id, coalesce(p.pin_hash, '') <> '', p.is_primary, p.is_child, coalesce(p.max_content_rating, ''), p.max_advisory_age::int,
+			p.require_advisory_age, p.library_restrictions_enabled,
+			coalesce((SELECT array_agg(a.library_id ORDER BY a.library_id) FROM user_profile_allowed_libraries a WHERE a.profile_id = p.id), '{}'),
+			coalesce(p.max_playback_quality, '')
 		FROM user_profiles p WHERE p.user_id = $1`, userID)
 	if err != nil {
 		return nil, fmt.Errorf("reading account %d's profiles: %w", userID, err)
@@ -96,7 +102,8 @@ func readProfileLimits(ctx context.Context, tx pgx.Tx, userID int) (map[string]p
 	for rows.Next() {
 		var id string
 		var p profileLimits
-		if err := rows.Scan(&id, &p.child, &p.ceiling, &p.advisoryAge, &p.requireAdvisoryAge, &p.restricted, &p.libraries); err != nil {
+		if err := rows.Scan(&id, &p.pin, &p.primary, &p.child, &p.ceiling, &p.advisoryAge, &p.requireAdvisoryAge, &p.restricted, &p.libraries,
+			&p.quality); err != nil {
 			return nil, err
 		}
 		out[id] = p
@@ -106,12 +113,15 @@ func readProfileLimits(ctx context.Context, tx pgx.Tx, userID int) (map[string]p
 
 // widerThan reports whether restored grants anything live does not: a
 // higher rank, sign-in or break-glass access live lacks, a wider account
-// policy (access.WiderThan), or a profile on both sides with a restriction
-// lifted or loosened. A profile only the restored data has is not compared:
-// the account restores it whatever its credentials.
+// policy (access.WiderThan), a household manager (a primary profile)
+// without a PIN where every live one has one, or a profile on both sides
+// with a protection or restriction lifted or loosened. A profile only the
+// restored data has is otherwise not compared: the account restores it
+// whatever its credentials.
 func (restored accountAuthority) widerThan(live accountAuthority) bool {
 	if restored.rank > live.rank || restored.enabled && !live.enabled || restored.breakGlass && !live.breakGlass ||
-		len(access.WiderThan(restored.policy, live.policy)) > 0 || requestsWider(restored.requests, live.requests) {
+		len(access.WiderThan(restored.policy, live.policy)) > 0 || requestsWider(restored.requests, live.requests) ||
+		restored.openManager() && !live.openManager() {
 		return true
 	}
 	for id, r := range restored.profiles {
@@ -122,9 +132,26 @@ func (restored accountAuthority) widerThan(live accountAuthority) bool {
 	return false
 }
 
+// openManager reports whether a primary profile has no PIN: whoever acts
+// as it manages the household (loosens or deletes the other profiles)
+// without one.
+func (a accountAuthority) openManager() bool {
+	for _, p := range a.profiles {
+		if p.primary && !p.pin {
+			return true
+		}
+	}
+	return false
+}
+
 func (p profileLimits) looserThan(live profileLimits) bool {
-	if live.child && !p.child || live.requireAdvisoryAge && !p.requireAdvisoryAge {
+	if live.pin && !p.pin || p.primary && !live.primary || live.child && !p.child || live.requireAdvisoryAge && !p.requireAdvisoryAge {
 		return true
+	}
+	if ceiling := access.NormalizePlaybackQuality(live.quality); ceiling != "" {
+		if q := access.NormalizePlaybackQuality(p.quality); q == "" || access.CompareQuality(q, ceiling) > 0 {
+			return true
+		}
 	}
 	if access.HasCeiling(live.ceiling) && p.ceiling != live.ceiling {
 		liveAge, ok := access.AgeForCeiling(live.ceiling)
