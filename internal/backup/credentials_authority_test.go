@@ -80,7 +80,7 @@ func TestAuthorityComparisonCoversEveryField(t *testing.T) {
 	}
 
 	// The account's own fields, each compared by widerThan.
-	accountFields := map[string]bool{"rank": true, "enabled": true, "breakGlass": true, "policy": true, "requests": true, "profiles": true}
+	accountFields := map[string]bool{"rank": true, "enabled": true, "breakGlass": true, "policy": true, "requests": true, "libraries": true, "profiles": true}
 	for _, f := range reflect.VisibleFields(reflect.TypeFor[accountAuthority]()) {
 		if !accountFields[f.Name] {
 			t.Errorf("accountAuthority field %s is not compared: add it to widerThan and here", f.Name)
