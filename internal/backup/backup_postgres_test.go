@@ -28,6 +28,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/blobstore"
 	"github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/config"
+	"github.com/Silo-Server/silo-server/internal/mail"
 	"github.com/Silo-Server/silo-server/internal/secret"
 	"github.com/Silo-Server/silo-server/internal/serveridentity"
 )
@@ -695,7 +696,7 @@ func checkOutboundSettings(t *testing.T, loader PGLoader, pool *pgxpool.Pool, ds
 		}
 		return v
 	}
-	keys := []string{settingSMTPHost, settingSMTPPassword, settingEmailEnabled, settingAIBaseURL, settingAIKey}
+	keys := []string{settingSMTPHost, settingSMTPPassword, mail.SettingSMTPUsername, settingEmailEnabled, settingAIBaseURL, settingAIKey}
 	var saved []string
 	for _, key := range keys {
 		var v *string
@@ -710,23 +711,23 @@ func checkOutboundSettings(t *testing.T, loader PGLoader, pool *pgxpool.Pool, ds
 			_, _ = pool.Exec(context.Background(), `INSERT INTO server_settings (key, value) VALUES ($1, $2)`, saved[i], saved[i+1])
 		}
 	})
-	set(restored, map[string]string{settingSMTPHost: "smtp.then.invalid", settingSMTPPassword: "then", settingEmailEnabled: "true",
+	set(restored, map[string]string{settingSMTPHost: "smtp.then.invalid", settingSMTPPassword: "then", mail.SettingSMTPUsername: "then-user", settingEmailEnabled: "true",
 		settingAIBaseURL: "https://ai.then.invalid", settingAIKey: "then-key"})
-	set(pool, map[string]string{settingSMTPHost: "smtp.now.invalid", settingSMTPPassword: "now", settingEmailEnabled: "true"})
+	set(pool, map[string]string{settingSMTPHost: "smtp.now.invalid", settingSMTPPassword: "now", mail.SettingSMTPUsername: "now-user", settingEmailEnabled: "true"})
 	if _, err := pool.Exec(ctx, `DELETE FROM server_settings WHERE key = ANY($1)`, []string{settingAIBaseURL, settingAIKey}); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err := loader.CarryOutboundSettings(ctx, into, dsn); err != nil {
 		t.Fatal(err)
 	}
-	if read(settingSMTPHost) != "smtp.now.invalid" || read(settingSMTPPassword) != "now" {
+	if read(settingSMTPHost) != "smtp.now.invalid" || read(settingSMTPPassword) != "now" || read(mail.SettingSMTPUsername) != "now-user" {
 		t.Fatalf("mail route %s / %s, want the live one", read(settingSMTPHost), read(settingSMTPPassword))
 	}
 	if read(settingAIBaseURL) != "https://ai.then.invalid" || read(settingAIKey) != "" {
 		t.Fatalf("a route the live server lacks: %s / %q, want the address kept and the key cleared", read(settingAIBaseURL), read(settingAIKey))
 	}
 	if _, cleared, err := loader.CarryOutboundSettings(ctx, into, ""); err != nil || read(settingSMTPPassword) != "" || read(settingEmailEnabled) != settingOff ||
-		!slices.Contains(cleared, settingSMTPHost) {
+		!slices.Contains(cleared, "mail (SMTP)") {
 		t.Fatalf("carrying none (%v): password %q, enabled %q, cleared %v; want it cleared and off", err, read(settingSMTPPassword), read(settingEmailEnabled), cleared)
 	}
 }
@@ -1366,4 +1367,67 @@ func openTestSource(t *testing.T, dir string) *Source {
 	}
 	t.Cleanup(func() { _ = src.Close() })
 	return src
+}
+
+// TestServerSpecificSettingsComeFromTheLiveServerDB: after a full restore
+// every server-specific setting is the live server's, whatever the backup
+// held, and one the live server does not have is gone so its default
+// applies; signing keys keep the values the restore rotated in. Each
+// setting of the classification is checked, on databases of their own.
+func TestServerSpecificSettingsComeFromTheLiveServerDB(t *testing.T) {
+	pool, dsn := backuptest.Database(t)
+	ctx := t.Context()
+	open := func() (*pgxpool.Pool, string) {
+		url := createDatabase(t, pool, dsn)
+		db, err := pgxpool.New(ctx, url)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(db.Close)
+		if _, err := db.Exec(ctx, `CREATE TABLE server_settings (key text PRIMARY KEY, value text NOT NULL)`); err != nil {
+			t.Fatal(err)
+		}
+		return db, url
+	}
+	live, liveURL := open()
+	restored, restoredURL := open()
+	var keys []string
+	for _, key := range settingRegistry() {
+		if kind, _ := SettingKindOf(key); kind == SettingKindServerSpecific && !slices.Contains(keys, key) {
+			keys = append(keys, key)
+		}
+	}
+	if len(keys) < 10 {
+		t.Fatalf("only %d server-specific settings registered", len(keys))
+	}
+	for i, key := range keys {
+		if _, err := restored.Exec(ctx, `INSERT INTO server_settings VALUES ($1, 'backup')`, key); err != nil {
+			t.Fatal(err)
+		}
+		if i%2 == 0 {
+			if _, err := live.Exec(ctx, `INSERT INTO server_settings VALUES ($1, 'live')`, key); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if _, err := (PGLoader{}).CarryServerSpecificSettings(ctx, restoredURL, liveURL); err != nil {
+		t.Fatal(err)
+	}
+	for i, key := range keys {
+		var got *string
+		if err := restored.QueryRow(ctx, `SELECT value FROM server_settings WHERE key = $1`, key).Scan(&got); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			t.Fatal(err)
+		}
+		_, rotated := rotatedSettings[key]
+		switch {
+		case rotated:
+			if got == nil || *got != "backup" {
+				t.Errorf("%s = %v, want the restore's own value kept", key, got)
+			}
+		case i%2 == 0 && (got == nil || *got != "live"):
+			t.Errorf("%s = %v, want the live value", key, got)
+		case i%2 == 1 && got != nil:
+			t.Errorf("%s = %q, want it gone: the live server has none", key, *got)
+		}
+	}
 }
