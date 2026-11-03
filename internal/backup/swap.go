@@ -66,6 +66,8 @@ type SwapOptions struct {
 	StoreConfig StoreConfig
 	OpenStores  func(context.Context, StoreConfig) (blobstore.Stores, error)
 	Cipher      *secret.Cipher
+	// JournalKey authenticates the local journal (secret.RestoreJournalKey).
+	JournalKey []byte
 	// RestoredSettings reads the restored database's settings, so the swap
 	// can confirm it records the storage location the live stores are.
 	RestoredSettings func(ctx context.Context, dbURL string) (map[string]string, error)
@@ -206,7 +208,7 @@ func RestoreSwap(ctx context.Context, src *Source, loader DatabaseLoader, ctl Co
 		LiveOID: liveOID, RestoredOID: restoredOID,
 		PreservePrefix: serverPrefix(m.ServerID) + stamp + "-overwritten-blobs/",
 		Stores:         sealedStores,
-	})
+	}, opts.JournalKey)
 	if err != nil {
 		return discard(err)
 	}
@@ -800,13 +802,26 @@ func (s *swap) restoreBlobs(ctx context.Context) error {
 // It opens no connection to either database: what it needs to know about
 // them comes from pg_database over the control connection, and the blob
 // storage comes from the journal, its credentials unsealed with cipher.
-func RecoverSwap(ctx context.Context, journalPath string, ctl ControlDB, cipher *secret.Cipher, openStores func(context.Context, StoreConfig) (blobstore.Stores, error), out io.Writer) error {
+//
+// The journal must verify under journalKey (openJournal), and its live
+// database must be the one liveURL names, before anything is done to
+// either database: a journal pointed at another database is refused. Its
+// databases are then found by the OIDs it recorded (observe).
+func RecoverSwap(ctx context.Context, journalPath string, ctl ControlDB, cipher *secret.Cipher, journalKey []byte, liveURL string,
+	openStores func(context.Context, StoreConfig) (blobstore.Stores, error), out io.Writer) error {
 	out = writerOrDiscard(out)
-	j, err := openJournal(journalPath)
+	j, err := openJournal(journalPath, journalKey)
 	if err != nil {
 		return err
 	}
 	defer j.close()
+	live, err := databaseName(liveURL)
+	if err != nil {
+		return err
+	}
+	if j.header.LiveDatabase != live {
+		return fmt.Errorf("the restore journal is for the database %q, not %q, which DATABASE_URL names; nothing was changed", j.header.LiveDatabase, live)
+	}
 	unlock, err := ctl.LockRestore(ctx, j.header.LiveDatabase)
 	if err != nil {
 		return err

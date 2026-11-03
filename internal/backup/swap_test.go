@@ -503,7 +503,7 @@ func (f *swapFixture) restore() (err error, crashed bool) {
 			Validate:    f.validate,
 			LiveURL:     "postgres://silo@db.invalid/" + liveDB,
 			StoreConfig: StoreConfig{Backend: blobstore.BackendLocal, LocalPath: f.root},
-			OpenStores:  f.openStores, Cipher: f.cipher,
+			OpenStores:  f.openStores, Cipher: f.cipher, JournalKey: testJournalKey,
 			RestoredSettings: func(context.Context, string) (map[string]string, error) { return map[string]string{}, nil },
 			WorkDir:          f.workDir, Now: func() time.Time { return swapNow }, Out: &f.output,
 		})
@@ -520,7 +520,7 @@ func (f *swapFixture) recover() (err error, crashed bool) {
 	returned := false
 	go func() {
 		defer close(done)
-		e := RecoverSwap(f.t.Context(), JournalPath(f.workDir, swapStamp), f.ctl, f.cipher, f.openStores, &f.output)
+		e := RecoverSwap(f.t.Context(), JournalPath(f.workDir, swapStamp), f.ctl, f.cipher, testJournalKey, "postgres://silo@db.invalid/"+liveDB, f.openStores, &f.output)
 		returned = true
 		done <- e
 	}()

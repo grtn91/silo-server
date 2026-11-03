@@ -231,9 +231,13 @@ func runBackupRestore(ctx context.Context, args []string, out io.Writer) error {
 	if err != nil {
 		return err
 	}
+	journalKey, err := secret.RestoreJournalKey(masterKey)
+	if err != nil {
+		return err
+	}
 	if err := backup.RestoreSwap(ctx, src, loader, ctl, backup.SwapOptions{
 		Validate: validate, LiveURL: liveURL, DatabaseOnly: f.databaseOnly,
-		StoreConfig: storeConfig, OpenStores: storesFromConfig, Cipher: cipher,
+		StoreConfig: storeConfig, OpenStores: storesFromConfig, Cipher: cipher, JournalKey: journalKey,
 		RestoredSettings: plainSettings, WorkDir: workDir, Out: out,
 		Journaled: func(stamp string) { swapJournal.Store(&stamp) },
 	}); err != nil {
@@ -338,7 +342,11 @@ func runBackupRecover(ctx context.Context, stamp string, out io.Writer) error {
 	// Neither database is opened: the journal holds the storage
 	// configuration, and the control connection reads which database is
 	// which from pg_database.
-	if err := backup.RecoverSwap(ctx, backup.JournalPath(workDir, stamp), ctl, cipher, storesFromConfig, out); err != nil {
+	journalKey, err := secret.RestoreJournalKey(masterKey)
+	if err != nil {
+		return err
+	}
+	if err := backup.RecoverSwap(ctx, backup.JournalPath(workDir, stamp), ctl, cipher, journalKey, liveURL, storesFromConfig, out); err != nil {
 		return err
 	}
 	_, _ = fmt.Fprintln(out, "If the restore went ahead, run FLUSHDB on the Redis database Silo uses before starting Silo.")
