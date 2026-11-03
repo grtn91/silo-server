@@ -793,6 +793,7 @@
 ./internal/backup TestManagedSectionPointedElsewhereIsRestoredDB
 ./internal/backup TestSelectiveRestoreOnOneConnectionDB
 ./internal/backup TestUnverifiedRestoreLeavesCostlyWorkOffDB
+./internal/backup TestRestoreItemWritesDoNotGrowDB
 ./internal/backup TestUnverifiedSectionCollectionHasNoScheduleDB
 ./internal/backup TestRestoreRefusesCollectionSourcesTheEditorWouldDB
 ./internal/backup TestManagedCollectionKeysMapLibrariesDB

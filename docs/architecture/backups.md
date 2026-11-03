@@ -818,8 +818,13 @@ Whichever API server claims it:
 5. applies the chosen items section by section. **Each item runs in its own
    transaction that begins with `SELECT … FROM admin_jobs … FOR UPDATE`,
    requiring status running and the worker's claim generation, holds that
-   lock through commit, and writes the item's outcome into the job's result
-   in the same transaction.** The package write paths take that transaction.
+   lock through commit, and records the item's outcome in the same
+   transaction.** The outcome is a `backup_restore_items` row; the job's
+   result holds the counts, the library map, and the latest 20 outcomes, so
+   each item's write is the same size however many came before it. The full
+   list goes into the result once: when the restore returns, however it
+   ends, or when stale recovery marks it interrupted; the rows are then
+   removed. The package write paths take that transaction.
    A failed item rolls back to a savepoint and is recorded as failed; the
    restore continues. Events are published after each commit.
 6. honors cancellation between items, never inside one.
@@ -1847,7 +1852,17 @@ database, so neither preflight would see the other.
    closing anything) and at
    `backups/<server-id>/<time>-overwritten-blobs/journal.json`.
    Its header records both databases' OIDs and the live storage
-   configuration, credentials sealed with `SECRET_KEY`.
+   configuration, credentials sealed with `SECRET_KEY`. Every line carries
+   an HMAC-SHA256, under a key derived from `SECRET_KEY`
+   (`secret.RestoreJournalKey`, `silo/restore-journal/v1`), of the previous
+   line's MAC and its record, so the chain covers the header, every step,
+   and every blob, in order. `--recover` reads only a regular file of the
+   user running it, opened without following links, in a directory no other
+   user can write to unless it is sticky; refuses any line that does not
+   verify (only a torn last line, from a crash mid-write, is cut off); and
+   refuses a journal whose live database is not the one `DATABASE_URL`
+   names, before it acts on either database. A journal from a build that
+   wrote no MACs is refused with how to recover by hand.
 6. Blobs, unless `--database-only`: each key the backup holds is recorded in
    the journal before it changes; one that exists is first copied to
    `backups/<server-id>/<time>-overwritten-blobs/<key>` in its own store.

@@ -66,7 +66,7 @@ type backupRestoreExecutor struct{ svc *backup.Service }
 
 func (e backupRestoreExecutor) ExecuteBackupRestore(ctx context.Context, run adminjob.BackupRestoreRun) (any, error) {
 	return e.svc.ExecuteRestore(ctx, backup.RestoreRun{
-		Payload: run.Payload,
+		JobID: run.JobID, Payload: run.Payload,
 		Fenced: func(ctx context.Context, fn func(pgx.Tx) (backup.FencedUpdate, error)) error {
 			return run.Fenced(ctx, func(tx pgx.Tx) (adminjob.FencedUpdate, error) {
 				update, err := fn(tx)
