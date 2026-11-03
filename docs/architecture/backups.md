@@ -1042,7 +1042,8 @@ the restore's or import's own transaction: the transaction already holds a
 connection, and a match that waited on the pool for another would wait
 forever on a pool of one. The matched items' visibility is checked in the
 same one read as the present ones'. A profile export names at most 100,000
-items. An item still unmatched is left out and listed in the report by
+items, its items list and every id its data names together, once each,
+checked before the import opens its transaction and mirrored by export. An item still unmatched is left out and listed in the report by
 title. Items the target profile may not see here are left out
 too and listed as hidden: each profile's data is merged through the canonical
 catalog visibility filter (`catalog.FilterAccessibleContentIDsInTransaction`)
