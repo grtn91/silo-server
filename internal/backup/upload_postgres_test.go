@@ -261,7 +261,7 @@ func TestUploadLimitAndSweepDB(t *testing.T) {
 	}
 	held.Release(ctx)
 	var queued *RestoreRequest
-	a.SetRestoreTargets(RestoreTargets{ActiveRestore: func(ctx context.Context) (*RestoreRequest, error) {
+	a.opts.ActiveRestore = func(ctx context.Context) (*RestoreRequest, error) {
 		// A restore being queued now waits for the sweep.
 		if held, err := b.opts.Locker.TryLock(ctx); !errors.Is(err, ErrBusy) {
 			if held != nil {
@@ -270,7 +270,7 @@ func TestUploadLimitAndSweepDB(t *testing.T) {
 			t.Errorf("queueing a restore during the sweep = %v, want ErrBusy", err)
 		}
 		return queued, nil
-	}})
+	}
 	queued = &RestoreRequest{UploadID: completed.ID}
 	if _, warnings := a.sweepUploads(ctx, false, nil); len(warnings) != 0 {
 		t.Fatal(warnings)
@@ -313,6 +313,9 @@ func TestUploadRejectsHostileArchivesDB(t *testing.T) {
 		{"newer format", RejectNewerSilo, buildTar(t, newer, entries), ""},
 		{"trailing data", RejectNotRestoreSet, append(buildTar(t, index, entries), bytes.Repeat([]byte{1}, 2<<20)...), ""},
 		{"other bytes than declared", RejectChecksum, buildTar(t, index, entries), strings.Repeat("0", 64)},
+		// Bytes that are no restore set, and not the ones declared: refused
+		// by their digest, before anything decodes them.
+		{"other bytes than declared, not a set", RejectChecksum, bytes.Repeat([]byte("x"), 4096), strings.Repeat("0", 64)},
 	}
 	for _, c := range cases {
 		u, err := svc.CreateUpload(ctx, 0, int64(len(c.data)), c.sha256, MinUploadPartSize)
@@ -335,7 +338,7 @@ func TestUploadRejectsHostileArchivesDB(t *testing.T) {
 		if keys := uploadObjects(t, store, u.ID); len(keys) != 0 {
 			t.Fatalf("%s: a rejected upload's parts remain: %v", c.name, keys)
 		}
-		if _, err := svc.PreviewUpload(ctx, u.ID); !errors.Is(err, ErrUploadNotReady) {
+		if _, err := svc.PreviewUpload(ctx, u.ID, true); !errors.Is(err, ErrUploadNotReady) {
 			t.Fatalf("%s: preview of a rejected upload = %v", c.name, err)
 		}
 		// Rejected uploads do not count against the limit and go at once.
@@ -352,7 +355,7 @@ func TestUploadRejectsHostileArchivesDB(t *testing.T) {
 	mine := encryptBytes(t, key, paddedRestoreSet(t))
 	if done := upload(t, keyed, mine); done.Status != UploadComplete || done.Digest != sha256Of(mine) {
 		t.Fatalf("an upload encrypted with this server's key = %+v (rejection %+v)", done, done.Rejection)
-	} else if _, err := keyed.PreviewUpload(ctx, done.ID); err != nil {
+	} else if _, err := keyed.PreviewUpload(ctx, done.ID, true); err != nil {
 		t.Fatalf("preview of an encrypted upload: %v", err)
 	}
 	theirs := upload(t, keyed, encryptBytes(t, testArchiveKey(t, "another-server"), paddedRestoreSet(t)))
@@ -405,7 +408,7 @@ func newOtherServer(t *testing.T, f *selectiveFixture) *otherServer {
 	targets.CreateJob = func(context.Context, int, RestoreRequest) (*models.AdminJob, error) {
 		return &models.AdminJob{ID: "queued"}, nil
 	}
-	targets.ActiveRestore = func(context.Context) (*RestoreRequest, error) { return o.queued, nil }
+	o.svc.opts.ActiveRestore = func(context.Context) (*RestoreRequest, error) { return o.queued, nil }
 	o.svc.SetRestoreTargets(targets)
 	return o
 }
@@ -454,7 +457,9 @@ func checkCrossServerPreview(t *testing.T, preview *RestorePreview, u UploadSess
 	}
 	settings := previewItem(t, preview, SectionSettings, "other").Settings
 	for _, s := range settings {
-		if s.Key == seed.secretKey && s.Status == ItemNeedsAnotherKey && s.Masked {
+		// An upload is unverified, so a setting that reaches an outside
+		// service is never restored from it, encrypted or not.
+		if s.Key == seed.secretKey && (s.Status == ItemNeedsAnotherKey || s.Status == SettingUnverifiedBackup) && s.Masked {
 			return
 		}
 	}
@@ -495,14 +500,19 @@ func TestRestoreFromUploadDB(t *testing.T) {
 		t.Fatalf("upload = %+v", u)
 	}
 	f.lose(t, seed)
-	preview, err := other.svc.PreviewUpload(ctx, u.ID)
+	preview, err := other.svc.PreviewUpload(ctx, u.ID, true)
 	if err != nil {
 		t.Fatal(err)
 	}
 	checkCrossServerPreview(t, preview, u, seed)
 
 	libraryRef := strconv.Itoa(seed.libraryID)
-	req := RestoreRequest{UploadID: u.ID, Digest: strings.Repeat("0", 64), Selection: map[string][]string{SectionLibraries: {libraryRef}}}
+	// An upload carries no manifest this server signed: restoring from it
+	// needs the admin's confirmation.
+	if _, err := other.svc.StartRestore(ctx, 1, RestoreRequest{UploadID: u.ID, Digest: u.Digest, Selection: map[string][]string{SectionLibraries: {libraryRef}}}); !errors.Is(err, ErrUnauthenticated) {
+		t.Fatalf("restoring an upload unconfirmed = %v, want ErrUnauthenticated", err)
+	}
+	req := RestoreRequest{UploadID: u.ID, Digest: strings.Repeat("0", 64), Selection: map[string][]string{SectionLibraries: {libraryRef}}, AcceptUnauthenticated: true}
 	if _, err := other.svc.StartRestore(ctx, 1, req); !errors.Is(err, ErrDigestMismatch) {
 		t.Fatalf("queueing with another digest = %v, want ErrDigestMismatch", err)
 	}
@@ -510,7 +520,7 @@ func TestRestoreFromUploadDB(t *testing.T) {
 		t.Fatalf("restore with another digest = %v, want ErrDigestMismatch", err)
 	}
 	req.Digest = u.Digest
-	if _, err := other.svc.StartRestore(ctx, 1, RestoreRequest{UploadID: u.ID, BackupID: source.ID, Digest: u.Digest, Selection: req.Selection}); !errors.As(err, new(*SelectionError)) {
+	if _, err := other.svc.StartRestore(ctx, 1, RestoreRequest{UploadID: u.ID, BackupID: source.ID, Digest: u.Digest, Selection: req.Selection, AcceptUnauthenticated: true}); !errors.As(err, new(*SelectionError)) {
 		t.Fatalf("queueing with two sources = %v, want SelectionError", err)
 	}
 	if _, err := other.svc.StartRestore(ctx, 1, req); err != nil {
@@ -602,7 +612,11 @@ func TestUploadEncryptedOnABucketDB(t *testing.T) {
 			t.Fatalf("part %s is stored unencrypted", k)
 		}
 	}
-	rs, err := svc.openRestoreSet(ctx, restoreSource{uploadID: u.ID}, false)
+	located, err := svc.locateConfirmed(ctx, restoreSource{uploadID: u.ID}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rs, err := svc.openRestoreSet(ctx, located, nil)
 	if err != nil {
 		t.Fatalf("reading the encrypted upload: %v", err)
 	}

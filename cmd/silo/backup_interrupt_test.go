@@ -3,6 +3,9 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -14,6 +17,7 @@ import (
 	"time"
 
 	"github.com/Silo-Server/silo-server/internal/backup"
+	"github.com/Silo-Server/silo-server/internal/secret"
 )
 
 const interruptHelperEnv = "SILO_BACKUP_INTERRUPT_HELPER_ARGS"
@@ -44,7 +48,7 @@ func TestBackupInterruptHelper(t *testing.T) {
 // stallingBucket serves an encrypted backup whose objects send their first
 // bytes and then stall until the client goes away, so a command is
 // interrupted mid-download.
-func stallingBucket(t *testing.T, key *backup.ArchiveKey) (*httptest.Server, chan string) {
+func stallingBucket(t *testing.T, masterKey string, key *backup.ArchiveKey) (*httptest.Server, chan string) {
 	t.Helper()
 	var ciphertext bytes.Buffer
 	w, err := key.Encrypt(&ciphertext)
@@ -63,6 +67,18 @@ func stallingBucket(t *testing.T, key *backup.ArchiveKey) (*httptest.Server, cha
 		"plugin_installations", "library_collections", "user_watch_history", "user_watch_progress"} {
 		m.Tables = append(m.Tables, backup.TableCount{Name: table, Present: true})
 	}
+	// Signed as the server that took it signs it, so the command fetches.
+	unsigned, err := json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	macKey, err := secret.BackupManifestKey([]byte(masterKey))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mac := hmac.New(sha256.New, macKey)
+	mac.Write(unsigned)
+	m.MAC = hex.EncodeToString(mac.Sum(nil))
 	manifest, err := json.Marshal(m)
 	if err != nil {
 		t.Fatal(err)
@@ -101,7 +117,7 @@ func TestBackupInterruptCleansUp(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv, stalled := stallingBucket(t, key)
+	srv, stalled := stallingBucket(t, masterKey, key)
 	from := "s3://backups/folder"
 	for name, args := range map[string][]string{
 		"verify":  {"verify", "--from", from, "--scratch", "postgres://unused/db"},

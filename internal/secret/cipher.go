@@ -95,6 +95,27 @@ func BackupPassphrase(masterKey []byte) (string, error) {
 	return base64.StdEncoding.EncodeToString(key), nil
 }
 
+// manifestKeyInfo domain-separates the key that authenticates backup
+// manifests from every other use of the master key.
+const manifestKeyInfo = "silo/backup-manifest/v1"
+
+// BackupManifestKey derives the HMAC-SHA256 key backup manifests are
+// authenticated with: HKDF-SHA256 with manifestKeyInfo, 32 bytes. Only a
+// server holding SECRET_KEY can produce or check a manifest's MAC.
+func BackupManifestKey(masterKey []byte) ([]byte, error) {
+	return deriveFromMasterKey(masterKey, manifestKeyInfo, 32, "backup manifest key")
+}
+
+// restoreJournalKeyInfo domain-separates the key that authenticates a full
+// restore's local journal.
+const restoreJournalKeyInfo = "silo/restore-journal/v1"
+
+// RestoreJournalKey derives the HMAC-SHA256 key a full restore's journal is
+// authenticated with: HKDF-SHA256 with restoreJournalKeyInfo, 32 bytes.
+func RestoreJournalKey(masterKey []byte) ([]byte, error) {
+	return deriveFromMasterKey(masterKey, restoreJournalKeyInfo, 32, "restore journal key")
+}
+
 // deriveFromMasterKey is HKDF-SHA256 over masterKey with info, refusing a key
 // shorter than New accepts. what names the derived value in errors.
 func deriveFromMasterKey(masterKey []byte, info string, length int, what string) ([]byte, error) {

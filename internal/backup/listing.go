@@ -7,11 +7,8 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"sort"
-	"strings"
 	"time"
 
-	"github.com/Silo-Server/silo-server/internal/blobstore"
 	"github.com/Silo-Server/silo-server/internal/config"
 )
 
@@ -43,14 +40,12 @@ func (s *Service) Delete(ctx context.Context, id string) error {
 	}
 	op := s.beginOperation(ctx, held, ActiveOperation{Operation: OperationDelete, BackupID: id, StartedAt: s.opts.Now()})
 	defer op.end(ctx, nil)
-	objects, err := t.List(ctx, folderPrefix(serverID, id))
-	if err != nil {
+	if found, err := hasObjects(ctx, t, folderPrefix(serverID, id)); err != nil {
 		return err
-	}
-	if len(objects) == 0 {
+	} else if !found {
 		return ErrNotFound
 	}
-	return t.DeletePrefix(ctx, folderPrefix(serverID, id))
+	return deleteBackupFolder(ctx, t, folderPrefix(serverID, id))
 }
 
 // Summary describes one backup folder of this server.
@@ -76,6 +71,9 @@ type Summary struct {
 	Encrypted  bool   `json:"encrypted"`
 	KeyCheck   string `json:"key_check,omitempty"`
 	KeyMatches bool   `json:"key_matches"`
+	// Clean is whether rotation protects this copy as its newest clean one
+	// may be: complete, every blob, verified (folder.cleanCopy).
+	Clean bool `json:"clean"`
 }
 
 // Warning is one condition the dashboard shows about backups.
@@ -194,11 +192,12 @@ func (s *Service) list(ctx context.Context) (Listing, error) {
 	listing.DestinationAvailable = true
 	recordedSuccess := listing.LastSuccessAt
 	hereSuccess := false
-	objects, err := t.List(ctx, RootPrefix)
+	// A server id and "uploads" may be among them, so two more than shown.
+	children, err := childFolders(ctx, t, RootPrefix, maxOtherServers+2)
 	if err != nil {
 		return listing, err
 	}
-	listing.OtherServerIDs = otherServerIDs(objects, serverID)
+	listing.OtherServerIDs = otherServerIDs(children, serverID)
 	folders, err := s.folders(ctx, t, serverID)
 	if err != nil {
 		return listing, err
@@ -206,6 +205,7 @@ func (s *Service) list(ctx context.Context) (Listing, error) {
 	for _, f := range folders {
 		summary := Summary{ID: f.id, Kind: f.kind, CreatedAt: f.at, SizeBytes: f.size, MissingBlobs: []MissingBlob{}, RestoreSetOmitted: []OmittedItem{}, Objects: []ObjectEntry{},
 			Location: t.Location(folderPrefix(serverID, f.id))}
+		summary.Clean = f.cleanCopy()
 		switch {
 		case f.manifest != nil:
 			s.fromManifest(&summary, f.manifest)
@@ -214,6 +214,8 @@ func (s *Service) list(ctx context.Context) (Listing, error) {
 			if listing.LastSuccessAt == nil || completed.After(*listing.LastSuccessAt) {
 				listing.LastSuccessAt = &completed
 			}
+		case f.tampered:
+			summary.Status = StatusUnverified
 		case listing.Active != nil && listing.Active.Operation == OperationBackup && listing.Active.BackupID == f.id:
 			summary.Status = StatusInProgress
 		default:
@@ -229,20 +231,14 @@ func (s *Service) list(ctx context.Context) (Listing, error) {
 }
 
 // otherServerIDs lists the server ids other than serverID with backups at
-// a destination, from a listing of RootPrefix.
-func otherServerIDs(objects []blobstore.ObjectInfo, serverID string) []string {
-	others := map[string]bool{}
-	for _, obj := range objects {
-		sid, _, ok := strings.Cut(strings.TrimPrefix(obj.Key, RootPrefix), "/")
-		if ok && sid != serverID && validServerID(sid) && sid != "uploads" {
-			others[sid] = true
+// a destination, from the folders under RootPrefix (childFolders).
+func otherServerIDs(children []string, serverID string) []string {
+	out := make([]string, 0, len(children))
+	for _, sid := range children {
+		if sid != serverID && validServerID(sid) && sid != "uploads" && len(out) < maxOtherServers {
+			out = append(out, sid)
 		}
 	}
-	out := make([]string, 0, len(others))
-	for sid := range others {
-		out = append(out, sid)
-	}
-	sort.Strings(out)
 	return out
 }
 
@@ -250,6 +246,9 @@ func otherServerIDs(objects []blobstore.ObjectInfo, serverID string) []string {
 func (s *Service) fromManifest(summary *Summary, m *Manifest) {
 	completed := m.CompletedAt
 	summary.Status, summary.CompletedAt, summary.SiloVersion = m.Status(), &completed, m.SiloVersion
+	if !m.authenticated && s.opts.ManifestKey != nil {
+		summary.Status = StatusUnverified
+	}
 	summary.SizeBytes, summary.MissingBlobs, summary.Objects, summary.BlobCount = m.Size(), m.MissingBlobs, m.Objects, m.Blobs.Count
 	summary.Encrypted, summary.KeyCheck, summary.KeyMatches = m.Encrypted, m.KeyCheck, m.KeyCheck != "" && m.KeyCheck == s.opts.KeyCheck
 	if m.RestoreSet != nil && m.RestoreSet.Omitted != nil {

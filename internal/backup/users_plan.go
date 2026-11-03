@@ -47,6 +47,9 @@ const (
 	ReasonLoginTaken           = "login_taken"
 	ReasonProfileLimit         = "profile_limit"
 	ReasonUserStore            = "user_store_unsupported"
+	// ReasonNeedsPrimary: an account without a primary profile here whose
+	// selection leaves out the backup's primary profile.
+	ReasonNeedsPrimary = "needs_primary_profile"
 )
 
 // KindAccount is the users section's item kind.
@@ -192,6 +195,10 @@ type userPlanner struct {
 	// pending, set for a preview, counts what a matched account's restore
 	// would change; nil (a restore) skips the count.
 	pending *pendingCompare
+	// users are the backup's accounts; claims counts, per account here, the
+	// backup accounts that match it (sharedTargets).
+	users  []UserDocument
+	claims map[int]int
 }
 
 func (s *Service) newUserPlanner(rs *RestoreSet, q queryer, serverID string, libMap map[int]int) *userPlanner {
@@ -199,7 +206,8 @@ func (s *Service) newUserPlanner(rs *RestoreSet, q queryer, serverID string, lib
 	if s.opts.UserStoreBackend != nil {
 		backend = strings.ToLower(strings.TrimSpace(s.opts.UserStoreBackend()))
 	}
-	return &userPlanner{q: q, sourceID: rs.Index.ServerID, sameServer: rs.Index.ServerID == serverID, libMap: libMap, userStore: backend != "sqlite"}
+	return &userPlanner{q: q, sourceID: rs.Index.ServerID, sameServer: rs.Index.ServerID == serverID, libMap: libMap, userStore: backend != "sqlite",
+		users: rs.Users}
 }
 
 func (u *userPlanner) planAll(ctx context.Context, docs []UserDocument) ([]accountPlan, error) {
@@ -246,6 +254,20 @@ func (u *userPlanner) plan(ctx context.Context, doc *UserDocument) (accountPlan,
 		acct.Target = TargetNew
 		return plan, nil
 	}
+	if match == MatchLogin {
+		// A match by login is a guess; one that another backup account also
+		// matches here would merge two households.
+		claims, err := u.sharedTargets(ctx)
+		if err != nil {
+			return plan, err
+		}
+		if n := claims[localID]; n > 1 {
+			plan.item.Status, plan.item.Reason = ItemAmbiguous, ReasonAmbiguousAccount
+			plan.item.Message = fmt.Sprintf("%d accounts in the backup match the same account here.", n)
+			acct.Match, acct.Target = MatchNew, TargetNew
+			return plan, nil
+		}
+	}
 	plan.localID = localID
 	acct.Target = plan.target()
 	if localID > 0 {
@@ -267,6 +289,27 @@ func (u *userPlanner) plan(ctx context.Context, doc *UserDocument) (accountPlan,
 		}
 	}
 	return plan, nil
+}
+
+// sharedTargets counts, per account here, the backup accounts that match
+// it, read once per planner. A restore plans one account at a time, so it
+// counts them all to see the others.
+func (u *userPlanner) sharedTargets(ctx context.Context) (map[int]int, error) {
+	if u.claims != nil {
+		return u.claims, nil
+	}
+	claims := map[int]int{}
+	for i := range u.users {
+		_, localID, reason, _, err := u.matchAccount(ctx, u.users[i].Account)
+		if err != nil {
+			return nil, err
+		}
+		if reason == "" && localID > 0 {
+			claims[localID]++
+		}
+	}
+	u.claims = claims
+	return claims, nil
 }
 
 // matchAccount finds the account a backup account is here. It never
@@ -417,6 +460,31 @@ func (u *userPlanner) planNew(ctx context.Context, plan *accountPlan) error {
 	return nil
 }
 
+// checkPrimaryRoom leaves the account out when it has no primary profile
+// here and no room for the backup's.
+func (u *userPlanner) checkPrimaryRoom(ctx context.Context, plan *accountPlan) error {
+	if !plan.item.Selectable {
+		return nil
+	}
+	for _, pp := range plan.profiles {
+		if !pp.entry.IsPrimary || pp.localID != "" || pp.preview.Reason != ReasonProfileLimit {
+			continue
+		}
+		has := false
+		if plan.localID > 0 {
+			if err := u.q.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM user_profiles WHERE user_id = $1 AND is_primary)`, plan.localID).Scan(&has); err != nil {
+				return fmt.Errorf("checking the account's primary profile: %w", err)
+			}
+		}
+		if !has {
+			plan.item.Selectable, plan.item.Reason = false, ReasonNeedsPrimary
+			plan.item.Message = fmt.Sprintf("The account has no primary profile here and no room for its primary profile, %q: it already has %d profiles, its limit.",
+				pp.entry.Name, plan.profileLimit)
+		}
+	}
+	return nil
+}
+
 // planProfiles matches each profile within the mapped account only.
 func (u *userPlanner) planProfiles(ctx context.Context, plan *accountPlan) error {
 	acct := plan.item.Account
@@ -493,6 +561,12 @@ func (u *userPlanner) planProfiles(ctx context.Context, plan *accountPlan) error
 			pp.preview.Status, pp.preview.Selectable, pp.preview.Reason = ItemNotOnThisServer, false, ReasonProfileLimit
 			pp.preview.Message = fmt.Sprintf("The account already has %d profiles, its limit here.", plan.profileLimit)
 		}
+	}
+	// An account with no primary profile here restores the backup's first,
+	// in the first free place (applyAccount); one with no place for it is
+	// not restored at all (missingPrimary), so say so now.
+	if err := u.checkPrimaryRoom(ctx, plan); err != nil {
+		return err
 	}
 	for _, pp := range plan.profiles {
 		acct.Profiles = append(acct.Profiles, pp.preview)

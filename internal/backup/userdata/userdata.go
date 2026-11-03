@@ -15,9 +15,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
+	"slices"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+
+	"github.com/Silo-Server/silo-server/internal/access"
+	"github.com/Silo-Server/silo-server/internal/backup/jsonsize"
 )
 
 // Data type ids. They name a profile's data in a restore set, a profile
@@ -69,12 +74,39 @@ type Summary struct {
 	Count int
 	Items []string
 	Blobs []Blob
+	// Profiles are the account's other profiles the data names (a personal
+	// collection shared with them), by their source ids.
+	Profiles []string
 }
 
 // Items resolves a source content id to the catalog item it is here. The
 // resolver records items it could not match, by title, for the report.
 type Items interface {
 	Resolve(ctx context.Context, sourceID string) (localID string, ok bool, err error)
+}
+
+// RecordingItems is an Items that remembers each local item it resolved,
+// so a caller can tell the rest of the server, after its commit, which
+// items a profile's data now names (notification interest, for one).
+type RecordingItems struct {
+	Inner    Items
+	resolved map[string]bool
+}
+
+func (r *RecordingItems) Resolve(ctx context.Context, sourceID string) (string, bool, error) {
+	local, ok, err := r.Inner.Resolve(ctx, sourceID)
+	if err == nil && ok {
+		if r.resolved == nil {
+			r.resolved = map[string]bool{}
+		}
+		r.resolved[local] = true
+	}
+	return local, ok, err
+}
+
+// Resolved lists the local items resolved, sorted.
+func (r *RecordingItems) Resolved() []string {
+	return slices.Sorted(maps.Keys(r.resolved))
 }
 
 // Target is where an import writes, and how references in the document map
@@ -102,13 +134,17 @@ type Target struct {
 	// here is that plugin's with the capability. Only consulted across
 	// servers.
 	PluginInstallation func(installationID int, capabilityID string) (int, bool)
-	// Collection maps a source collection id named in field
+	// Collections maps source collection ids named in field
 	// (LibraryCollectionField, an admin collection, or UserCollectionField,
-	// a personal one) to the collection here; false drops the reference.
-	// nil maps none.
-	Collection func(ctx context.Context, field, id string) (string, bool, error)
+	// a personal one) to the collections here, all at once; an id missing
+	// from the result is dropped. nil maps none.
+	Collections func(ctx context.Context, field string, ids []string) (map[string]string, error)
 	// Now stamps rows that need a time of their own.
 	Now time.Time
+	// Unverified marks a document from a backup this server cannot verify:
+	// nothing it names may make this server fetch from outside services on
+	// a schedule.
+	Unverified bool
 	// Untrusted marks a profile's own export, which whoever holds it could
 	// have edited. Its import must not write rows other accounts read, such
 	// as shared watchlist titles, from the document.
@@ -124,10 +160,18 @@ const (
 // MapCollection maps a source collection id, dropping it when no mapping
 // is set.
 func (t Target) MapCollection(ctx context.Context, field, id string) (string, bool, error) {
-	if t.Collection == nil {
-		return "", false, nil
+	mapped, err := t.MapCollections(ctx, field, []string{id})
+	local, ok := mapped[id]
+	return local, ok, err
+}
+
+// MapCollections maps source collection ids, by id; an id it drops is
+// missing from the result.
+func (t Target) MapCollections(ctx context.Context, field string, ids []string) (map[string]string, error) {
+	if t.Collections == nil || len(ids) == 0 {
+		return map[string]string{}, nil
 	}
-	return t.Collection(ctx, field, id)
+	return t.Collections(ctx, field, ids)
 }
 
 // MapPluginInstallation maps a source plugin installation, dropping it when
@@ -237,12 +281,28 @@ func ResolveAll(ctx context.Context, items Items, ids []string) (map[string]stri
 }
 
 // Prepared is one profile's document of a type, before it is imported.
-// Keep reports whether an export keeps rows about an item: a profile's own
-// export keeps only what the profile may see now. Nil keeps everything.
-type Keep func(item string) bool
+// Keep is what an export keeps: a profile's own export keeps only what the
+// profile may see now. The zero Keep, an administrator backup's, keeps
+// everything.
+type Keep struct {
+	// Item reports whether rows about a catalog item are kept; nil keeps
+	// every item.
+	Item func(item string) bool
+	// MaxContentRating is the profile's rating ceiling for watchlisted
+	// titles outside the library; "" keeps every title (HasTitle).
+	MaxContentRating string
+}
 
-// Has is keep(item); a nil Keep has every item.
-func (k Keep) Has(item string) bool { return k == nil || k(item) }
+// Has reports whether rows about item are kept.
+func (k Keep) Has(item string) bool { return k.Item == nil || k.Item(item) }
+
+// HasTitle reports whether a watchlisted title outside the library, by its
+// stored certification, is kept: by the rule the watchlist shows it with
+// (access.RatingAllowed), so a title without one fails closed under a
+// ceiling.
+func (k Keep) HasTitle(certification string) bool {
+	return access.RatingAllowed(certification, k.MaxContentRating)
+}
 
 type Prepared struct {
 	Owner Owner
@@ -287,12 +347,23 @@ func PrepareAll(ctx context.Context, tx pgx.Tx, types []Type, docs map[string][]
 	return nil
 }
 
+// DecodedPerByte bounds what a document decodes to against its size
+// (DecodeStrict); a document Silo writes decodes to about its size.
+const DecodedPerByte = 8
+
 // MaxEntries bounds one data type's document.
 const MaxEntries = 500_000
 
 // DecodeStrict decodes one JSON value, refusing unknown fields and trailing
-// data: documents come from backups and uploads, which are untrusted.
+// data: documents come from backups and uploads, which are untrusted. A
+// document that would decode to more than DecodedPerByte times its size
+// plus 64 KiB, nest deeper than 32, or hold over a million elements in one
+// array or object is refused before it is decoded (jsonsize).
 func DecodeStrict(data []byte, into any) error {
+	limits := jsonsize.Limits{Depth: 32, Elements: 1_000_000, Bytes: DecodedPerByte*int64(len(data)) + 64<<10}
+	if _, err := jsonsize.Check(data, into, limits); err != nil {
+		return err
+	}
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(into); err != nil {
@@ -301,6 +372,20 @@ func DecodeStrict(data []byte, into any) error {
 	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
 		return errors.New("trailing data after the document")
 	}
+	return CheckBounds(into)
+}
+
+// Distinct refuses an entry a document lists twice, by its key. Every
+// document is written from rows with a unique key, so a repeat is a forged
+// one, which would multiply the writes an import does.
+type Distinct map[string]bool
+
+// Add records key, refusing one already seen.
+func (d Distinct) Add(kind, key string) error {
+	if d[key] {
+		return fmt.Errorf("%s lists %q twice", kind, key)
+	}
+	d[key] = true
 	return nil
 }
 

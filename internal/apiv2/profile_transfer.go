@@ -8,6 +8,7 @@ import (
 	"net/http"
 
 	"github.com/danielgtaylor/huma/v2"
+	"github.com/danielgtaylor/huma/v2/adapters/humachi"
 
 	"github.com/Silo-Server/silo-server/internal/access"
 	"github.com/Silo-Server/silo-server/internal/backup"
@@ -18,13 +19,31 @@ import (
 type ProfileTransferService interface {
 	Capability() backup.ProfileExportCapability
 	Export(ctx context.Context, scope backup.ProfileImportScope) ([]byte, error)
+	// Admit takes the account's transfer slot before an import's body is
+	// read, so a busy server refuses it without buffering it.
+	Admit(ctx context.Context, userID int) (context.Context, func(), error)
 	Import(ctx context.Context, scope backup.ProfileImportScope, data []byte) (*backup.ProfileImportResult, error)
 }
 
 // ProfileExportDocument is a silo-profile-export document. Its shape is the
 // file format, versioned on its own (docs/architecture/backups.md), not
-// this contract, so the schema leaves it open.
-type ProfileExportDocument map[string]any
+// this contract, so the schema leaves it open. It is carried as the
+// encoded document: an export is written as backup produced it, and an
+// import is parsed by backup from the raw body, so neither is decoded here.
+//
+//nolint:recvcheck // Huma marshals the Body value, so MarshalJSON needs a value receiver; UnmarshalJSON needs a pointer.
+type ProfileExportDocument json.RawMessage
+
+// MarshalJSON writes the document as it is.
+func (d ProfileExportDocument) MarshalJSON() ([]byte, error) {
+	if len(d) == 0 {
+		return []byte("null"), nil
+	}
+	return d, nil
+}
+
+// UnmarshalJSON keeps nothing: the import reads the raw body.
+func (d *ProfileExportDocument) UnmarshalJSON([]byte) error { return nil }
 
 func (ProfileExportDocument) Schema(huma.Registry) *huma.Schema {
 	return &huma.Schema{Type: huma.TypeObject, AdditionalProperties: true, Extensions: map[string]any{extExtensionBag: "profile-export-document"},
@@ -91,7 +110,7 @@ func registerProfileTransfer(reg *Registry) {
 
 	export := humaOp(http.MethodGet, Prefix+"/profile/export", "exportProfile", "profiles",
 		"Download the acting profile's own data as a silo-profile-export document: watch history and progress, ratings, favorites and watchlist, personal collections, dismissals, preferences, and notification preferences, leaving out titles the profile may not see now. It carries no account fields, password or PIN hashes, or access fields.")
-	export.Errors = []int{http.StatusForbidden}
+	export.Errors = []int{http.StatusForbidden, http.StatusConflict, http.StatusRequestEntityTooLarge}
 	Register(reg, viewerOperation(export), func(ctx context.Context, _ *struct{}) (*ProfileExportOutput, error) {
 		svc := reg.deps.ProfileTransfer
 		if svc == nil {
@@ -106,16 +125,36 @@ func registerProfileTransfer(reg *Registry) {
 		if err != nil {
 			return nil, profileTransferProblem(err)
 		}
-		var doc ProfileExportDocument
-		if err := json.Unmarshal(data, &doc); err != nil {
-			return nil, serviceProblem(err)
-		}
-		return &ProfileExportOutput{Body: doc, ContentDisposition: mime.FormatMediaType("attachment", map[string]string{dispositionFilenameParam: "silo-profile.json"})}, nil
+		return &ProfileExportOutput{Body: ProfileExportDocument(data), ContentDisposition: mime.FormatMediaType("attachment", map[string]string{dispositionFilenameParam: "silo-profile.json"})}, nil
 	})
 
 	imp := humaOp(http.MethodPost, Prefix+"/profile/import", "importProfile", "profiles",
 		"Merge a silo-profile-export document into the acting profile: newer progress and history win, ratings, favorites, and dismissals are added where the profile has none, collections gain missing items, and preferences are overwritten. Nothing is deleted, and importing the same document again changes nothing. The target is always the acting profile; a document carrying account or access fields is refused, and items the profile cannot see are left out. A PIN-protected profile needs its PIN-verified session.")
 	imp.Errors = []int{http.StatusForbidden, http.StatusConflict}
+	// The service decodes and validates the raw document strictly; a generic
+	// decode for the schema check would hold a second copy of a large one.
+	imp.SkipValidateBody = true
+	// The transfer slot is taken before Huma reads the body, so an import
+	// the server is too busy for is refused without buffering it.
+	imp.Middlewares = huma.Middlewares{func(ctx huma.Context, next func(huma.Context)) {
+		svc, claims := reg.deps.ProfileTransfer, claimsFrom(ctx.Context())
+		if svc == nil || claims == nil {
+			next(ctx)
+			return
+		}
+		admitted, release, err := svc.Admit(ctx.Context(), claims.UserID)
+		if err != nil {
+			problem, ok := errors.AsType[*Problem](profileTransferProblem(err))
+			if !ok {
+				problem = NewProblem(TypeInternalError, "An unexpected error occurred.")
+			}
+			r, w := humachi.Unwrap(ctx)
+			writeProblem(w, r, problem)
+			return
+		}
+		defer release()
+		next(huma.WithContext(ctx, admitted))
+	}}
 	Register(reg, Operation{Operation: imp, Class: ClassProfileScoped, ServiceBacked: true, DemoRestricted: true,
 		RetrySafety: RetrySafetyNaturalIdempotent, MaxBodyBytes: backup.MaxProfileImportBytes},
 		func(ctx context.Context, in *ProfileImportInput) (*ProfileImportOutput, error) {
@@ -152,8 +191,10 @@ func profileTransferProblem(err error) error {
 		return NewProblem(TypeValidationFailed, err.Error())
 	case errors.Is(err, backup.ErrProfileImportTooLarge):
 		return NewProblem(TypePayloadTooLarge, err.Error())
-	case errors.Is(err, backup.ErrProfileImportBusy):
-		return NewProblem(TypeConflict, "Another profile import is running. Try again when it finishes.")
+	case errors.Is(err, backup.ErrProfileExportTooLarge):
+		return NewProblem(TypePayloadTooLarge, err.Error())
+	case errors.Is(err, backup.ErrProfileTransferBusy):
+		return NewProblem(TypeConflict, "Another profile export or import is running. Try again when it finishes.")
 	}
 	if invalid, ok := errors.AsType[*backup.InvalidProfileExportError](err); ok {
 		return NewProblem(TypeValidationFailed, invalid.Error())

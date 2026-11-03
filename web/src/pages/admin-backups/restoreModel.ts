@@ -43,11 +43,23 @@ export const REASON_SENTENCES: Record<RestoreReason, string> = {
     "Its access group isn't on this server. Create a group with the same name, then open the restore again.",
   login_taken: "Another account here signs in with its username or email.",
   profile_limit: "The account here has no room for another profile.",
+  needs_primary_profile:
+    "Its primary profile has to be restored with it: only a primary profile manages the household.",
   user_store_unsupported: "Accounts can be restored only on the PostgreSQL user store.",
   template_not_available:
     "This server's starter packs don't have its template, or the template doesn't suit the library.",
   collection_not_mapped:
     "The collection it shows isn't on this server or in the backup, so there's nothing for it to show.",
+  unreadable: "The backup's copy of it can't be read, so it was left out.",
+  files_missing_here: "Its files are missing on this server. Restoring writes them back.",
+  needs_install:
+    "It isn't installed here. Install it from a plugin catalog, then restore it again for its settings. A restore never installs a plugin from a backup.",
+  kept_stricter:
+    "Its settings that differ would widen access, so this server keeps its stricter current values.",
+  unverified_backup:
+    "It connects to outside services, so it isn't restored from a backup this server can't verify.",
+  over_restore_budget:
+    "This restore already wrote as much collection detail as one restore may. Restore it on its own.",
 };
 
 export const SECTION_TITLES: Record<RestoreSectionId, string> = {
@@ -380,11 +392,27 @@ export function chosenItems(set: RestoreSet, selection: SelectionKeys): IndexedI
   );
 }
 
-/** An account's chosen profiles. */
+/**
+ * The profile a new account must restore with any of its others: the
+ * backup's primary profile. Only a primary profile manages a household, and a
+ * restore never makes another profile primary, so the server refuses a new
+ * account whose chosen profiles leave it out.
+ */
+export function requiredPrimary(account: RestoreItem): RestoreProfile | undefined {
+  if (account.account?.target !== "new") return undefined;
+  return account.account.profiles.find((profile) => profile.is_primary && profile.selectable);
+}
+
+/** An account's chosen profiles, its required primary profile with any others. */
 export function chosenProfiles(account: RestoreItem, selection: SelectionKeys): RestoreProfile[] {
-  return (account.account?.profiles ?? []).filter(
+  const primary = requiredPrimary(account);
+  const chosen = (account.account?.profiles ?? []).filter(
     (profile) => profile.selectable && selection.has(profileKey(account.id, profile.id)),
   );
+  if (primary && chosen.length > 0 && !chosen.includes(primary)) {
+    return [primary, ...chosen];
+  }
+  return chosen;
 }
 
 /** Whether any chosen profile carries at least one of the chosen data types. */
@@ -635,6 +663,31 @@ export function restoreCaveats(set: RestoreSet, selection: SelectionKeys): Cavea
       add(
         "key",
         `${plural(otherKey, "encrypted setting")} saved with a different SECRET_KEY ${otherKey === 1 ? "is" : "are"} left out.`,
+      );
+    }
+    const stricter = (item.settings ?? []).filter(
+      (setting) => setting.status === "kept_stricter",
+    ).length;
+    const cleared = (item.settings ?? []).filter((setting) => setting.status === "cleared").length;
+    if (cleared > 0) {
+      add(
+        "cleared",
+        "A service's address changes without its credentials in the backup, so restoring clears them here and turns the service off until they're entered again.",
+      );
+    }
+    const unverified = (item.settings ?? []).filter(
+      (setting) => setting.status === "unverified_backup",
+    ).length;
+    if (unverified > 0) {
+      add(
+        "unverified",
+        `${plural(unverified, "setting")} that ${unverified === 1 ? "connects" : "connect"} to outside services ${unverified === 1 ? "isn't" : "aren't"} restored from a backup this server can't verify.`,
+      );
+    }
+    if (stricter > 0) {
+      add(
+        "stricter",
+        `${plural(stricter, "setting")} would widen access, so this server keeps ${stricter === 1 ? "its" : "their"} stricter current ${stricter === 1 ? "value" : "values"}.`,
       );
     }
     const unknown = item.collection?.unknown_items ?? 0;

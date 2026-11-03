@@ -3,6 +3,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { AdminBackupUpload } from "@/api/v2/adminBackupUpload";
+import { StaleApiRequestContextError } from "@/api/client";
 import { V2ProblemError } from "@/api/v2/request";
 
 import {
@@ -10,6 +11,7 @@ import {
   failureOfError,
   PartFailedError,
   partRange,
+  retryable,
   sendParts,
   sniffRestoreSet,
 } from "./uploadModel";
@@ -81,6 +83,18 @@ describe("failures", () => {
     expect(failureCopy({ kind: "rejected", reason: "encrypted", message: "" }).resumable).toBe(
       false,
     );
+  });
+
+  it("checks a received file again after its check stopped", () => {
+    const failure = failureOfError(problem("internal_error", 500), "complete", limits);
+    expect(failure.kind).toBe("check_failed");
+    expect(failureCopy(failure).resumable).toBe(true);
+    expect(failureOfError(new TypeError("network"), "complete", limits).kind).toBe("check_failed");
+  });
+
+  it("stops retrying a part once the session it was sent with is gone", () => {
+    expect(retryable(new StaleApiRequestContextError())).toBe(false);
+    expect(failureCopy({ kind: "signed_out", part: 3, partCount: 8 }).resumable).toBe(true);
   });
 });
 

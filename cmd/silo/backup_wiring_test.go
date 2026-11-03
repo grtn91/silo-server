@@ -178,8 +178,18 @@ func TestBeforeMigrateBackupOnAnOldSchemaDB(t *testing.T) {
 	if !checked {
 		t.Fatal("the migrations did not run under the backup lock")
 	}
+	// It is signed like every backup, so it verifies under the key.
 	src := db.beforeUpgradeSource(t)
-	if err := backup.VerifyBackup(ctx, src, backup.PGLoader{Tools: db.tools}, db.newDatabase(), backup.ValidateOptions{}, io.Discard); err != nil {
+	keyCheck, err := secret.KeyCheckValue(bc.SecretKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifestKey, err := secret.BackupManifestKey(bc.SecretKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	validate := backup.ValidateOptions{KeyCheck: keyCheck, ManifestKey: manifestKey}
+	if err := backup.VerifyBackup(ctx, src, backup.PGLoader{Tools: db.tools}, db.newDatabase(), validate, io.Discard); err != nil {
 		t.Fatalf("verify the before-upgrade backup: %v", err)
 	}
 }

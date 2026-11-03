@@ -820,7 +820,7 @@ export interface paths {
       path?: never;
       cookie?: never;
     };
-    /** Read a backup's restore set and compare each section with this server: per-item status, the library mapping, per-setting differences with encrypted values masked, and the digest a restore request must carry. 409 when the backup has no restore set or is from a newer Silo. */
+    /** Read a backup's restore set and compare each section with this server: per-item status, the library mapping, per-setting differences with encrypted values masked, and the digest a restore request must carry. 409 when the backup has no restore set or is from a newer Silo, and 409 backup_unauthenticated, before anything inside the restore set is read, when this server cannot authenticate the backup's manifest and accept_unauthenticated is not set. */
     get: operations["getAdminBackupRestoreSet"];
     put?: never;
     post?: never;
@@ -974,7 +974,7 @@ export interface paths {
       path?: never;
       cookie?: never;
     };
-    /** Preview a complete upload's restore set against this server, as for a backup. The digest is the one frozen when the upload completed. 409 for an upload not yet complete. */
+    /** Preview a complete upload's restore set against this server, as for a backup. The digest is the one frozen when the upload completed. 409 for an upload not yet complete, and 409 backup_unauthenticated, before anything inside it is read, without accept_unauthenticated: an upload carries no manifest this server signed. */
     get: operations["getAdminBackupUploadRestoreSet"];
     put?: never;
     post?: never;
@@ -7970,6 +7970,23 @@ export interface paths {
     patch?: never;
     trace?: never;
   };
+  "/api/v2/devices/push/apple/reset": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get?: never;
+    put?: never;
+    /** Clear this account's Apple installation for a device_id so an app that lost its installation key, as after a reinstall, can register again from any generation. */
+    post: operations["resetApplePushInstallation"];
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
   "/api/v2/devices/push/apple/retire": {
     parameters: {
       query?: never;
@@ -13158,7 +13175,7 @@ export interface components {
        */
       password_change_required: boolean;
       /**
-       * @description Effective assignable permissions; empty for a disabled account
+       * @description Assignable permissions the account holds after its access group's mask; empty for a disabled account. An admin lists only explicitly assigned permissions: its role grants every permission only while it acts as administrator (on the primary profile, or with no profile on a household that does not require one), and clients apply that grant from role and profile
        * @example [
        *       "marker_edit"
        *     ]
@@ -14334,6 +14351,8 @@ export interface components {
        * @description Files copied into blobs.tar
        */
       blob_count: number;
+      /** @description Whether this copy counts as a clean copy for rotation: complete, with every file, and verified under this server's SECRET_KEY. Rotation always keeps the newest clean copy, even beyond backup.keep */
+      clean: boolean;
       /**
        * Format: date-time
        * @description RFC 3339 instant in UTC with millisecond precision
@@ -14350,7 +14369,7 @@ export interface components {
       id: string;
       /** @description Check value of the SECRET_KEY the backup was taken with: 16 hex digits in groups of 4 */
       key_check?: string;
-      /** @description Whether key_check is this server's. An encrypted backup that does not match cannot be previewed, restored, or downloaded decrypted here */
+      /** @description Whether key_check is this server's. Settings and credentials the backup holds encrypted cannot be read with another key, and an encrypted backup that does not match cannot be previewed, restored, or downloaded decrypted here */
       key_matches: boolean;
       /** @enum {string} */
       kind: "nightly" | "manual" | "before-restore" | "before-upgrade";
@@ -14364,10 +14383,10 @@ export interface components {
       /** Format: int64 */
       size_bytes: number;
       /**
-       * @description complete: manifest written, checksums recorded, table of contents readable; it does not claim a restore was tested. complete_with_warnings: some referenced files were missing when copied, or the restore set left items out (restore_set_omitted). in_progress: being written now. incomplete: no manifest and nothing running; deleted after 24 hours
+       * @description complete: manifest written, checksums recorded, table of contents readable; it does not claim a restore was tested. complete_with_warnings: some referenced files were missing when copied, or the restore set left items out (restore_set_omitted). in_progress: being written now. incomplete: no manifest and nothing running; deleted after 24 hours. unverified: this server cannot authenticate the manifest (another SECRET_KEY, none recorded, or changed since it was written); a restore needs confirmation, and one whose manifest names this key but does not verify shows no details and cannot be restored
        * @enum {string}
        */
-      status: "complete" | "complete_with_warnings" | "in_progress" | "incomplete";
+      status: "complete" | "complete_with_warnings" | "in_progress" | "incomplete" | "unverified";
     };
     AdminBackupAcknowledgeKeyBody: {
       /** @description The check value the admin was shown (key_check from the backup list). It must be this server's current one */
@@ -14596,6 +14615,8 @@ export interface components {
       username: string;
     };
     AdminBackupRestoreBody: {
+      /** @description Confirms restoring from a backup whose manifest this server cannot authenticate (authenticated false in the preview); refused without it */
+      accept_unauthenticated?: boolean;
       /** @description The digest the preview returned */
       digest: string;
       selection: components["schemas"]["AdminBackupRestoreSelection"];
@@ -14718,7 +14739,14 @@ export interface components {
         | "profile_limit"
         | "user_store_unsupported"
         | "template_not_available"
-        | "collection_not_mapped";
+        | "collection_not_mapped"
+        | "unreadable"
+        | "files_missing_here"
+        | "needs_install"
+        | "kept_stricter"
+        | "unverified_backup"
+        | "over_restore_budget"
+        | "needs_primary_profile";
       /** @description Items (section:id) that must be chosen with this one: a collection whose library is restored by the same request */
       requires: string[];
       restart_required: boolean;
@@ -14933,7 +14961,14 @@ export interface components {
         | "profile_limit"
         | "user_store_unsupported"
         | "template_not_available"
-        | "collection_not_mapped";
+        | "collection_not_mapped"
+        | "unreadable"
+        | "files_missing_here"
+        | "needs_install"
+        | "kept_stricter"
+        | "unverified_backup"
+        | "over_restore_budget"
+        | "needs_primary_profile";
       restart_keys: string[];
       restart_required: boolean;
       /** @enum {string} */
@@ -14999,6 +15034,8 @@ export interface components {
       users?: components["schemas"]["AdminBackupRestoreUserSelection"][];
     };
     AdminBackupRestoreSet: {
+      /** @description Whether the backup's manifest verified under this server's SECRET_KEY. When false the server cannot tell whether the backup was changed after it was written, and a restore needs accept_unauthenticated */
+      authenticated: boolean;
       /** @description The backup previewed; absent for an upload */
       backup_id?: string;
       /**
@@ -15043,10 +15080,16 @@ export interface components {
       /** @description The setting applies after a restart */
       restart_required: boolean;
       /**
-       * @description on_this_server: same value here; needs_another_key: encrypted with another SECRET_KEY and never written
+       * @description on_this_server: same value here; needs_another_key: encrypted with another SECRET_KEY and never written; kept_stricter: the backup's value would widen access (who can sign in, how long sessions last, what a rating-capped profile sees, mail transport security), so this server keeps its stricter value and a restore never writes it; cleared: the restore changes where a service connects and the backup has no secret this server can read for it, so restoring clears the secret here and turns the service off; unverified_backup: it connects to an outside service, which a backup this server cannot verify never restores
        * @enum {string}
        */
-      status: "on_this_server" | "differs" | "needs_another_key";
+      status:
+        | "on_this_server"
+        | "differs"
+        | "needs_another_key"
+        | "kept_stricter"
+        | "cleared"
+        | "unverified_backup";
     };
     AdminBackupRestoreSource: {
       /** @description The backup restored from; absent for an upload */
@@ -19707,7 +19750,7 @@ export interface components {
        */
       restart_count: number;
       /**
-       * @description Process state; starting and backoff occur only for resident plugins, failed also marks a non-resident plugin whose last launch failed
+       * @description Process state; starting and backoff occur only for resident plugins, failed also marks a non-resident plugin whose last launch failed, or whose files can't be restored from its stored archive, on the answering server
        * @enum {string}
        */
       state: "stopped" | "starting" | "running" | "backoff" | "failed";
@@ -22603,6 +22646,8 @@ export interface components {
     ApplePushRegistrationCapability: {
       /** @description Whether the current principal may use the capability */
       allowed: boolean;
+      /** @description resetApplePushInstallation is served: after a push_installation_key_mismatch refusal the app can reset its own installation and register again. */
+      installation_reset_available: boolean;
       /** @description Local ordered storage and current-login validation are configured; not provider delivery or cluster rollout readiness. */
       registration_available: boolean;
       /** @description Opaque revision of this document */
@@ -22641,6 +22686,13 @@ export interface components {
        * @example 3f2a9d5e-6b1c-4c7e-9a0d-2f4b8c1e7a35
        */
       server_id?: string;
+    };
+    ApplePushResetBody: {
+      device_id: string;
+    };
+    ApplePushResetReceipt: {
+      /** @description True when the server cleared the installation's binding and its Apple push registrations. False when there was nothing to clear: no ordered record for this device_id, or one already bound to the sent key, whose generation order still applies. After a cleared or absent record, the next registration with that key binds at any positive generation. */
+      reset: boolean;
     };
     ApplePushRetirementBody: {
       device_id: string;
@@ -43944,7 +43996,10 @@ export interface operations {
   };
   getAdminBackupRestoreSet: {
     parameters: {
-      query?: never;
+      query?: {
+        /** @description Confirms reading a backup whose manifest this server cannot authenticate; without it such a backup answers 409 backup_unauthenticated and nothing inside it is read */
+        accept_unauthenticated?: boolean;
+      };
       header?: {
         /** @description Optional. When present, it must name the authenticated account's primary profile; an absent header is accepted. */
         "X-Profile-Id"?: string;
@@ -45260,7 +45315,10 @@ export interface operations {
   };
   getAdminBackupUploadRestoreSet: {
     parameters: {
-      query?: never;
+      query?: {
+        /** @description Confirms reading an upload, which this server cannot authenticate: it carries no manifest this server signed. Without it the preview answers 409 backup_unauthenticated and nothing inside the upload is read */
+        accept_unauthenticated?: boolean;
+      };
       header?: {
         /** @description Optional. When present, it must name the authenticated account's primary profile; an absent header is accepted. */
         "X-Profile-Id"?: string;
@@ -106520,6 +106578,145 @@ export interface operations {
       };
     };
   };
+  resetApplePushInstallation: {
+    parameters: {
+      query?: never;
+      header: {
+        /** @description The household profile acting for this request; it must belong to the authenticated account. */
+        "X-Profile-Id": string;
+        /** @description Verification proof for a PIN-locked profile, issued by POST /api/v2/profiles/{id}/verify-pin; required only when the declared profile is locked */
+        "X-Profile-Token"?: string;
+        /** @description The caller's current installation key, the one its next registration will send. An installation already bound to it is left alone, so a retried reset cannot undo the registration that followed it. */
+        "X-Push-Installation-Key": string;
+      };
+      path?: never;
+      cookie?: never;
+    };
+    requestBody: {
+      content: {
+        "application/json": components["schemas"]["ApplePushResetBody"];
+      };
+    };
+    responses: {
+      /** @description OK */
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApplePushResetReceipt"];
+        };
+      };
+      /** @description Bad Request */
+      400: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unauthorized */
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Forbidden */
+      403: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Found */
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Not Acceptable */
+      406: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Request Timeout */
+      408: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Request Entity Too Large */
+      413: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unsupported Media Type */
+      415: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Unprocessable Entity */
+      422: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Too Many Requests */
+      429: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Internal Server Error */
+      500: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Service Unavailable */
+      503: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+    };
+  };
   retireApplePushInstallation: {
     parameters: {
       query?: never;
@@ -129678,6 +129875,24 @@ export interface operations {
       };
       /** @description Not Acceptable */
       406: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Conflict */
+      409: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/problem+json": components["schemas"]["Problem"];
+        };
+      };
+      /** @description Request Entity Too Large */
+      413: {
         headers: {
           [name: string]: unknown;
         };

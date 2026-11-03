@@ -21,7 +21,7 @@ var userDataTypes = []userdata.Type{
 	watchlist.BackupData{},
 	usercollections.BackupData{},
 	pgstore.DismissalsBackupData{},
-	pgstore.PreferencesBackupData{},
+	pgstore.PreferencesBackupData{NormalizeSort: catalog.NormalizeCollectionSortPreference},
 	notifications.BackupData{},
 }
 
@@ -69,7 +69,7 @@ const (
 var excludedUserTables = map[string]string{
 	// Sessions, credentials, devices, and links to outside accounts.
 	"auth_sessions":                    "login sessions",
-	"api_keys":                         "API keys",
+	tableAPIKeys:                       "API keys",
 	"oauth_completions":                excludedSignIn,
 	"oauth_link_tickets":               excludedSignIn,
 	"oauth_pending_links":              "external sign-in links",

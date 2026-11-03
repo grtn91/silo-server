@@ -5,6 +5,7 @@ package backup
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 
 	"github.com/jackc/pgx/v5"
 
@@ -39,16 +40,16 @@ func newCollectionMap(p *planner, tx pgx.Tx, libMap map[int]int, sameServer bool
 	return &collectionMap{p: p, tx: tx, libMap: libMap, sameServer: sameServer, admin: admin, carried: usercollections.CarriedCollections(docs)}
 }
 
-// lookup is Target.Collection for target.
-func (m *collectionMap) lookup(target userdata.Target) func(ctx context.Context, field, id string) (string, bool, error) {
-	return func(ctx context.Context, field, id string) (string, bool, error) {
+// lookup is Target.Collections for target.
+func (m *collectionMap) lookup(target userdata.Target) func(ctx context.Context, field string, ids []string) (map[string]string, error) {
+	return func(ctx context.Context, field string, ids []string) (map[string]string, error) {
 		switch field {
 		case userdata.LibraryCollectionField:
-			return m.adminCollection(ctx, id)
+			return m.adminCollections(ctx, ids)
 		case userdata.UserCollectionField:
-			return usercollections.MapCarried(ctx, m.tx, target, m.carried, id)
+			return usercollections.MapCarriedEach(ctx, m.tx, target, m.carried, ids)
 		}
-		return "", false, nil
+		return map[string]string{}, nil
 	}
 }
 
@@ -56,17 +57,21 @@ func (m *collectionMap) lookup(target userdata.Target) func(ctx context.Context,
 // collection the account's documents carry but this server does not have
 // yet maps to a stand-in, because the restore creates it (all profiles'
 // collections before any profile's other data) before anything names it.
-func (m *collectionMap) previewLookup(target userdata.Target) func(ctx context.Context, field, id string) (string, bool, error) {
+func (m *collectionMap) previewLookup(target userdata.Target) func(ctx context.Context, field string, ids []string) (map[string]string, error) {
 	lookup := m.lookup(target)
-	return func(ctx context.Context, field, id string) (string, bool, error) {
-		local, ok, err := lookup(ctx, field, id)
-		if err != nil || ok || field != userdata.UserCollectionField {
-			return local, ok, err
+	return func(ctx context.Context, field string, ids []string) (map[string]string, error) {
+		mapped, err := lookup(ctx, field, ids)
+		if err != nil || field != userdata.UserCollectionField {
+			return mapped, err
 		}
-		if _, carried := m.carried[id]; carried {
-			return pendingCollectionPrefix + id, true, nil
+		for _, id := range ids {
+			if _, ok := mapped[id]; !ok {
+				if _, carried := m.carried[id]; carried {
+					mapped[id] = pendingCollectionPrefix + id
+				}
+			}
 		}
-		return "", false, nil
+		return mapped, nil
 	}
 }
 
@@ -74,41 +79,74 @@ func (m *collectionMap) previewLookup(target userdata.Target) func(ctx context.C
 // collection the restore will create; no stored id has it.
 const pendingCollectionPrefix = "restore-pending:"
 
-// adminCollection maps an admin collection id as the restore's collections
-// and sections match it: a carried collection or template collection, a
+// adminCollections maps admin collection ids as the restore's collections
+// and sections match them: a carried collection or template collection, a
 // section-managed collection through its section, and on the server that
-// wrote the backup any collection still here by its id.
-func (m *collectionMap) adminCollection(ctx context.Context, id string) (string, bool, error) {
-	if local, ok := m.admin[id]; ok {
-		return local, local != "", nil
+// wrote the backup any collection still here by its id. Ids the backup
+// does not name are looked up here in one read, not one per id.
+func (m *collectionMap) adminCollections(ctx context.Context, ids []string) (map[string]string, error) {
+	out := map[string]string{}
+	index := m.p.rs.lookup()
+	var here []string
+	for _, id := range ids {
+		local, cached := m.admin[id]
+		if !cached {
+			_, collection := index.collectionIDs[id]
+			_, template := index.templateIDs[id]
+			_, section := index.sectionCollections[id]
+			if !collection && !template && !section {
+				here = append(here, id)
+				continue
+			}
+			var err error
+			if local, _, err = m.p.resolveCollection(ctx, id, m.libMap, m.sameServer); err == nil && local == "" {
+				local, err = m.sectionCollection(ctx, id)
+			}
+			if err != nil {
+				return nil, err
+			}
+			m.admin[id] = local
+		}
+		if local != "" {
+			out[id] = local
+		}
 	}
-	local, _, err := m.p.resolveCollection(ctx, id, m.libMap, m.sameServer)
-	if err == nil && local == "" {
-		local, err = m.sectionCollection(ctx, id)
+	if len(here) == 0 {
+		return out, nil
 	}
-	if err != nil {
-		return "", false, err
+	var found []string
+	if m.sameServer {
+		rows, err := m.p.q.Query(ctx, `SELECT id FROM library_collections WHERE id = ANY($1)`, here)
+		if err != nil {
+			return nil, fmt.Errorf("reading collections: %w", err)
+		}
+		if found, err = pgx.CollectRows(rows, pgx.RowTo[string]); err != nil {
+			return nil, fmt.Errorf("reading collections: %w", err)
+		}
 	}
-	m.admin[id] = local
-	return local, local != "", nil
+	for _, id := range here {
+		m.admin[id] = ""
+	}
+	for _, id := range found {
+		m.admin[id], out[id] = id, id
+	}
+	return out, nil
 }
 
 // sectionCollection maps the collection a carried section manages to the
 // one its section here shows.
 func (m *collectionMap) sectionCollection(ctx context.Context, id string) (string, error) {
-	for _, e := range m.p.rs.HomeSections.Sections {
-		if e.Collection == nil || e.Collection.ID != id {
-			continue
-		}
-		library := mappedLibrary(e.LibraryID, m.libMap)
-		if e.LibraryID != nil && library == nil {
-			return "", nil
-		}
-		local, _, err := m.p.matchSection(ctx, e, library, m.libMap, m.sameServer)
-		if err != nil || local == nil {
-			return "", err
-		}
-		return sectionCollectionID(local.Config), nil
+	e := indexed(m.p.rs.HomeSections.Sections, m.p.rs.lookup().sectionCollections, id)
+	if e == nil {
+		return "", nil
 	}
-	return "", nil
+	library := mappedLibrary(e.LibraryID, m.libMap)
+	if e.LibraryID != nil && library == nil {
+		return "", nil
+	}
+	local, _, err := m.p.matchSection(ctx, *e, library, m.libMap, m.sameServer)
+	if err != nil || local == nil {
+		return "", err
+	}
+	return sectionCollectionID(local.Config), nil
 }

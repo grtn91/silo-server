@@ -33,6 +33,10 @@ func newBackupService(pool *pgxpool.Pool, bc *config.BootstrapConfig, settings *
 	if err != nil {
 		log.Fatalf("backup archive key: %v", err)
 	}
+	manifestKey, err := secret.BackupManifestKey(bc.SecretKey)
+	if err != nil {
+		log.Fatalf("backup manifest key: %v", err)
+	}
 	return backup.New(backup.Options{
 		Pool:                pool,
 		DatabaseURL:         bc.DatabaseURL,
@@ -45,6 +49,7 @@ func newBackupService(pool *pgxpool.Pool, bc *config.BootstrapConfig, settings *
 		ServerID:            serveridentity.New(settings).ServerID,
 		KeyCheck:            archiveKey.Check,
 		ArchiveKey:          archiveKey,
+		ManifestKey:         manifestKey,
 		Cipher:              deps.SecretCipher,
 		UserStoreBackend:    func() string { return deps.CurrentConfig().UserDB.Backend },
 		AllowUnratedContent: config.NewUnratedContentPolicy(settings).AllowUnratedContent,
@@ -68,11 +73,11 @@ func beforeMigrateBackup(bc *config.BootstrapConfig, pool *pgxpool.Pool, cipher 
 			// Skipping needs only the lock the migrations run under.
 			opts = backup.Options{Pool: pool, Locker: backup.PostgresLocker{Pool: pool}}
 		}
+		// Rotation after the backup keeps a queued restore's source, read
+		// from the admin jobs (Options.ActiveRestore). On a schema the job
+		// repository cannot read, rotation is skipped with a warning; the
+		// backup itself stands.
 		svc := backup.New(opts)
-		// Rotation after the backup keeps a queued restore's source. On a
-		// schema the job repository cannot read, rotation is skipped with a
-		// warning; the backup itself stands.
-		svc.SetRestoreTargets(backup.RestoreTargets{ActiveRestore: api.ActiveBackupRestore(adminjob.NewRepository(pool))})
 		held, err := svc.BeforeUpgrade(ctx, backup.UpgradeOptions{Wait: wait, Skip: skip})
 		if err != nil {
 			return nil, err
@@ -88,6 +93,10 @@ func upgradeBackupOptions(ctx context.Context, pool *pgxpool.Pool, bc *config.Bo
 	if err != nil {
 		return backup.Options{}, fmt.Errorf("backup archive key: %w", err)
 	}
+	manifestKey, err := secret.BackupManifestKey(bc.SecretKey)
+	if err != nil {
+		return backup.Options{}, fmt.Errorf("backup manifest key: %w", err)
+	}
 	settings := catalog.NewEncryptedSettingsRepo(catalog.NewServerSettingsRepo(pool), cipher)
 	all, err := settings.GetAll(ctx)
 	if err != nil {
@@ -102,14 +111,18 @@ func upgradeBackupOptions(ctx context.Context, pool *pgxpool.Pool, bc *config.Bo
 		return backup.Options{}, fmt.Errorf("opening blob storage: %w", err)
 	}
 	return backup.Options{
-		Pool:             pool,
-		DatabaseURL:      bc.DatabaseURL,
-		Settings:         settings,
-		Stores:           stores,
-		Destination:      backup.NewStoreDestination(stores.Operational),
-		Locker:           backup.PostgresLocker{Pool: pool},
-		ServerID:         serveridentity.New(settings).ServerID,
-		ArchiveKey:       archiveKey,
+		Pool:        pool,
+		DatabaseURL: bc.DatabaseURL,
+		Settings:    settings,
+		Stores:      stores,
+		Destination: backup.NewStoreDestination(stores.Operational),
+		Locker:      backup.PostgresLocker{Pool: pool},
+		ServerID:    serveridentity.New(settings).ServerID,
+		ArchiveKey:  archiveKey,
+		// Signed like every other backup, so restoring it needs no
+		// --accept-lost-credentials.
+		KeyCheck:         archiveKey.Check,
+		ManifestKey:      manifestKey,
 		UserStoreBackend: func() string { return cfg.UserDB.Backend },
 	}, nil
 }
@@ -130,7 +143,7 @@ type backupRestoreExecutor struct{ svc *backup.Service }
 
 func (e backupRestoreExecutor) ExecuteBackupRestore(ctx context.Context, run adminjob.BackupRestoreRun) (any, error) {
 	return e.svc.ExecuteRestore(ctx, backup.RestoreRun{
-		Payload: run.Payload,
+		JobID: run.JobID, Payload: run.Payload,
 		Fenced: func(ctx context.Context, fn func(pgx.Tx) (backup.FencedUpdate, error)) error {
 			return run.Fenced(ctx, func(tx pgx.Tx) (adminjob.FencedUpdate, error) {
 				update, err := fn(tx)

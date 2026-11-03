@@ -16,6 +16,7 @@ function backup(day: number, overrides: Partial<AdminBackup> = {}): AdminBackup 
     id: `${day}`,
     kind: "nightly",
     status: "complete",
+    clean: true,
     created_at: new Date(2026, 9, day, 4).toISOString(),
     size_bytes: 1,
     blob_count: 0,
@@ -37,8 +38,8 @@ describe("retentionPlan", () => {
     [
       "keeps the newest copy without warnings behind newer copies with them",
       [
-        backup(31, { status: "complete_with_warnings" }),
-        backup(30, { status: "complete_with_warnings" }),
+        backup(31, { status: "complete_with_warnings", clean: false }),
+        backup(30, { status: "complete_with_warnings", clean: false }),
         backup(29),
         backup(28),
       ],
@@ -49,12 +50,27 @@ describe("retentionPlan", () => {
     [
       "deletes past the limit when every copy has warnings",
       [
-        backup(31, { status: "complete_with_warnings" }),
-        backup(30, { status: "complete_with_warnings" }),
+        backup(31, { status: "complete_with_warnings", clean: false }),
+        backup(30, { status: "complete_with_warnings", clean: false }),
       ],
       1,
       ["30", "31"],
       null,
+    ],
+    [
+      "an unverified copy does not stand in for a verified clean one",
+      [
+        backup(31, {
+          status: "unverified",
+          clean: false,
+          objects: [{ name: "db.dump", size_bytes: 1, sha256: "" }],
+        }),
+        backup(30, { status: "complete_with_warnings", clean: false }),
+        backup(29),
+      ],
+      1,
+      ["30", "31"],
+      "29",
     ],
   ])("%s", (_case, items, keep, doomed, protectedId = null) => {
     const plan = retentionPlan(items, keep);
@@ -66,7 +82,12 @@ describe("retentionPlan", () => {
     const plan = retentionPlan(
       [
         backup(31, { id: "running", status: "in_progress" }),
-        backup(30, { id: "manual", kind: "manual", status: "complete_with_warnings" }),
+        backup(30, {
+          id: "manual",
+          kind: "manual",
+          status: "complete_with_warnings",
+          clean: false,
+        }),
         backup(29, { id: "failed", status: "incomplete" }),
         backup(28, { id: "restore", kind: "before-restore" }),
         backup(27, { id: "upgrade", kind: "before-upgrade" }),

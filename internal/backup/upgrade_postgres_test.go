@@ -184,10 +184,13 @@ func (d *blockingDestination) Put(ctx context.Context, key string, r io.Reader) 
 // TestBeforeUpgradeWaitsForANightlyBackupDB: behind a running nightly backup
 // the before-upgrade backup waits for the lock; a wait that runs out fails
 // naming SILO_MIGRATION_WAIT, and a longer one backs up once the nightly run
-// finishes.
+// finishes. The nightly slot that run recorded neither skips the
+// before-upgrade backup nor changes with it.
 func TestBeforeUpgradeWaitsForANightlyBackupDB(t *testing.T) {
 	ctx := t.Context()
 	opts, store := upgradeOptions(t)
+	// Both publish status, so the nightly run records its slot.
+	opts.Status = PostgresStatus{Pool: opts.Pool}
 	nightlyOpts := opts
 	blocking := &blockingDestination{Destination: opts.Destination, entered: make(chan struct{}), release: make(chan struct{})}
 	nightlyOpts.Destination = blocking
@@ -220,8 +223,17 @@ func TestBeforeUpgradeWaitsForANightlyBackupDB(t *testing.T) {
 	if err := <-nightly; err != nil {
 		t.Fatalf("nightly backup: %v", err)
 	}
+	slot, err := opts.Status.Read(ctx)
+	if err != nil || slot.LastNightlySlot == nil {
+		t.Fatalf("the nightly run recorded no slot: %+v, %v", slot, err)
+	}
+	// The slot is done, and the before-upgrade backup runs anyway and
+	// leaves it as the nightly run recorded it.
 	if err := <-upgraded; err != nil {
 		t.Fatalf("before-upgrade backup after the nightly one: %v", err)
+	}
+	if after, err := opts.Status.Read(ctx); err != nil || after.LastNightlySlot == nil || !after.LastNightlySlot.Equal(*slot.LastNightlySlot) {
+		t.Fatalf("after the before-upgrade backup the slot is %v (%v), want %v", after.LastNightlySlot, err, *slot.LastNightlySlot)
 	}
 	serverID, _ := opts.ServerID(ctx)
 	folders, err := svc.folders(ctx, target{Destination: NewStoreDestination(store)}, serverID)

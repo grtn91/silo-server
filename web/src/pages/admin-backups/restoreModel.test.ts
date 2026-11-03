@@ -11,9 +11,12 @@ import type {
 
 import {
   chooseItems,
+  chosenProfiles,
   DEFAULT_DATA_TYPES,
   indexItems,
+  itemKey,
   profileKey,
+  requiredPrimary,
   toggleKeys,
   restorePlan,
   selectionRequest,
@@ -76,6 +79,7 @@ const SET = {
   created_at: "2026-10-31T04:00:00Z",
   same_server: true,
   key_matches: true,
+  authenticated: true,
   missing_blobs: [],
   library_map: [],
   never_restored_settings: [],
@@ -306,5 +310,29 @@ describe("users plan", () => {
     expect(restorePlan(settled, annaOnly, DEFAULT_DATA_TYPES)[0]?.sentences.at(-1)).toBe(
       "Nothing to merge for the chosen data",
     );
+  });
+});
+
+describe("a new account's primary profile", () => {
+  const accountItem = (target: string) =>
+    item({
+      id: "7",
+      kind: "account",
+      account: account({
+        target,
+        profiles: [profile({ id: "parent", is_primary: true }), profile({ id: "kid" })],
+      }),
+    });
+
+  it("is restored with any of its other profiles", () => {
+    const chosen = new Set([itemKey("users", "7"), profileKey("7", "kid")]);
+    expect(chosenProfiles(accountItem("new"), chosen).map((p) => p.id)).toEqual(["parent", "kid"]);
+    expect(requiredPrimary(accountItem("new"))?.id).toBe("parent");
+  });
+
+  it("is not required of an account that merges into one here", () => {
+    const chosen = new Set([itemKey("users", "7"), profileKey("7", "kid")]);
+    expect(requiredPrimary(accountItem("12"))).toBeUndefined();
+    expect(chosenProfiles(accountItem("12"), chosen).map((p) => p.id)).toEqual(["kid"]);
   });
 });

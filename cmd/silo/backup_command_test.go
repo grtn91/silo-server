@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -16,6 +17,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/blobstore"
 	"github.com/Silo-Server/silo-server/internal/config"
 	"github.com/Silo-Server/silo-server/internal/s3client/s3test"
+	"github.com/Silo-Server/silo-server/internal/secret"
 )
 
 type mapSettingsReader map[string]string
@@ -58,11 +60,20 @@ func backupToBucket(t *testing.T) *bucketBackup {
 			t.Fatal(err)
 		}
 		t.Cleanup(func() { _, _ = pool.Exec(context.Background(), `DROP DATABASE IF EXISTS "`+name+`" WITH (FORCE)`) })
-		url, err := backup.WithDatabase(dsn, name)
+		raw, err := backup.WithDatabase(dsn, name)
 		if err != nil {
 			t.Fatal(err)
 		}
-		return url
+		// The commands refuse a password on their command line.
+		u, err := url.Parse(raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if password, ok := u.User.Password(); ok {
+			t.Setenv("PGPASSWORD", password)
+			u.User = url.User(u.User.Username())
+		}
+		return u.String()
 	}
 	store, err := blobstore.NewFilesystem(t.TempDir())
 	if err != nil {
@@ -91,6 +102,10 @@ func backupToBucket(t *testing.T) *bucketBackup {
 	if err != nil {
 		t.Fatal(err)
 	}
+	manifestKey, err := secret.BackupManifestKey([]byte(b.masterKey))
+	if err != nil {
+		t.Fatal(err)
+	}
 	b.serverID = "cli-s3-" + suffix
 	svc := backup.New(backup.Options{
 		Pool: pool, DatabaseURL: dsn,
@@ -104,8 +119,8 @@ func backupToBucket(t *testing.T) *bucketBackup {
 		Stores: blobstore.Stores{Assets: store, Operational: store}, Destination: backup.NewStoreDestination(store),
 		Locker:     backup.PostgresLocker{Pool: pool},
 		ServerID:   func(context.Context) (string, error) { return b.serverID, nil },
-		ArchiveKey: key,
-		FindTools:  func(context.Context) (backup.Tools, error) { return tools, nil },
+		ArchiveKey: key, KeyCheck: key.Check, ManifestKey: manifestKey,
+		FindTools: func(context.Context) (backup.Tools, error) { return tools, nil },
 	})
 	// Wait for the lock: the backup package's database tests take it too,
 	// and the contract runner runs both packages at once.

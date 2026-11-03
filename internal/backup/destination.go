@@ -31,7 +31,14 @@ type Destination interface {
 	// Put streams r to key. Nothing is spooled locally first.
 	Put(ctx context.Context, key string, r io.Reader) error
 	Open(ctx context.Context, key string) (io.ReadCloser, int64, error)
-	List(ctx context.Context, prefix string) ([]blobstore.ObjectInfo, error)
+	// ListPage lists at most limit (1 to listPageSize) objects under prefix
+	// whose keys sort after after, in key order, and the after of the next
+	// page: empty at the end. Callers list through listing.go's bounded
+	// readers, never everything at once.
+	ListPage(ctx context.Context, prefix, after string, limit int) ([]blobstore.ObjectInfo, string, error)
+	// DeletePrefix deletes every object under prefix, a page at a time. A
+	// backup folder is deleted through deleteBackupFolder, which removes
+	// its manifest first.
 	DeletePrefix(ctx context.Context, prefix string) error
 	// Delete removes objects under RootPrefix; absent keys count as deleted.
 	Delete(ctx context.Context, keys ...string) error
@@ -86,6 +93,12 @@ func NewStoreDestination(store blobstore.Store) Destination { //nolint:iface // 
 }
 
 func (d StoreDestination) Name() string { return DestinationDefault }
+
+// RecordIdentity records the store's identity before a backup writes while
+// it holds the snapshot connection (blobstore.RecordIdentity).
+func (d StoreDestination) RecordIdentity(ctx context.Context) error {
+	return blobstore.RecordIdentity(ctx, d.Store)
+}
 
 // Put writes key and leaves it readable by this account only: a backup holds
 // password hashes and settings, and the store's own modes (0755 folders,
@@ -160,9 +173,11 @@ func (d StoreDestination) Open(ctx context.Context, key string) (io.ReadCloser, 
 	return body, info.Size, nil
 }
 
-func (d StoreDestination) List(ctx context.Context, prefix string) ([]blobstore.ObjectInfo, error) {
-	objects, _, err := d.Store.List(ctx, prefix, "", 0)
-	return objects, err
+func (d StoreDestination) ListPage(ctx context.Context, prefix, after string, limit int) ([]blobstore.ObjectInfo, string, error) {
+	if err := checkPageLimit(limit); err != nil {
+		return nil, "", err
+	}
+	return d.Store.List(ctx, prefix, after, limit)
 }
 
 func (d StoreDestination) DeletePrefix(ctx context.Context, prefix string) error {
@@ -170,7 +185,7 @@ func (d StoreDestination) DeletePrefix(ctx context.Context, prefix string) error
 		return err
 	}
 	_, err := d.Store.DeletePrefix(ctx, prefix)
-	return err
+	return refusedDelete(ctx, err)
 }
 
 func (d StoreDestination) Delete(ctx context.Context, keys ...string) error {
@@ -181,7 +196,23 @@ func (d StoreDestination) Delete(ctx context.Context, keys ...string) error {
 		return nil
 	}
 	_, err := d.Store.Delete(ctx, keys)
-	return err
+	return refusedDelete(ctx, err)
+}
+
+// deleteBackupFolder deletes the backup folder at prefix with its manifest
+// first, at every destination: a destination that refuses deletes (object
+// lock, a deny policy) then leaves the backup whole, and a delete that
+// stops partway leaves an incomplete folder the sweep finishes, never a
+// manifest that lists objects that are gone. A manifest that is already
+// gone counts as deleted.
+func deleteBackupFolder(ctx context.Context, d Destination, prefix string) error {
+	if err := checkDeletePrefix(prefix); err != nil {
+		return err
+	}
+	if err := d.Delete(ctx, prefix+ManifestName); err != nil {
+		return err
+	}
+	return d.DeletePrefix(ctx, prefix)
 }
 
 func (d StoreDestination) Probe(ctx context.Context) error { return d.Store.Probe(ctx) }
@@ -242,6 +273,14 @@ func (d StoreDestination) Location(key string) string {
 func checkDeletePrefix(prefix string) error {
 	if !strings.HasPrefix(prefix, RootPrefix) || !strings.HasSuffix(prefix, "/") {
 		return fmt.Errorf("backup: refusing to delete %q outside a backup folder", prefix)
+	}
+	return nil
+}
+
+// checkPageLimit refuses a page size ListPage does not take.
+func checkPageLimit(limit int) error {
+	if limit < 1 || limit > listPageSize {
+		return fmt.Errorf("backup: a listing page holds 1 to %d objects, not %d", listPageSize, limit)
 	}
 	return nil
 }

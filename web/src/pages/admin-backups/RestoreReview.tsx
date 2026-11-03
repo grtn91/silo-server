@@ -1,5 +1,7 @@
 import type { RestoreDataTypeId, RestoreSet } from "@/api/v2/adminBackupRestore";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
+import { Label } from "@/components/ui/label";
 import { FieldGroup } from "@/pages/admin-settings/FieldGroup";
 
 import { restoreCaveats, restorePlan, type SelectionKeys } from "./restoreModel";
@@ -18,6 +20,9 @@ export interface RestoreReviewProps {
   dataTypes: ReadonlySet<RestoreDataTypeId>;
   onBack: () => void;
   onRestore: () => void;
+  /** The admin's confirmation for a backup this server cannot authenticate. */
+  acceptUnauthenticated: boolean;
+  onAcceptUnauthenticated: (accept: boolean) => void;
   pending: boolean;
   refusal: RestoreRefusal | null;
   onOpenRunning: (jobId: string) => void;
@@ -31,6 +36,8 @@ export function RestoreReview({
   dataTypes,
   onBack,
   onRestore,
+  acceptUnauthenticated,
+  onAcceptUnauthenticated,
   pending,
   refusal,
   onOpenRunning,
@@ -84,6 +91,25 @@ export function RestoreReview({
         </div>
       ) : null}
 
+      {!set.authenticated ? (
+        <div className="space-y-3 rounded-xl border border-amber-500/30 bg-amber-500/10 p-4 text-sm">
+          <p>
+            Silo can&apos;t confirm this backup is unchanged: it was written with a different
+            SECRET_KEY, so anyone who could write to its storage could have changed it.
+          </p>
+          <div className="flex items-center gap-2">
+            <Checkbox
+              id="restore-accept-unauthenticated"
+              checked={acceptUnauthenticated}
+              onCheckedChange={(value) => onAcceptUnauthenticated(value === true)}
+            />
+            <Label htmlFor="restore-accept-unauthenticated">
+              I trust this backup; restore from it anyway
+            </Label>
+          </div>
+        </div>
+      ) : null}
+
       <div className="border-border/60 flex flex-wrap items-center gap-3 border-t pt-4">
         <p className="text-muted-foreground min-w-0 flex-1 text-sm">
           Takes about a minute. Silo backs up this server first.
@@ -91,7 +117,12 @@ export function RestoreReview({
         <Button variant="outline" onClick={onBack} disabled={pending}>
           Back
         </Button>
-        <Button onClick={onRestore} disabled={pending || selection.size === 0}>
+        <Button
+          onClick={onRestore}
+          disabled={
+            pending || selection.size === 0 || (!set.authenticated && !acceptUnauthenticated)
+          }
+        >
           Restore
         </Button>
       </div>

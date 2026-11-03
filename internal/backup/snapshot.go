@@ -9,6 +9,7 @@ import (
 
 	"github.com/Silo-Server/silo-server/internal/branding"
 	"github.com/Silo-Server/silo-server/internal/metadata"
+	"github.com/Silo-Server/silo-server/internal/subtitles"
 )
 
 // Store names inside blobs.tar. Avatars live in the operational store; every
@@ -21,28 +22,34 @@ const (
 // inventoryTables is the core table inventory every manifest records and
 // every full restore compares (docs/architecture/backups.md).
 var inventoryTables = []string{
-	"users", "user_profiles", "media_folders", "media_items", "media_files",
+	tableUsers, tableUserProfiles, "media_folders", "media_items", "media_files",
 	"server_settings", "plugin_installations", tableLibraryCollections,
 	"user_watch_history", "user_watch_progress",
 }
 
-const tableLibraryCollections = "library_collections"
+const (
+	tableLibraryCollections  = "library_collections"
+	tableUsers               = "users"
+	tableUserProfiles        = "user_profiles"
+	tableDownloadedSubtitles = "downloaded_subtitles"
+	tableAPIKeys             = "api_keys"
+)
 
 // sourceLibraryPoster names what references a library poster blob.
 const sourceLibraryPoster = "library poster"
 
-// excludedTableData lists the tables whose rows a dump leaves out: logs and
-// queues that are large and rebuildable or disposable; backup_status, whose
-// row describes the backup being taken and would read as a stale run after a
-// restore; and the upload sessions, whose parts live outside the backup.
-// Their schema is always kept. Each entry also excludes its
-// partitions.
+// excludedTableData lists the tables whose rows a dump leaves out: the logs
+// and queues of loggedTables, and the short-lived secrets of secretTables
+// (secretLeftOut). Their schema is always kept. Each entry
+// also excludes its partitions.
 func excludedTableData(includeIntroFingerprints bool) []string {
-	tables := []string{"activity_log", "operational_logs", "policy_decisions", "catalog_search_index_events", "backup_status", "backup_uploads", "backup_upload_parts", "backup_upload_attempts"}
-	if !includeIntroFingerprints {
-		tables = append(tables, "media_intro_fingerprints")
+	var tables []string
+	for _, t := range loggedTables {
+		if t != tableIntroFingerprints || !includeIntroFingerprints {
+			tables = append(tables, t)
+		}
 	}
-	return tables
+	return append(tables, leftOutTables()...)
 }
 
 // blobRef is one blob the snapshot references.
@@ -190,9 +197,14 @@ func referencedBlobs(ctx context.Context, q queryer, includeSubtitles bool) ([]b
 		query{table: "user_profiles", source: "profile avatar", store: storeOperational, ladder: true,
 			sql: `SELECT DISTINCT substr(avatar, 8) FROM public.user_profiles WHERE avatar LIKE 'upload:%' AND avatar NOT LIKE 'upload:%://%' AND length(avatar) > 7`},
 	)
+	// Uploaded subtitles cannot be fetched again, so they are always kept;
+	// the setting covers only the ones a provider can download again.
+	uploaded := fmt.Sprintf("provider = '%s'", subtitles.ProviderUpload)
+	queries = append(queries, query{table: tableDownloadedSubtitles, source: "uploaded subtitle", store: storeAssets,
+		sql: `SELECT DISTINCT s3_key FROM public.downloaded_subtitles WHERE ` + uploaded + ` AND ` + cached("s3_key")})
 	if includeSubtitles {
-		queries = append(queries, query{table: "downloaded_subtitles", source: "downloaded subtitle", store: storeAssets,
-			sql: `SELECT DISTINCT s3_key FROM public.downloaded_subtitles WHERE ` + cached("s3_key")})
+		queries = append(queries, query{table: tableDownloadedSubtitles, source: "downloaded subtitle", store: storeAssets,
+			sql: `SELECT DISTINCT s3_key FROM public.downloaded_subtitles WHERE NOT (` + uploaded + `) AND ` + cached("s3_key")})
 	}
 	for _, qy := range queries {
 		present, err := tableExists(ctx, q, qy.table)
@@ -235,8 +247,8 @@ func brandingKeys(ctx context.Context, q queryer) ([]string, error) {
 	return keys, rows.Err()
 }
 
-func collectStrings(ctx context.Context, q queryer, sql string) ([]string, error) {
-	rows, err := q.Query(ctx, sql)
+func collectStrings(ctx context.Context, q queryer, sql string, args ...any) ([]string, error) {
+	rows, err := q.Query(ctx, sql, args...)
 	if err != nil {
 		return nil, err
 	}

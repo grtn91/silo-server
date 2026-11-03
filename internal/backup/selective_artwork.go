@@ -3,10 +3,12 @@ package backup
 import (
 	"context"
 	"errors"
+	"io"
 
 	"github.com/jackc/pgx/v5"
 
 	"github.com/Silo-Server/silo-server/internal/catalog"
+	"github.com/Silo-Server/silo-server/internal/imageutil"
 	"github.com/Silo-Server/silo-server/internal/metadata"
 )
 
@@ -14,12 +16,34 @@ import (
 // stored objects.
 
 func (a *applier) artworkEntry(id string) *ItemArtworkEntry {
-	for i := range a.rs.Collections.ItemArtwork {
-		if a.rs.Collections.ItemArtwork[i].itemID() == id {
-			return &a.rs.Collections.ItemArtwork[i]
-		}
+	return indexed(a.rs.Collections.ItemArtwork, a.rs.lookup().artwork, id)
+}
+
+// artworkThumbhash is the thumbhash of the restored original, as the image
+// cache computes one when it stores artwork; the backup's own is used only
+// when the image cannot be read, and only when it is one (validThumbhash).
+func (a *applier) artworkThumbhash(entry ItemArtworkEntry) string {
+	if thumb, err := a.blobThumbhash(entry.Path); err == nil {
+		return thumb
 	}
-	return nil
+	return thumbFor(entry.Path, entry.Thumbhash)
+}
+
+// blobThumbhash computes the thumbhash of an extracted image.
+func (a *applier) blobThumbhash(key string) (string, error) {
+	f, size, err := a.rs.openBlob(key)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = f.Close() }()
+	if size > maxRestoredFile {
+		return "", ErrRestoredFileRefused
+	}
+	data, err := io.ReadAll(f)
+	if err != nil {
+		return "", err
+	}
+	return imageutil.Thumbhash(data)
 }
 
 // stageArtwork writes an artwork item's objects before its transaction,
@@ -44,6 +68,7 @@ func (a *applier) stageArtwork(ctx context.Context, id string) {
 		return
 	}
 	a.staged[id] = a.writeArtwork(ctx, *entry)
+	a.filesWritten[id] = plan.Reason == ReasonFilesMissingHere && a.staged[id] == nil
 }
 
 // writeArtwork registers and writes an artwork entry's objects.
@@ -78,6 +103,11 @@ func (a *applier) applyArtwork(ctx context.Context, tx pgx.Tx, id string) (appli
 		return applied{}, err
 	}
 	item.Label = plan.Label
+	if a.filesWritten[id] && plan.Reason == ReasonSame {
+		// Its files are back; the catalog already points at them.
+		item.Outcome = OutcomeRestored
+		return applied{item: item}, nil
+	}
 	if !plan.Selectable {
 		return leftOutFor(item, plan), nil
 	}
@@ -90,7 +120,7 @@ func (a *applier) applyArtwork(ctx context.Context, tx pgx.Tx, id string) (appli
 	}
 	if err := catalog.PublishArtworkSelectionInTx(ctx, tx, catalog.ArtworkSelection{
 		TargetType: entry.TargetType, TargetContentID: entry.ContentID, ParentContentID: entry.ParentContentID,
-		ImageType: entry.ImageType, StoredPath: entry.Path, SourcePath: entry.Source, Thumbhash: entry.Thumbhash,
+		ImageType: entry.ImageType, StoredPath: entry.Path, SourcePath: entry.Source, Thumbhash: a.artworkThumbhash(*entry),
 		LockField: int(metadata.FieldImages),
 	}); err != nil {
 		return applied{}, err
@@ -106,12 +136,7 @@ func (a *applier) applyArtwork(ctx context.Context, tx pgx.Tx, id string) (appli
 
 func (a *applier) applyBranding(ctx context.Context, tx pgx.Tx, id string) (applied, error) {
 	item := ReportItem{Kind: KindBranding, Label: id}
-	var entry *BrandingEntry
-	for i := range a.rs.Collections.Branding {
-		if a.rs.Collections.Branding[i].itemID() == id {
-			entry = &a.rs.Collections.Branding[i]
-		}
-	}
+	entry := indexed(a.rs.Collections.Branding, a.rs.lookup().branding, id)
 	if entry == nil {
 		return leftOut(item, ReasonNotInBackup, "The backup has no such branding asset."), nil
 	}
@@ -125,7 +150,10 @@ func (a *applier) applyBranding(ctx context.Context, tx pgx.Tx, id string) (appl
 	if err != nil {
 		return applied{}, err
 	}
-	plan := a.s.newPlanner(a.rs, tx).planBranding(stored, *entry)
+	plan, err := a.s.newPlanner(a.rs, tx).planBranding(ctx, stored, *entry)
+	if err != nil {
+		return applied{}, err
+	}
 	if !plan.Selectable {
 		return leftOutFor(item, plan), nil
 	}
@@ -135,10 +163,14 @@ func (a *applier) applyBranding(ctx context.Context, tx pgx.Tx, id string) (appl
 	if err := a.writeBlob(ctx, entry.Blob, entry.Blob); err != nil {
 		return applied{}, err
 	}
-	_, after, err := a.s.targets.ApplySettings(ctx, tx, map[string]string{entry.Key: entry.Ref})
+	item.Outcome = OutcomeRestored
+	if plan.Reason == ReasonFilesMissingHere {
+		// The setting already names the file just written back.
+		return applied{item: item}, nil
+	}
+	_, after, err := a.s.targets.ApplySettings(ctx, tx, map[string]string{entry.Key: entry.Ref}, nil)
 	if err != nil {
 		return applied{}, err
 	}
-	item.Outcome = OutcomeRestored
 	return applied{item: item, after: after}, nil
 }

@@ -116,7 +116,8 @@ const libraryCollectionColumns = `lc.id, lc.library_id, lc.slug, lc.title, lc.de
 	lc.management_mode, lc.management_source, lc.management_key, lc.last_sync_status,
 	lc.last_sync_message, lc.last_sync_at, lc.sync_schedule, lc.next_sync_at,
 	CASE WHEN lc.collection_type = 'smart' THEN lc.item_count_cached
-	     ELSE COALESCE(COUNT(DISTINCT lci.media_item_id), 0) END,
+	     ELSE COALESCE(COUNT(DISTINCT lci.media_item_id) FILTER (WHERE EXISTS (
+	         SELECT 1 FROM media_item_libraries in_library WHERE in_library.content_id = lci.media_item_id)), 0) END,
 	lc.created_at, lc.updated_at,
 	COALESCE(ARRAY_AGG(DISTINCT lcl.library_id) FILTER (WHERE lcl.library_id IS NOT NULL), ARRAY[]::integer[])`
 
@@ -1052,8 +1053,15 @@ func AddMissingItemsInTx(ctx context.Context, tx pgx.Tx, collectionID string, me
 // GroupUngroupedMembershipInTx puts a collection's membership in one library
 // into groupID, at the end of that group's order, only while the membership
 // is ungrouped, in the caller's transaction. It reports whether it changed
-// anything; a membership an admin grouped is left alone.
+// anything; a membership an admin grouped is left alone. It takes the
+// collection-editing locks in their order: the collection parent, then the
+// library's order revision, then the membership row. MoveAndReorder takes
+// the library's parents before anything else, so it waits on the parent
+// here instead of holding the membership row this needs.
 func GroupUngroupedMembershipInTx(ctx context.Context, tx pgx.Tx, collectionID string, libraryID int, groupID string) (bool, error) {
+	if err := lockLibraryCollectionParent(ctx, tx, collectionID); err != nil {
+		return false, err
+	}
 	if err := lockLibraryCollectionOrderRevisions(ctx, tx, []int{libraryID}); err != nil {
 		return false, err
 	}

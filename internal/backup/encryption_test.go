@@ -6,15 +6,33 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"io"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/Silo-Server/silo-server/internal/secret"
 )
 
 func testArchiveKey(t *testing.T, seed string) *ArchiveKey {
 	t.Helper()
-	key, err := NewArchiveKey([]byte(seed + strings.Repeat("k", 40)))
+	key, err := NewArchiveKey(testMasterKey(seed))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return key
+}
+
+// testMasterKey is the SECRET_KEY testArchiveKey and seedManifestKey derive
+// from.
+func testMasterKey(seed string) []byte { return []byte(seed + strings.Repeat("k", 40)) }
+
+// seedManifestKey is the manifest key of testArchiveKey's server.
+func seedManifestKey(t *testing.T, seed string) []byte {
+	t.Helper()
+	key, err := secret.BackupManifestKey(testMasterKey(seed))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -143,9 +161,26 @@ func TestFetchSourceChecksSpaceAndScope(t *testing.T) {
 	if err != nil || len(objects.opened) != 1 || objects.opened[0] != DumpName+EncryptedSuffix {
 		t.Fatalf("database-only fetch = %v, opened %v", err, objects.opened)
 	}
-	if err := src.Validate(ctx, ValidateOptions{KeyCheck: key.Check}); err != nil {
+	if err := m.sign(seedManifestKey(t, "server-a")); err != nil {
+		t.Fatal(err)
+	}
+	if err := src.Validate(ctx, ValidateOptions{KeyCheck: key.Check, ManifestKey: seedManifestKey(t, "server-a")}); err != nil {
 		t.Fatalf("validating a database-only fetch: %v", err)
 	}
+	// The decrypt command reads an object only beside a manifest that
+	// verifies: a changed one's checksums could be anyone's.
+	data, _ := json.Marshal(&m)
+	objects.objects[ManifestName] = data
+	if err := DecryptObject(ctx, objects, DumpName+EncryptedSuffix, key, io.Discard); err != nil {
+		t.Fatalf("decrypt beside a verified manifest: %v", err)
+	}
+	m.CompletedAt = m.CompletedAt.Add(time.Hour)
+	data, _ = json.Marshal(&m)
+	objects.objects[ManifestName] = data
+	if err := DecryptObject(ctx, objects, DumpName+EncryptedSuffix, key, io.Discard); !errors.Is(err, ErrManifestTampered) {
+		t.Fatalf("decrypt beside a changed manifest = %v, want ErrManifestTampered", err)
+	}
+	delete(objects.objects, ManifestName)
 
 	// The manifest says the dump is smaller than what arrives.
 	for i := range m.Objects {

@@ -35,11 +35,20 @@ export function jobIdFromLocation(location: string | null | undefined): string |
  */
 export const RESTORE_SET_TIMEOUT_MS = 180_000;
 
-export function getRestoreSet(context: ProfileRequestContextSnapshot, id: string) {
+/**
+ * `acceptUnauthenticated` confirms opening a backup this server can't verify;
+ * without it such a backup answers 409 `backup_unauthenticated`.
+ */
+export function getRestoreSet(
+  context: ProfileRequestContextSnapshot,
+  id: string,
+  acceptUnauthenticated = false,
+) {
   return readAsAdmin(context, () =>
     v2("GET /api/v2/admin/backups/{id}/restore-set", {
       profileContext: context,
       path: { id },
+      query: acceptUnauthenticated ? { accept_unauthenticated: true } : undefined,
       timeoutMs: RESTORE_SET_TIMEOUT_MS,
     }),
   );
@@ -51,12 +60,13 @@ export function startRestore(
   id: string,
   digest: string,
   selection: RestoreSelection,
+  acceptUnauthenticated = false,
 ) {
   return readAsAdmin(context, () =>
     v2("POST /api/v2/admin/backups/{id}/restore", {
       profileContext: context,
       path: { id },
-      body: { digest, selection },
+      body: { digest, selection, accept_unauthenticated: acceptUnauthenticated || undefined },
       retryAuthentication: false,
     }),
   );

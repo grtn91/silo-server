@@ -85,6 +85,49 @@ func (s *Service) backupTime(ctx context.Context) string {
 	return fmt.Sprintf("%02d:%02d", hour, minute)
 }
 
+// nightlySlot is the scheduled time a nightly run at now belongs to: the
+// latest backup.time (HH:MM) at or before now, on the wall clock of loc,
+// the zone the daily trigger fires in (Options.Location, time.Local
+// unless set).
+func nightlySlot(now time.Time, at string, loc *time.Location) time.Time {
+	hour, minute, ok := config.ParseBackupTime(at)
+	if !ok {
+		hour, minute, _ = config.ParseBackupTime(config.DefaultBackupTime)
+	}
+	local := now.In(loc)
+	slot := time.Date(local.Year(), local.Month(), local.Day(), hour, minute, 0, 0, loc)
+	if slot.After(local) {
+		slot = slot.AddDate(0, 0, -1)
+	}
+	return slot
+}
+
+// slotBackedUp reports whether a scheduled backup already succeeded for
+// slot, on any server: a recorded slot after this server's previous one,
+// the same wall-clock time a calendar day earlier (AddDate, so a daylight
+// saving change, when consecutive slots are 23 or 25 hours apart, still
+// backs up each night). Servers in different time zones compute different
+// slots for one night, and another zone's slot for the same night lands
+// after this server's previous one, so the later server skips; a mismatch,
+// or a backup.time moved earlier, at worst skips one night's run and never
+// takes a second copy. A failed nightly records no slot, so the next
+// server still tries.
+func (s *Service) slotBackedUp(ctx context.Context, slot time.Time) (bool, error) {
+	if s.opts.Status == nil {
+		return false, nil
+	}
+	rec, err := s.opts.Status.Read(ctx)
+	if err != nil {
+		return false, fmt.Errorf("reading the latest nightly backup: %w", err)
+	}
+	return slotDone(rec.LastNightlySlot, slot), nil
+}
+
+// slotDone is slotBackedUp's rule for the latest recorded slot.
+func slotDone(last *time.Time, slot time.Time) bool {
+	return last != nil && last.After(slot.AddDate(0, 0, -1))
+}
+
 func scheduleFor(at string) []taskmanager.TriggerConfig {
 	return []taskmanager.TriggerConfig{{Type: taskmanager.TriggerTypeDaily, TimeOfDay: at}}
 }

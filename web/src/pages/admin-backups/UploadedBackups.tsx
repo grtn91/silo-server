@@ -6,7 +6,10 @@ import { toast } from "sonner";
 import type { AdminBackupUpload } from "@/api/v2/adminBackupUpload";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { Button } from "@/components/ui/button";
-import { useDeleteAdminBackupUpload } from "@/hooks/queries/admin/backupUploads";
+import {
+  useCompleteAdminBackupUpload,
+  useDeleteAdminBackupUpload,
+} from "@/hooks/queries/admin/backupUploads";
 import { formatFileSize } from "@/lib/mediaFormat";
 
 import {
@@ -42,6 +45,15 @@ function uploadDetails(upload: AdminBackupUpload): string {
 }
 
 /**
+ * Whether every part of an upload arrived but its check never finished: the
+ * server checking it stopped, or the dialog that sent it was closed before
+ * it completed. Completing it again checks it.
+ */
+function fullyReceived(upload: AdminBackupUpload): boolean {
+  return upload.status === "uploading" && upload.received_parts === upload.part_count;
+}
+
+/**
  * Restore sets uploaded from other servers. Checked ones are kept a week
  * after their last use; unfinished ones are deleted a day after their last
  * part.
@@ -49,6 +61,7 @@ function uploadDetails(upload: AdminBackupUpload): string {
 export function UploadedBackups({ uploads }: { uploads: readonly AdminBackupUpload[] }) {
   const [deleting, setDeleting] = useState<AdminBackupUpload | null>(null);
   const remove = useDeleteAdminBackupUpload();
+  const check = useCompleteAdminBackupUpload();
   // Rejected uploads hold no file; the dialog that sent them said why.
   const shown = uploads.filter((upload) => upload.status !== "rejected");
   if (shown.length === 0) return null;
@@ -98,6 +111,24 @@ export function UploadedBackups({ uploads }: { uploads: readonly AdminBackupUplo
                       Restore…
                       <span className="sr-only"> from {label}</span>
                     </Link>
+                  </Button>
+                ) : null}
+                {fullyReceived(upload) ? (
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    disabled={check.isPending}
+                    onClick={() =>
+                      check.mutate(upload.id, {
+                        onError: (error) =>
+                          toast.error("Couldn't check the uploaded backup", {
+                            description: backupErrorMessage(error),
+                          }),
+                      })
+                    }
+                  >
+                    Check again
+                    <span className="sr-only"> {label}</span>
                   </Button>
                 ) : null}
                 <Button

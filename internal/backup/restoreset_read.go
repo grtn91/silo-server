@@ -10,18 +10,16 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"maps"
 	"os"
 	"path"
-	"path/filepath"
-	"slices"
 	"sort"
 	"strings"
+	"sync"
 	"unicode/utf8"
 
 	"github.com/Silo-Server/silo-server/internal/artworkkey"
+	"github.com/Silo-Server/silo-server/internal/backup/jsonsize"
 	"github.com/Silo-Server/silo-server/internal/blobstore"
-	"github.com/Silo-Server/silo-server/internal/branding"
 )
 
 // ErrRestoreSetTooNew refuses a restore set from a newer format.
@@ -35,13 +33,45 @@ var ErrNoRestoreSet = errors.New("this backup has no restore set")
 // destination can be written by something other than this server. These
 // limits bound what reading one can cost.
 const (
-	maxRestoreSetEntries   = 200_000
-	maxRestoreSetPath      = 1024
-	maxRestoreSetDocument  = 64 << 20
+	maxRestoreSetEntries = 200_000
+	maxRestoreSetPath    = 1024
+	// maxRestoreSetDocument bounds the documents that grow with a library:
+	// collections (item lists and item artwork) and accounts (a profile's
+	// watch history).
+	maxRestoreSetDocument = 64 << 20
+	// maxRestoreSetIndex bounds the index, which lists every file. The
+	// other limits bound documents that hold a few kilobytes a server
+	// (settings, libraries, page sections) or a plugin's configuration,
+	// with a wide margin.
+	maxRestoreSetIndex  = 32 << 20
+	maxSettingsDocument = 4 << 20
+	maxPluginDocument   = 4 << 20
+	maxSmallDocument    = 8 << 20
+	// maxRestoreSetMetadata bounds the index and documents one read holds
+	// in memory together, as the preview cache bounds what it keeps
+	// (maxCachedRestoreSetBytes). The index lists every document's size, so
+	// a set over it is refused before any document is read.
+	maxRestoreSetMetadata  = 256 << 20
 	maxRestoreSetArchive   = 256 << 20 // the admin plugin upload cap
 	maxRestoreSetBlob      = 256 << 20
 	maxRestoreSetTotal     = 32 << 30
 	maxRestoreSetJSONDepth = 32
+	// A document is refused before decoding when what it decodes to
+	// (jsonsize) would be over decodedPerByte times its size plus
+	// decodedSlack, or would take a set's decoded documents over
+	// maxRestoreSetDecoded: a short document of empty elements decodes to
+	// whole structs. A document Silo writes decodes to about its size.
+	decodedPerByte       = 8
+	decodedSlack         = 64 << 10
+	maxRestoreSetDecoded = maxRestoreSetMetadata
+	// maxJSONElements bounds one array or object of a document.
+	maxJSONElements = 1_000_000
+	// maxCollectionItems bounds the item lists of a set's collections
+	// together: a large library's collections list a few hundred thousand.
+	maxCollectionItems = 1_000_000
+	// blobIndexCost is about what one blob costs the set's maps and
+	// lookups: its key in blobs, blobSizes, and the index's directories.
+	blobIndexCost = 256
 	// maxRestoreSetTrailer bounds the bytes after the tar end marker.
 	maxRestoreSetTrailer = 1 << 20
 )
@@ -61,16 +91,32 @@ type RestoreSet struct {
 	// MissingBlobs lists keys a section references that the archive does
 	// not carry: they were gone when the backup copied them.
 	MissingBlobs []string
+	// Unusable lists entries the reader left out because a value in them is
+	// one no restore could write; the rest of the set stays readable, and a
+	// preview lists them as unreadable.
+	Unusable []UnusableEntry
 
 	// blobs maps each blob key in the archive to its extracted file, or to
 	// "" when the read did not extract.
 	blobs map[string]string
-	// archives maps a plugin id to its extracted archive file.
-	archives map[string]string
-	dir      string
+	// unverified marks a set a restore job read from a backup this server
+	// cannot authenticate; a preview's shared set leaves it unset and says
+	// so to its planner.
+	unverified bool
+	// blobSizes is each blob's size in bytes, extracted or not.
+	blobSizes map[string]int64
+	// accountBlobs are the blobs each account's document references
+	// (avatars, collection images), by account id.
+	accountBlobs map[string][]string
+	dir          string
 	// metadataBytes estimates what the set holds in memory: its documents
 	// and blob keys, for the preview cache's bound.
 	metadataBytes int64
+	indexOnce     sync.Once
+	index         *restoreSetIndex
+	// fromUnverified marks a cached set of a backup this server cannot
+	// verify; the cache keeps one at a time.
+	fromUnverified bool
 }
 
 // HasBlob reports whether the archive carries key.
@@ -92,6 +138,17 @@ type ReadOptions struct {
 	// subdirectory in for plugin archives and blobs. A preview leaves it
 	// empty: their bytes are checked and discarded.
 	ExtractDir string
+	// Extract, when set, picks the blobs an extracting read writes to
+	// ExtractDir; the rest are checked and discarded like a preview's.
+	Extract func(key string) bool
+	// IndexSHA256, when set, is the index's digest from an authenticated
+	// manifest: the index must match it before it is decoded.
+	IndexSHA256 string
+	// Verify, when set, runs once the whole archive has been read and
+	// before any document is decoded; its error stops the read. A caller
+	// checks the archive against its manifest's digest here, so documents
+	// are decoded only from verified bytes.
+	Verify func() error
 }
 
 // ReadRestoreSet reads and validates a whole restore set:
@@ -109,8 +166,9 @@ type ReadOptions struct {
 func ReadRestoreSet(ctx context.Context, r io.Reader, opts ReadOptions) (_ *RestoreSet, err error) {
 	digest := sha256.New()
 	counted := &countingReader{r: io.TeeReader(r, digest)}
-	tr := tar.NewReader(counted)
-	rs := &RestoreSet{blobs: map[string]string{}, archives: map[string]string{}}
+	guard := newTarGuard(counted)
+	tr := tar.NewReader(guard)
+	rs := &RestoreSet{blobs: map[string]string{}, blobSizes: map[string]int64{}}
 	if opts.ExtractDir != "" {
 		if rs.dir, err = os.MkdirTemp(opts.ExtractDir, "restore-set-"); err != nil {
 			return nil, err
@@ -122,7 +180,7 @@ func ReadRestoreSet(ctx context.Context, r io.Reader, opts ReadOptions) (_ *Rest
 		}()
 	}
 
-	p := &restoreSetParser{rs: rs, seen: map[string]bool{}, documents: map[string][]byte{}}
+	p := &restoreSetParser{rs: rs, opts: opts, seen: map[string]bool{}, documents: map[string][]byte{}}
 	for entries := 0; ; entries++ {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -132,6 +190,9 @@ func ReadRestoreSet(ctx context.Context, r io.Reader, opts ReadOptions) (_ *Rest
 			break
 		}
 		if err != nil {
+			return nil, fmt.Errorf("restore set: %w", err)
+		}
+		if err := guard.checkEntry(h.Size); err != nil {
 			return nil, fmt.Errorf("restore set: %w", err)
 		}
 		if entries >= maxRestoreSetEntries {
@@ -154,6 +215,11 @@ func ReadRestoreSet(ctx context.Context, r io.Reader, opts ReadOptions) (_ *Rest
 	}
 	if n, _ := io.Copy(io.Discard, io.LimitReader(counted, 1)); n > 0 {
 		return nil, errors.New("restore set: unexpected data after the archive")
+	}
+	if opts.Verify != nil {
+		if err := opts.Verify(); err != nil {
+			return nil, err
+		}
 	}
 	if err := p.finish(); err != nil {
 		return nil, fmt.Errorf("restore set: %w", err)
@@ -181,16 +247,39 @@ type restoreSetParser struct {
 	// with the section that references them.
 	files map[string]FileDigest
 	blobs map[string]sectionSpec
-	// ladderDirs are the image directories of referenced artwork originals;
-	// the variants stored beside an original may ride along with it.
-	ladderDirs map[string]sectionSpec
-	seen       map[string]bool
-	documents  map[string][]byte
+	// originals are the referenced artwork originals by key, and
+	// legacyOriginals those without a revision by directory; the variants
+	// stored beside one (ladderSibling) may ride along with it, at most
+	// maxLadderVariants of them, counted in variants.
+	originals       map[string]bool
+	legacyOriginals map[string][]string
+	variants        map[string]int
+	opts            ReadOptions
+	seen            map[string]bool
+	documents       map[string][]byte
+	// decoded is what the documents decoded so far take (jsonsize).
+	decoded int64
+	// unusableCount counts each section's entries left out (unusable).
+	unusableCount map[string]int
+	// logical sums the entries' sizes as their headers state them.
+	logical int64
 }
 
 func (p *restoreSetParser) entry(h *tar.Header, tr io.Reader, first bool) error {
 	if h.Typeflag != tar.TypeReg {
 		return fmt.Errorf("%q is not a regular file", h.Name)
+	}
+	// A PAX sparse file reads as a regular one whose size is its logical
+	// size, with holes the tar reader fills from nothing: a tiny archive
+	// could expand to any size. The writer never makes one.
+	for key := range h.PAXRecords {
+		if strings.HasPrefix(key, "GNU.sparse.") {
+			return fmt.Errorf("%q is a sparse file", h.Name)
+		}
+	}
+	// What the entries say they hold is bounded as the archive's bytes are.
+	if p.logical += h.Size; p.logical > maxRestoreSetTotal {
+		return fmt.Errorf("restore set: its files hold more than %d bytes", int64(maxRestoreSetTotal))
 	}
 	if !canonicalArchivePath(h.Name) {
 		return fmt.Errorf("%q is not a canonical path", h.Name)
@@ -206,11 +295,7 @@ func (p *restoreSetParser) entry(h *tar.Header, tr io.Reader, first bool) error 
 		return fmt.Errorf("%s must be the first entry", restoreSetIndexName)
 	}
 	if first {
-		data, err := readLimited(tr, h, maxRestoreSetDocument)
-		if err != nil {
-			return err
-		}
-		return p.readIndex(data)
+		return p.indexEntry(h, tr)
 	}
 	if key, ok := strings.CutPrefix(h.Name, restoreSetBlobDir); ok {
 		return p.blob(key, h, tr)
@@ -225,7 +310,7 @@ func (p *restoreSetParser) entry(h *tar.Header, tr io.Reader, first bool) error 
 	if path.Base(h.Name) == pluginArchiveName {
 		return p.archive(h, tr, want)
 	}
-	data, err := readLimited(tr, h, maxRestoreSetDocument)
+	data, err := readLimited(tr, h, documentLimit(h.Name))
 	if err != nil {
 		return err
 	}
@@ -235,6 +320,35 @@ func (p *restoreSetParser) entry(h *tar.Header, tr io.Reader, first bool) error 
 	p.documents[h.Name] = data
 	p.rs.metadataBytes += int64(len(data))
 	return nil
+}
+
+// indexEntry reads the index, checking it against the manifest's digest
+// (ReadOptions.IndexSHA256) before decoding it.
+func (p *restoreSetParser) indexEntry(h *tar.Header, tr io.Reader) error {
+	data, err := readLimited(tr, h, maxRestoreSetIndex)
+	if err != nil {
+		return err
+	}
+	if want := p.opts.IndexSHA256; want != "" {
+		if sum := sha256.Sum256(data); hex.EncodeToString(sum[:]) != want {
+			return fmt.Errorf("%s does not match the digest its manifest records", restoreSetIndexName)
+		}
+	}
+	p.rs.metadataBytes += int64(len(data))
+	return p.readIndex(data)
+}
+
+// documentLimit is the most a section document named name may hold.
+func documentLimit(name string) int64 {
+	switch {
+	case name == settingsDocumentName:
+		return maxSettingsDocument
+	case path.Base(name) == pluginDocumentName:
+		return maxPluginDocument
+	case name == librariesDocumentName || name == homeSectionsDocumentName:
+		return maxSmallDocument
+	}
+	return maxRestoreSetDocument
 }
 
 func readLimited(r io.Reader, h *tar.Header, limit int64) ([]byte, error) {
@@ -258,7 +372,7 @@ func (p *restoreSetParser) readIndex(data []byte) error {
 		Format  string `json:"format"`
 		Version int    `json:"version"`
 	}
-	if err := checkJSONDepth(data); err != nil {
+	if _, err := jsonsize.Check(data, &head, decodeLimits(len(data))); err != nil {
 		return fmt.Errorf("%s: %w", restoreSetIndexName, err)
 	}
 	if err := json.Unmarshal(data, &head); err != nil {
@@ -274,7 +388,7 @@ func (p *restoreSetParser) readIndex(data []byte) error {
 		return fmt.Errorf("%s: version %d is not valid", restoreSetIndexName, head.Version)
 	}
 	var index RestoreSetIndex
-	if err := decodeStrict(data, &index); err != nil {
+	if err := p.decode(data, &index); err != nil {
 		return fmt.Errorf("%s: %w", restoreSetIndexName, err)
 	}
 	if !validServerID(index.ServerID) {
@@ -287,8 +401,12 @@ func (p *restoreSetParser) readIndex(data []byte) error {
 	p.rs.Index = index
 	p.files = map[string]FileDigest{}
 	p.blobs = map[string]sectionSpec{}
-	p.ladderDirs = map[string]sectionSpec{}
+	p.originals = map[string]bool{}
+	p.legacyOriginals = map[string][]string{}
+	p.variants = map[string]int{}
 	sectionsSeen := map[string]bool{}
+	// documents sums the listed documents' sizes.
+	var documents int64
 	for _, si := range index.Sections {
 		spec, ok := sectionByID(si.ID)
 		if !ok {
@@ -317,6 +435,14 @@ func (p *restoreSetParser) readIndex(data []byte) error {
 			if f.Size < 0 || !sha256Hex.MatchString(f.SHA256) {
 				return fmt.Errorf("%s: %q has no valid size and digest", restoreSetIndexName, f.Path)
 			}
+			if path.Base(f.Path) != pluginArchiveName {
+				if f.Size > documentLimit(f.Path) {
+					return fmt.Errorf("%s: %q is larger than %d bytes", restoreSetIndexName, f.Path, documentLimit(f.Path))
+				}
+				if documents += f.Size; documents+int64(len(data)) > maxRestoreSetMetadata {
+					return fmt.Errorf("%s: its documents hold more than the %d bytes a restore set may", restoreSetIndexName, int64(maxRestoreSetMetadata))
+				}
+			}
 			p.files[f.Path] = f
 		}
 		for _, key := range si.Blobs {
@@ -327,11 +453,7 @@ func (p *restoreSetParser) readIndex(data []byte) error {
 				return fmt.Errorf("%s: blob %q is listed twice", restoreSetIndexName, key)
 			}
 			p.blobs[key] = spec
-			if strings.HasPrefix(path.Base(key), artworkkey.OriginalVariant+".") {
-				if dir := artworkkey.Directory(key); dir != "" {
-					p.ladderDirs[dir] = spec
-				}
-			}
+			p.noteOriginal(key)
 		}
 	}
 	return nil
@@ -350,13 +472,55 @@ func validateOmitted(list []OmittedItem) error {
 	return nil
 }
 
-// blob accepts a referenced key, or a variant stored in a referenced
-// original's directory, under its section's prefixes.
+// noteOriginal records a referenced key that is an artwork original, whose
+// variants may ride along with it.
+func (p *restoreSetParser) noteOriginal(key string) {
+	dir := artworkkey.Directory(key)
+	if !strings.HasPrefix(path.Base(key), artworkkey.OriginalVariant+".") || dir == "" {
+		return
+	}
+	p.originals[key] = true
+	if artworkkey.Revision(key) == "" && legacyOriginalName(key) {
+		p.legacyOriginals[dir] = append(p.legacyOriginals[dir], key)
+	}
+}
+
+// variant finds the referenced original key is a variant of
+// (ladderSibling), and counts it against maxLadderVariants.
+func (p *restoreSetParser) variant(key string) (sectionSpec, bool, error) {
+	// A variant of a revision names its original (artworkkey.OriginalOf);
+	// one without a revision may belong to any legacy original beside it,
+	// of which a directory holds one per image format.
+	var candidates []string
+	if legacyVariantName(key) {
+		candidates = p.legacyOriginals[artworkkey.Directory(key)]
+	}
+	if artworkkey.Revision(key) != "" {
+		candidates = nil
+		if original := artworkkey.OriginalOf(key); p.originals[original] {
+			candidates = []string{original}
+		}
+	}
+	for _, original := range candidates {
+		if !ladderSibling(original, key) {
+			continue
+		}
+		if p.variants[original]++; p.variants[original] > maxLadderVariants {
+			return sectionSpec{}, false, fmt.Errorf("blob %q: more than %d variants of %q", key, maxLadderVariants, original)
+		}
+		return p.blobs[original], true, nil
+	}
+	return sectionSpec{}, false, nil
+}
+
+// blob accepts a referenced key, or a variant stored beside a referenced
+// original (ladderSibling), under its section's prefixes.
 func (p *restoreSetParser) blob(key string, h *tar.Header, tr io.Reader) error {
 	spec, ok := p.blobs[key]
 	if !ok {
-		if dir := artworkkey.Directory(key); dir != "" && path.Dir(key)+"/" == dir {
-			spec, ok = p.ladderDirs[dir]
+		var err error
+		if spec, ok, err = p.variant(key); err != nil {
+			return err
 		}
 	}
 	if !ok {
@@ -368,12 +532,17 @@ func (p *restoreSetParser) blob(key string, h *tar.Header, tr io.Reader) error {
 	if h.Size > maxRestoreSetBlob {
 		return fmt.Errorf("blob %q is larger than %d bytes", key, maxRestoreSetBlob)
 	}
-	target, err := p.extract("blob", h, tr, "")
+	dir := p.rs.dir
+	if p.opts.Extract != nil && !p.opts.Extract(key) {
+		dir = ""
+	}
+	target, err := p.copyEntry(dir, "blob", h, tr, "")
 	if err != nil {
 		return err
 	}
 	p.rs.blobs[key] = target
-	p.rs.metadataBytes += int64(len(key) + len(target))
+	p.rs.blobSizes[key] = h.Size
+	p.rs.metadataBytes += int64(2*len(key)+len(target)) + 8
 	return nil
 }
 
@@ -381,24 +550,31 @@ func (p *restoreSetParser) archive(h *tar.Header, tr io.Reader, want FileDigest)
 	if h.Size > maxRestoreSetArchive {
 		return fmt.Errorf("%q is larger than %d bytes", h.Name, maxRestoreSetArchive)
 	}
-	target, err := p.extract("archive", h, tr, want.SHA256)
-	if err != nil {
-		return err
+	// A plugin's archive is checked against its digest and never kept: a
+	// restore never installs or runs a plugin from a backup (see
+	// plugins.ErrPluginNotInstalled), so nothing reads it.
+	sum := sha256.New()
+	n, err := io.Copy(sum, io.LimitReader(tr, h.Size))
+	switch {
+	case err != nil:
+		return fmt.Errorf("reading %q: %w", h.Name, err)
+	case n != h.Size:
+		return fmt.Errorf("%q is truncated", h.Name)
+	case hex.EncodeToString(sum.Sum(nil)) != want.SHA256:
+		return fmt.Errorf("%q does not match its digest", h.Name)
 	}
-	pluginID := path.Base(path.Dir(h.Name))
-	p.rs.archives[pluginID] = target
 	return nil
 }
 
-// extract copies an entry to a new file in the extraction directory, or
-// discards it, checking its digest when one is expected.
-func (p *restoreSetParser) extract(kind string, h *tar.Header, tr io.Reader, wantSHA string) (string, error) {
+// copyEntry copies an entry to a new file in dir, or discards it when dir
+// is "", checking its digest when one is expected.
+func (p *restoreSetParser) copyEntry(dir, kind string, h *tar.Header, tr io.Reader, wantSHA string) (string, error) {
 	sum := sha256.New()
 	var w io.Writer = sum
 	var file *os.File
-	if p.rs.dir != "" {
+	if dir != "" {
 		var err error
-		if file, err = os.CreateTemp(p.rs.dir, kind+"-"); err != nil {
+		if file, err = os.CreateTemp(dir, kind+"-"); err != nil {
 			return "", err
 		}
 		defer func() { _ = file.Close() }()
@@ -437,326 +613,24 @@ func (p *restoreSetParser) finish() error {
 		}
 	}
 	sort.Strings(p.rs.MissingBlobs)
+	defer func() {
+		// What the set holds once read: its documents decoded (jsonsize's
+		// estimate) and its lookup index, built here so its cost is known
+		// before the set is cached, besides the bytes counted as read.
+		p.rs.lookup()
+		p.rs.metadataBytes += p.decoded + int64(len(p.rs.blobs))*blobIndexCost
+	}()
 	for _, si := range p.index.Sections {
 		count, err := p.decodeSection(si)
 		if err != nil {
 			return fmt.Errorf("section %q: %w", si.ID, err)
 		}
+		p.summarizeUnusable(si.ID)
 		if count != si.Count {
 			return fmt.Errorf("section %q holds %d items; the index says %d", si.ID, count, si.Count)
 		}
 	}
 	return nil
-}
-
-func (p *restoreSetParser) document(name string, into any) (bool, error) {
-	data, ok := p.documents[name]
-	if !ok {
-		return false, nil
-	}
-	if err := checkJSONDepth(data); err != nil {
-		return false, fmt.Errorf("%s: %w", name, err)
-	}
-	if err := decodeStrict(data, into); err != nil {
-		return false, fmt.Errorf("%s: %w", name, err)
-	}
-	return true, nil
-}
-
-func (p *restoreSetParser) decodeSection(si SectionIndex) (int, error) {
-	spec, _ := sectionByID(si.ID)
-	switch si.ID {
-	case SectionSettings:
-		if ok, err := p.document(spec.document, &p.rs.Settings); err != nil || !ok {
-			return 0, requireDocument(spec, ok, err)
-		}
-		return len(p.rs.Settings.Settings), validateSettingsDocument(p.rs.Settings)
-	case SectionLibraries:
-		if ok, err := p.document(spec.document, &p.rs.Libraries); err != nil || !ok {
-			return 0, requireDocument(spec, ok, err)
-		}
-		return len(p.rs.Libraries.Libraries), p.validateLibraries()
-	case SectionCollections:
-		if ok, err := p.document(spec.document, &p.rs.Collections); err != nil || !ok {
-			return 0, requireDocument(spec, ok, err)
-		}
-		d := p.rs.Collections
-		return len(d.Collections) + len(d.TemplateCollections) + len(d.ItemArtwork) + len(d.Branding), p.validateCollections()
-	case SectionHomeSections:
-		if ok, err := p.document(spec.document, &p.rs.HomeSections); err != nil || !ok {
-			return 0, requireDocument(spec, ok, err)
-		}
-		return len(p.rs.HomeSections.Sections), validateHomeSections(p.rs.HomeSections)
-	case SectionPlugins:
-		return p.decodePlugins(spec)
-	case SectionUsers:
-		return p.decodeUsers(spec)
-	}
-	return 0, fmt.Errorf("no reader for section %q", si.ID)
-}
-
-func requireDocument(spec sectionSpec, ok bool, err error) error {
-	if err != nil {
-		return err
-	}
-	if !ok {
-		return fmt.Errorf("%s is missing", spec.document)
-	}
-	return nil
-}
-
-func validateSettingsDocument(d SettingsDocument) error {
-	seen := map[string]bool{}
-	for _, s := range d.Settings {
-		if s.Key == "" || len(s.Key) > 256 || !utf8.ValidString(s.Key) {
-			return fmt.Errorf("setting key %q is not valid", s.Key)
-		}
-		if seen[s.Key] {
-			return fmt.Errorf("setting %q is listed twice", s.Key)
-		}
-		seen[s.Key] = true
-	}
-	return nil
-}
-
-func (p *restoreSetParser) validateLibraries() error {
-	seen := map[int]bool{}
-	for _, l := range p.rs.Libraries.Libraries {
-		if l.ID <= 0 {
-			return fmt.Errorf("library id %d is not valid", l.ID)
-		}
-		if seen[l.ID] {
-			return fmt.Errorf("library %d is listed twice", l.ID)
-		}
-		seen[l.ID] = true
-		if strings.TrimSpace(l.Name) == "" || strings.TrimSpace(l.Type) == "" || len(l.Paths) == 0 {
-			return fmt.Errorf("library %d has no name, type, or paths", l.ID)
-		}
-		for _, folder := range l.Paths {
-			if !filepath.IsAbs(folder) || filepath.Clean(folder) != folder {
-				return fmt.Errorf("library %d path %q is not a clean absolute path", l.ID, folder)
-			}
-		}
-		if err := p.requireReferenced(SectionLibraries, l.Poster); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func (p *restoreSetParser) validateCollections() error {
-	d := p.rs.Collections
-	seen := map[string]bool{}
-	claim := func(id string) error {
-		if seen[id] {
-			return fmt.Errorf("item %q is listed twice", id)
-		}
-		seen[id] = true
-		return nil
-	}
-	for _, c := range d.Collections {
-		if !validItemSegment(c.ID) || strings.TrimSpace(c.Title) == "" || c.LibraryID <= 0 {
-			return fmt.Errorf("collection %q has no valid id, title, or library", c.ID)
-		}
-		if err := claim(collectionItemID(c.ID)); err != nil {
-			return err
-		}
-		if !validRawJSON(c.QueryDefinition, c.SortConfig, c.SourceConfig) {
-			return fmt.Errorf("collection %q carries invalid JSON", c.ID)
-		}
-		if err := p.requireCollectionImages(c.Poster, c.Backdrop); err != nil {
-			return err
-		}
-	}
-	if err := p.validateTemplateCollections(claim); err != nil {
-		return err
-	}
-	for _, a := range d.ItemArtwork {
-		if a.ContentID == "" || a.ImageType == "" || a.TargetType == "" {
-			return fmt.Errorf("item artwork %q is incomplete", a.itemID())
-		}
-		if err := claim(a.itemID()); err != nil {
-			return err
-		}
-		if err := p.requireReferenced(SectionCollections, a.Path); err != nil {
-			return err
-		}
-	}
-	for _, b := range d.Branding {
-		if err := validBrandingEntry(b); err != nil {
-			return err
-		}
-		if err := claim(b.itemID()); err != nil {
-			return err
-		}
-		if err := p.requireReferenced(SectionCollections, b.Blob); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// validateTemplateCollections checks the template collections (version 3
-// and later): a management key naming their own bundle, template, and
-// library, and images listed for the section.
-func (p *restoreSetParser) validateTemplateCollections(claim func(string) error) error {
-	d := p.rs.Collections
-	if len(d.TemplateCollections) > 0 && p.index.Version < 3 {
-		return errors.New("template collections are not part of this format version")
-	}
-	for _, t := range d.TemplateCollections {
-		bundle, template, library, ok := ParseTemplateManagementKey(t.ManagementKey)
-		if !validItemSegment(t.ID) || !ok || bundle != t.BundleID || template != t.TemplateID || library != t.LibraryID ||
-			len(t.ManagementKey) > 512 || strings.TrimSpace(t.Title) == "" {
-			return fmt.Errorf("template collection %q has no valid id, title, or management key", t.ID)
-		}
-		if err := claim(t.itemID()); err != nil {
-			return err
-		}
-		if !validRawJSON(t.SortConfig, t.SourceConfig) {
-			return fmt.Errorf("template collection %q carries invalid JSON", t.ID)
-		}
-		if err := p.requireCollectionImages(t.Poster, t.Backdrop); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// validateHomeSections checks each section's identity, scope, and JSON, and
-// that a carried collection is the one its configuration names.
-func validateHomeSections(d HomeSectionsDocument) error {
-	seen := map[string]bool{}
-	for _, e := range d.Sections {
-		if !validItemSegment(e.ID) || seen[e.ID] {
-			return fmt.Errorf("section %q has no valid id or is listed twice", e.ID)
-		}
-		seen[e.ID] = true
-		switch {
-		case e.Scope == pageScopeHome && e.LibraryID == nil:
-		case e.Scope == pageScopeLibrary && e.LibraryID != nil && *e.LibraryID > 0:
-		default:
-			return fmt.Errorf("section %q has no valid scope", e.ID)
-		}
-		// An empty title is kept: bulk section creation persists one.
-		if !validSectionID(e.SectionType) || len(e.Title) > 512 || e.ItemLimit < 0 {
-			return fmt.Errorf("section %q has no valid type or title", e.ID)
-		}
-		if !validRawJSON(e.Config) {
-			return fmt.Errorf("section %q carries invalid JSON", e.ID)
-		}
-		if c := e.Collection; c != nil {
-			if !validItemSegment(c.ID) || c.ID != sectionCollectionID(e.Config) || strings.TrimSpace(c.Title) == "" || c.LibraryID <= 0 {
-				return fmt.Errorf("section %q carries a collection its configuration does not name", e.ID)
-			}
-			if !validRawJSON(c.QueryDefinition, c.SortConfig, c.SourceConfig) {
-				return fmt.Errorf("section %q's collection carries invalid JSON", e.ID)
-			}
-			if storedKey(c.Poster) || storedKey(c.Backdrop) {
-				return fmt.Errorf("section %q's collection names an image the set cannot carry", e.ID)
-			}
-		}
-	}
-	return nil
-}
-
-// validBrandingEntry admits only a branding asset setting whose reference
-// is one safe file name naming the entry's blob: a branding entry is written
-// as a setting, so anything else would let an archive set any setting.
-func validBrandingEntry(b BrandingEntry) error {
-	if !slices.Contains(branding.AssetSettingKeys(), b.Key) {
-		return fmt.Errorf("branding entry %q is not a branding asset setting", b.Key)
-	}
-	if !validItemSegment(b.Ref) || branding.AssetObjectKey(b.Key, b.Ref) != b.Blob {
-		return fmt.Errorf("branding entry %q does not name its own asset", b.Key)
-	}
-	return nil
-}
-
-// validRawJSON reports whether every non-empty value is valid JSON.
-func validRawJSON(values ...json.RawMessage) bool {
-	for _, raw := range values {
-		if len(raw) > 0 && !json.Valid(raw) {
-			return false
-		}
-	}
-	return true
-}
-
-// requireCollectionImages requires each uploaded collection image
-// (collection-images/) among keys to be listed for the collections section.
-func (p *restoreSetParser) requireCollectionImages(keys ...string) error {
-	for _, key := range keys {
-		if strings.HasPrefix(key, "collection-images/") {
-			if err := p.requireReferenced(SectionCollections, key); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
-}
-
-// requireReferenced checks that a document's blob key is one its section's
-// index entry lists: a document cannot point a restore at a key the index
-// did not admit.
-func (p *restoreSetParser) requireReferenced(section, key string) error {
-	if key == "" {
-		return nil
-	}
-	spec, ok := p.blobs[key]
-	if !ok || spec.id != section {
-		return fmt.Errorf("blob %q is not listed for section %q", key, section)
-	}
-	return nil
-}
-
-// itemIDs lists, sorted, the items whose files the index lists for a
-// per-item section.
-func (p *restoreSetParser) itemIDs(spec sectionSpec) []string {
-	ids := map[string]bool{}
-	for name := range p.files {
-		if item, ok := spec.ownsFile(name); ok {
-			ids[item] = true
-		}
-	}
-	return slices.Sorted(maps.Keys(ids))
-}
-
-func (p *restoreSetParser) decodePlugins(spec sectionSpec) (int, error) {
-	for _, id := range p.itemIDs(spec) {
-		var doc PluginDocument
-		docPath := spec.itemDir + id + "/" + pluginDocumentName
-		ok, err := p.document(docPath, &doc)
-		if err != nil {
-			return 0, err
-		}
-		if !ok {
-			return 0, fmt.Errorf("%s is missing", docPath)
-		}
-		if doc.PluginID != id {
-			return 0, fmt.Errorf("%s names plugin %q", docPath, doc.PluginID)
-		}
-		archivePath := spec.itemDir + id + "/" + pluginArchiveName
-		listed, ok := p.files[archivePath]
-		if !ok {
-			return 0, fmt.Errorf("%s is missing", archivePath)
-		}
-		if doc.Archive.Size != listed.Size || doc.Archive.SHA256 != listed.SHA256 {
-			return 0, fmt.Errorf("%s does not describe its archive", docPath)
-		}
-		keys := map[string]bool{}
-		for _, c := range doc.Configs {
-			if c.Key == "" || keys[c.Key] {
-				return 0, fmt.Errorf("%s: configuration key %q is empty or listed twice", docPath, c.Key)
-			}
-			keys[c.Key] = true
-			if !json.Valid(c.Value) {
-				return 0, fmt.Errorf("%s: configuration %q is not JSON", docPath, c.Key)
-			}
-		}
-		p.rs.Plugins = append(p.rs.Plugins, doc)
-	}
-	return len(p.rs.Plugins), nil
 }
 
 // canonicalArchivePath accepts a relative slash path with no empty, ".", or
@@ -782,8 +656,28 @@ func allowedRestoreSetKey(key string) bool {
 	return canonicalArchivePath(key) && blobstore.ValidateKey(key) == nil && !strings.HasPrefix(key, RootPrefix)
 }
 
+// decodeLimits bound decoding a document of n bytes on its own.
+func decodeLimits(n int) jsonsize.Limits {
+	return jsonsize.Limits{Depth: maxRestoreSetJSONDepth, Elements: maxJSONElements, Bytes: decodedPerByte*int64(n) + decodedSlack}
+}
+
+// decode decodes one of the set's documents strictly (decodeStrict), first
+// checking what it decodes to against its own bound and what the set's
+// documents decoded so far leave of maxRestoreSetDecoded.
+func (p *restoreSetParser) decode(data []byte, into any) error {
+	limits := decodeLimits(len(data))
+	limits.Bytes = min(limits.Bytes, maxRestoreSetDecoded-p.decoded)
+	size, err := jsonsize.Check(data, into, limits)
+	if err != nil {
+		return err
+	}
+	p.decoded += size
+	return decodeStrict(data, into)
+}
+
 // decodeStrict decodes one JSON value, refusing unknown fields and trailing
-// data: within a format version every field is known.
+// data: within a format version every field is known. Data from an
+// untrusted source is checked with jsonsize first (restoreSetParser.decode).
 func decodeStrict(data []byte, into any) error {
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields()
@@ -795,36 +689,6 @@ func decodeStrict(data []byte, into any) error {
 	}
 	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
 		return errors.New("trailing data after the document")
-	}
-	return nil
-}
-
-// checkJSONDepth refuses JSON nested deeper than maxRestoreSetJSONDepth
-// before it is decoded.
-func checkJSONDepth(data []byte) error {
-	depth := 0
-	inString, escaped := false, false
-	for _, c := range data {
-		switch {
-		case inString:
-			switch {
-			case escaped:
-				escaped = false
-			case c == '\\':
-				escaped = true
-			case c == '"':
-				inString = false
-			}
-		case c == '"':
-			inString = true
-		case c == '{' || c == '[':
-			depth++
-			if depth > maxRestoreSetJSONDepth {
-				return fmt.Errorf("JSON nested deeper than %d", maxRestoreSetJSONDepth)
-			}
-		case c == '}' || c == ']':
-			depth--
-		}
 	}
 	return nil
 }
@@ -861,20 +725,5 @@ func (rs *RestoreSet) blobFamily(key string) []string {
 	if dir == "" {
 		return out
 	}
-	for other := range rs.blobs {
-		if other != key && path.Dir(other)+"/" == dir {
-			out = append(out, other)
-		}
-	}
-	sort.Strings(out[1:])
-	return out
-}
-
-// pluginArchive reads an extracted plugin archive.
-func (rs *RestoreSet) pluginArchive(pluginID string) ([]byte, error) {
-	file, ok := rs.archives[pluginID]
-	if !ok || file == "" {
-		return nil, ErrNotFound
-	}
-	return os.ReadFile(file) //nolint:gosec // G304: a file this read created
+	return append(out, rs.lookup().variants[key]...)
 }

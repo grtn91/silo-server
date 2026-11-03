@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -36,6 +37,8 @@ type Server struct {
 	// maxPart is the largest multipart part received.
 	maxPart int64
 	parts   int
+	// listRequests counts ListObjectsV2 requests.
+	listRequests atomic.Int64
 }
 
 type object struct {
@@ -96,6 +99,9 @@ func (s *Server) Put(bucket, key string, data []byte) {
 	s.buckets[bucket][key] = object{data: append([]byte(nil), data...), modified: time.Now()}
 }
 
+// ListRequests is the number of listing requests served so far.
+func (s *Server) ListRequests() int64 { return s.listRequests.Load() }
+
 // Parts reports how many multipart parts arrived and the largest one.
 func (s *Server) Parts() (count int, largest int64) {
 	s.mu.Lock()
@@ -143,7 +149,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 	case key == "" && r.Method == http.MethodHead:
 		w.WriteHeader(http.StatusOK)
 	case key == "" && r.Method == http.MethodGet && q.Get("list-type") == "2":
-		s.list(w, bucketName, q.Get("prefix"), q.Get("continuation-token"))
+		s.list(w, bucketName, q.Get("prefix"), q.Get("continuation-token"), q.Get("start-after"), q.Get("max-keys"))
 	case key == "" && r.Method == http.MethodPost && q.Has("delete"):
 		s.deleteObjects(w, r, bucketName)
 	case q.Has("uploads") || q.Has("uploadId"):
@@ -275,13 +281,21 @@ func (s *Server) object(w http.ResponseWriter, r *http.Request, bucketName, key 
 
 const listPageSize = 1000
 
-func (s *Server) list(w http.ResponseWriter, bucket, prefix, token string) {
+func (s *Server) list(w http.ResponseWriter, bucket, prefix, token, startAfter, maxKeys string) {
 	keys := s.Keys(bucket, prefix)
 	start := 0
-	if token != "" {
+	switch {
+	case token != "":
 		start = sort.SearchStrings(keys, token)
+	case startAfter != "":
+		start = sort.Search(len(keys), func(i int) bool { return keys[i] > startAfter })
 	}
-	end := min(start+listPageSize, len(keys))
+	pageSize := listPageSize
+	if n, err := strconv.Atoi(maxKeys); err == nil && n > 0 && n < pageSize {
+		pageSize = n
+	}
+	s.listRequests.Add(1)
+	end := min(start+pageSize, len(keys))
 	type content struct {
 		Key          string `xml:"Key"`
 		Size         int    `xml:"Size"`
