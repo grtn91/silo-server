@@ -12,6 +12,7 @@ import (
 
 	"github.com/Silo-Server/silo-server/internal/backup/userdata"
 	"github.com/Silo-Server/silo-server/internal/catalog"
+	"github.com/Silo-Server/silo-server/internal/collectionutil"
 	"github.com/Silo-Server/silo-server/internal/models"
 )
 
@@ -148,18 +149,25 @@ func (a *applier) restoreOntoCollection(ctx context.Context, tx pgx.Tx, id strin
 }
 
 // createCollection creates every collection a restore creates, by input,
-// under the rules all of them follow. When input's source and sync
+// under the rules all of them follow. Its source is stored in the editors'
+// canonical form. When input's source and sync
 // schedule are the backup's (fromBackup) and the backup is one this server
 // cannot verify, the collection keeps its source but gets no sync
 // schedule, so it fetches nothing until an admin schedules or syncs it,
 // and notes say so. A template collection's come from this server's
 // template (the backup's changes to them are withheld, customizeTemplate).
 func (a *applier) createCollection(ctx context.Context, tx pgx.Tx, input catalog.CreateLibraryCollectionInput, fromBackup bool, notes *[]string) error {
+	// The source is stored as the editors store one; the plan refused one
+	// that does not canonicalize (planner.checkCollection).
+	var err error
+	if input.SourceURL, input.SourceConfig, err = collectionutil.CanonicalCollectionSource(input.CollectionType, input.SourceURL, input.SourceConfig); err != nil {
+		return err
+	}
 	if fromBackup && a.rs.unverified && scheduleOf(input.SyncSchedule) != "" {
 		input.SyncSchedule = nil
 		*notes = append(*notes, msgScheduleWithheld)
 	}
-	_, err := catalog.CreateLibraryCollectionInTx(ctx, tx, input)
+	_, err = catalog.CreateLibraryCollectionInTx(ctx, tx, input)
 	return err
 }
 

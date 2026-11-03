@@ -20,6 +20,7 @@ import (
 
 	"github.com/Silo-Server/silo-server/internal/backup/userdata"
 	"github.com/Silo-Server/silo-server/internal/catalog"
+	"github.com/Silo-Server/silo-server/internal/collectionutil"
 	"github.com/Silo-Server/silo-server/internal/idgen"
 )
 
@@ -256,10 +257,14 @@ func customizeTemplate(t TemplateCollectionEntry, def catalog.CreateLibraryColle
 	}
 	if source, ok := userdata.RemapQueryLibraries(t.SourceConfig, mapIn(libMap)); ok &&
 		!jsonEqual(source, def.SourceConfig) && !jsonEqual(source, local.sourceConfig) {
-		url := t.SourceURL
-		if trusted {
-			u.SourceConfig, u.SourceURL, c.changes = source, &url, append(c.changes, "source")
-		} else {
+		// As the editors store a source; the plan refused one that does
+		// not canonicalize (planner.checkCollection).
+		url, canonical, err := collectionutil.CanonicalCollectionSource(def.CollectionType, t.SourceURL, source)
+		switch {
+		case err != nil:
+		case trusted:
+			u.SourceConfig, u.SourceURL, c.changes = canonical, &url, append(c.changes, "source")
+		default:
 			c.withheld = append(c.withheld, "source")
 		}
 	}

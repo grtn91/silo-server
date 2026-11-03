@@ -1064,8 +1064,34 @@ func TestUnverifiedSectionCollectionHasNoScheduleDB(t *testing.T) {
 		JOIN library_collections c ON c.id = p.config->>'library_collection_id' WHERE p.id = $1`, s.managed).Scan(&url, &schedule); err != nil {
 		t.Fatal(err)
 	}
-	if url != source || schedule != nil {
+	// Kept, in the canonical form the editors store.
+	if url != source+"/json" || schedule != nil {
 		t.Fatalf("restored collection: source %q, schedule %v; want the source kept and no schedule", url, schedule)
+	}
+}
+
+// TestRestoreRefusesCollectionSourcesTheEditorWouldDB: a collection whose
+// source the editors would not store (an MDBList collection whose list is
+// on loopback) is refused by the preview, carried by a section or not.
+func TestRestoreRefusesCollectionSourcesTheEditorWouldDB(t *testing.T) {
+	f := newSelectiveFixture(t)
+	ctx, pool := t.Context(), f.pool
+	wirePageTargets(f, new(bool), &[]string{})
+	s := seedPages(t, f)
+	dbExec(t, pool, `UPDATE library_collections SET collection_type = 'mdblist', source_url = 'http://127.0.0.1:9/lists/a/b',
+		source_config = '{"mode":"mdblist_json","url":"http://127.0.0.1:9/lists/a/b"}' WHERE id = $1`, s.managedCollection)
+	backup, err := backupUnderLock(t, f.svc, KindManual)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dbExec(t, pool, `DELETE FROM library_collections WHERE id = $1`, s.managedCollection)
+	preview, err := f.svc.Preview(ctx, backup.ID, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := previewItem(t, preview, SectionHomeSections, homeSectionItemID(s.managed)); got.Selectable || got.Reason != ReasonUnreadable ||
+		!strings.Contains(got.Message, "not one this server accepts") {
+		t.Fatalf("section whose collection's list is on loopback = %+v, want refused", got)
 	}
 }
 

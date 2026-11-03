@@ -14,6 +14,7 @@ import (
 
 	"github.com/Silo-Server/silo-server/internal/blobstore"
 	"github.com/Silo-Server/silo-server/internal/catalog"
+	"github.com/Silo-Server/silo-server/internal/collectionutil"
 	"github.com/Silo-Server/silo-server/internal/plugins"
 )
 
@@ -408,8 +409,13 @@ func collectionInput(c CollectionEntry) catalog.CreateLibraryCollectionInput {
 	}
 }
 
-// checkCollection runs CheckCollection when this server has it.
+// checkCollection checks a collection the restore would write: its
+// source as the editors canonicalize one (collectionutil
+// .CanonicalCollectionSource), and CheckCollection when this server has it.
 func (p *planner) checkCollection(in catalog.CreateLibraryCollectionInput) error {
+	if _, _, err := collectionutil.CanonicalCollectionSource(in.CollectionType, in.SourceURL, in.SourceConfig); err != nil {
+		return err
+	}
 	if p.s.targets.CheckCollection == nil {
 		return nil
 	}
