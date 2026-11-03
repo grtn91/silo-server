@@ -1168,6 +1168,20 @@ collection reference maps to the importing profile's own copy (the one
 its import created or merged into), and on the same server to an
 uncarried collection only one that profile can see.
 
+A collection sort preference is stored under the identity, field, and
+order the sort editor stores it under
+(`catalog.NormalizeCollectionSortPreference`): a watchlist or favorites
+sort under the one `personal` id whatever id the document names, so a
+document lists at most one per personal list; a library-kind sort under
+an admin collection the restore's collection mapping finds here, mapped
+for the whole list in one read. A document holds at most 10,000. Every
+list of every data type is written, and compared for a preview, in one
+set-based statement whatever its length (settings in one per scope);
+personal collections, at most 1,000 an import, are created or merged one
+at a time. `TestImportsReadInBatchesDB` drives each list and each sort
+kind with 100,000 and 1,000 distinct entries, every reference mapping,
+and requires a bounded number of statements.
+
 An import writes only the profile of the session, never one the document
 names, in one transaction, with the merge rules above. It refuses a document
 that carries an account or access field (at the top level or among the

@@ -21,7 +21,7 @@ var userDataTypes = []userdata.Type{
 	watchlist.BackupData{},
 	usercollections.BackupData{},
 	pgstore.DismissalsBackupData{},
-	pgstore.PreferencesBackupData{},
+	pgstore.PreferencesBackupData{NormalizeSort: catalog.NormalizeCollectionSortPreference},
 	notifications.BackupData{},
 }
 

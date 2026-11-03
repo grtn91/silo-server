@@ -225,7 +225,7 @@ func collectionsHere(ctx context.Context, tx pgx.Tx, config string) (bool, error
 }
 
 // remapCollections maps the collection ids a configuration names to the
-// collections here (Target.Collection); false when one has none.
+// collections here (Target.Collections); false when one has none.
 func remapCollections(ctx context.Context, target userdata.Target, config string) (string, bool, error) {
 	var doc map[string]json.RawMessage
 	if config == "" || json.Unmarshal([]byte(config), &doc) != nil {

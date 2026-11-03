@@ -32,7 +32,13 @@ import (
 // a library is remapped through the library map; navigation documents that
 // name libraries, sections, and collections are kept only on the same
 // server.
-type PreferencesBackupData struct{}
+type PreferencesBackupData struct {
+	// NormalizeSort is the sort editor's normalization of a collection sort
+	// preference (catalog.NormalizeCollectionSortPreference): the identity,
+	// field, and order the editor would store it under, or false when the
+	// editor refuses it. nil refuses every collection sort.
+	NormalizeSort func(kind, collection, field, order string) (string, string, string, string, bool)
+}
 
 func (PreferencesBackupData) ID() string { return userdata.Preferences }
 
@@ -328,7 +334,7 @@ func settingDefinition(s settingPreference) (*settingscontract.Definition, json.
 	return def, normalized, nil
 }
 
-func decodePreferences(data json.RawMessage) (preferencesDocument, userdata.Summary, error) {
+func (d PreferencesBackupData) decode(data json.RawMessage) (preferencesDocument, userdata.Summary, error) {
 	var doc preferencesDocument
 	var sum userdata.Summary
 	if err := userdata.DecodeStrict(data, &doc); err != nil {
@@ -353,7 +359,7 @@ func decodePreferences(data json.RawMessage) (preferencesDocument, userdata.Summ
 	if err := validateSectionOverrides(doc.SectionOverrides); err != nil {
 		return doc, sum, err
 	}
-	err := doc.validateTracks(&sum)
+	err := doc.validateTracks(&sum, d.NormalizeSort)
 	return doc, sum, err
 }
 
@@ -405,7 +411,7 @@ func (doc preferencesDocument) validateSettings(sum *userdata.Summary) error {
 	return nil
 }
 
-func (doc preferencesDocument) validateTracks(sum *userdata.Summary) error {
+func (doc preferencesDocument) validateTracks(sum *userdata.Summary, normalizeSort func(kind, collection, field, order string) (string, string, string, string, bool)) error {
 	series := seriesCheck(sum)
 	// Each list holds one entry per series, library, or collection, as
 	// the store keeps one row per each; a repeat is refused.
@@ -459,43 +465,42 @@ func (doc preferencesDocument) validateTracks(sum *userdata.Summary) error {
 			return err
 		}
 	}
-	for _, c := range doc.CollectionSort {
-		if err := sorts(c.Kind + "\x00" + c.Collection); err != nil {
-			return err
+	if len(doc.CollectionSort) > maxImportedCollectionSorts {
+		return fmt.Errorf("more than %d collection sort preferences", maxImportedCollectionSorts)
+	}
+	for i := range doc.CollectionSort {
+		// Each sort is stored under the identity, and with the field and
+		// order, the sort editor would store it with: one per personal
+		// list, whatever collection id the document gives it.
+		c := &doc.CollectionSort[i]
+		var kind, collection, field, order string
+		ok := normalizeSort != nil
+		if ok {
+			kind, collection, field, order, ok = normalizeSort(c.Kind, c.Collection, c.Field, c.Order)
 		}
-		if (c.Kind != scopeLibrary && c.Kind != "watchlist" && c.Kind != "favorites") || (c.Order != "" && c.Order != "asc" && c.Order != "desc") ||
-			!userdata.ValidText(c.Field, 64) || !userdata.ValidText(c.Collection, 128) {
+		if !ok || kind == userstore.CollectionKindUser || !userdata.ValidText(collection, 128) {
 			return errors.New("a collection sort preference is not valid")
+		}
+		c.Kind, c.Collection, c.Field, c.Order = kind, collection, field, order
+		if err := sorts(kind + "\x00" + collection); err != nil {
+			return err
 		}
 	}
 	return nil
 }
 
-func (PreferencesBackupData) Validate(data json.RawMessage) (userdata.Summary, error) {
-	_, sum, err := decodePreferences(data)
+// maxImportedCollectionSorts bounds a document's collection sort
+// preferences: one per admin collection the profile re-sorted, and one per
+// personal list.
+const maxImportedCollectionSorts = 10_000
+
+func (d PreferencesBackupData) Validate(data json.RawMessage) (userdata.Summary, error) {
+	_, sum, err := d.decode(data)
 	return sum, err
 }
 
-// upsertCounted runs an upsert whose conflict update is guarded by "values
-// differ" and that returns (xmax = 0): no row means nothing changed.
-func upsertCounted(ctx context.Context, tx pgx.Tx, res *userdata.Result, sql string, args ...any) error {
-	var inserted bool
-	err := tx.QueryRow(ctx, sql, args...).Scan(&inserted)
-	switch {
-	case errors.Is(err, pgx.ErrNoRows):
-		res.Unchanged++
-	case err != nil:
-		return err
-	case inserted:
-		res.Added++
-	default:
-		res.Updated++
-	}
-	return nil
-}
-
-func (PreferencesBackupData) Import(ctx context.Context, tx pgx.Tx, target userdata.Target, data json.RawMessage) (userdata.Result, error) {
-	doc, _, err := decodePreferences(data)
+func (d PreferencesBackupData) Import(ctx context.Context, tx pgx.Tx, target userdata.Target, data json.RawMessage) (userdata.Result, error) {
+	doc, _, err := d.decode(data)
 	if err != nil {
 		return userdata.Result{}, err
 	}
@@ -531,6 +536,7 @@ func (PreferencesBackupData) Import(ctx context.Context, tx pgx.Tx, target userd
 	if err != nil {
 		return res, err
 	}
+	var writes []settingPlan
 	for _, s := range doc.Settings {
 		plan, err := planSetting(ctx, tx, target, s, stored)
 		if err != nil {
@@ -540,26 +546,23 @@ func (PreferencesBackupData) Import(ctx context.Context, tx pgx.Tx, target userd
 		case settingRejected:
 			rejected++
 			res.LeftOut++
-			continue
 		case settingNavigation:
 			navigationDropped++
 			res.LeftOut++
-			continue
 		case settingUnmapped:
 			res.LeftOut++
-			continue
 		case settingSame:
 			res.Unchanged++
-			continue
-		}
-		if _, err := upsertSettingValue(ctx, tx, target.UserID, plan.id, plan.value); err != nil {
-			return res, err
-		}
-		if plan.outcome == settingNew {
+		case settingNew:
 			res.Added++
-		} else {
+			writes = append(writes, plan)
+		default:
 			res.Updated++
+			writes = append(writes, plan)
 		}
+	}
+	if err := upsertSettingValues(ctx, tx, target.UserID, writes); err != nil {
+		return res, err
 	}
 	if rejected > 0 {
 		res.Notes = append(res.Notes, fmt.Sprintf("%d settings this server does not accept were left out.", rejected))
@@ -746,22 +749,6 @@ func remapLibraryList(value json.RawMessage, target userdata.Target) (json.RawMe
 	return json.Marshal(out)
 }
 
-func importTrackPreferences(ctx context.Context, tx pgx.Tx, target userdata.Target, doc preferencesDocument, res *userdata.Result) error {
-	if err := importAudioPreferences(ctx, tx, target, doc.Audio, res); err != nil {
-		return err
-	}
-	if err := importSubtitlePreferences(ctx, tx, target, doc.Subtitles, res); err != nil {
-		return err
-	}
-	if err := importLibraryPreferences(ctx, tx, target, doc.LibraryPlayback, res); err != nil {
-		return err
-	}
-	if err := importSeriesPreferences(ctx, tx, target, doc.SeriesPlayback, res); err != nil {
-		return err
-	}
-	return importCollectionSorts(ctx, tx, target, doc.CollectionSort, res)
-}
-
 // resolveSeries maps a series id, counting one left out when it has no item
 // here.
 func resolveSeries(ctx context.Context, target userdata.Target, id string, res *userdata.Result) (string, bool, error) {
@@ -795,148 +782,6 @@ func (s seriesPreference) localFileID(target userdata.Target) *int64 {
 		return nil
 	}
 	return s.FileID
-}
-
-// localCollection is the sort's collection id here. A library-kind sort
-// names an admin collection (a library_collections row, as the sort write
-// path checks), mapped through the restore's collection mapper; false when
-// it has none here.
-func (c collectionSort) localCollection(ctx context.Context, target userdata.Target) (string, bool, error) {
-	if c.Kind != scopeLibrary {
-		return c.Collection, true, nil
-	}
-	if target.Collection == nil {
-		return "", false, nil
-	}
-	return target.Collection(ctx, userdata.LibraryCollectionField, c.Collection)
-}
-
-func importAudioPreferences(ctx context.Context, tx pgx.Tx, target userdata.Target, entries []audioPreference, res *userdata.Result) error {
-	for _, a := range entries {
-		series, ok, err := resolveSeries(ctx, target, a.Series, res)
-		if err != nil {
-			return err
-		}
-		if !ok {
-			continue
-		}
-		if err := upsertCounted(ctx, tx, res, `
-			INSERT INTO user_audio_preferences (user_id, profile_id, series_id, audio_track_index, audio_language, audio_track_signature, updated_at)
-			VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7)
-			ON CONFLICT (user_id, profile_id, series_id) DO UPDATE SET audio_track_index = EXCLUDED.audio_track_index,
-				audio_language = EXCLUDED.audio_language, audio_track_signature = EXCLUDED.audio_track_signature, updated_at = EXCLUDED.updated_at
-			WHERE (user_audio_preferences.audio_track_index, user_audio_preferences.audio_language, user_audio_preferences.audio_track_signature)
-				IS DISTINCT FROM (EXCLUDED.audio_track_index, EXCLUDED.audio_language, EXCLUDED.audio_track_signature)
-			RETURNING (xmax = 0)`,
-			target.UserID, target.ProfileID, series, a.TrackIndex, a.Language, trackSignature(a.Signature), a.UpdatedAt); err != nil {
-			return fmt.Errorf("restoring an audio preference: %w", err)
-		}
-	}
-	return nil
-}
-
-func importSubtitlePreferences(ctx context.Context, tx pgx.Tx, target userdata.Target, entries []subtitlePreference, res *userdata.Result) error {
-	for _, s := range entries {
-		series, ok, err := resolveSeries(ctx, target, s.Series, res)
-		if err != nil {
-			return err
-		}
-		if !ok {
-			continue
-		}
-		if err := upsertCounted(ctx, tx, res, `
-			INSERT INTO user_subtitle_preferences (user_id, profile_id, series_id, subtitle_language, subtitle_track_index, external_subtitle_path,
-				subtitle_mode, show_forced_subtitles, subtitle_track_signature, updated_at)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10)
-			ON CONFLICT (user_id, profile_id, series_id) DO UPDATE SET subtitle_language = EXCLUDED.subtitle_language,
-				subtitle_track_index = EXCLUDED.subtitle_track_index, external_subtitle_path = EXCLUDED.external_subtitle_path,
-				subtitle_mode = EXCLUDED.subtitle_mode, show_forced_subtitles = EXCLUDED.show_forced_subtitles,
-				subtitle_track_signature = EXCLUDED.subtitle_track_signature, updated_at = EXCLUDED.updated_at
-			WHERE (user_subtitle_preferences.subtitle_language, user_subtitle_preferences.subtitle_track_index, user_subtitle_preferences.external_subtitle_path,
-				user_subtitle_preferences.subtitle_mode, user_subtitle_preferences.show_forced_subtitles, user_subtitle_preferences.subtitle_track_signature)
-				IS DISTINCT FROM (EXCLUDED.subtitle_language, EXCLUDED.subtitle_track_index, EXCLUDED.external_subtitle_path,
-				EXCLUDED.subtitle_mode, EXCLUDED.show_forced_subtitles, EXCLUDED.subtitle_track_signature)
-			RETURNING (xmax = 0)`,
-			target.UserID, target.ProfileID, series, s.Language, s.TrackIndex, s.localPath(target), s.Mode, s.ShowForcedSubtitles, trackSignature(s.Signature), s.UpdatedAt); err != nil {
-			return fmt.Errorf("restoring a subtitle preference: %w", err)
-		}
-	}
-	return nil
-}
-
-func importLibraryPreferences(ctx context.Context, tx pgx.Tx, target userdata.Target, entries []libraryPreference, res *userdata.Result) error {
-	for _, l := range entries {
-		library, ok := target.MapLibrary(l.Library)
-		if !ok {
-			res.LeftOut++
-			continue
-		}
-		if err := upsertCounted(ctx, tx, res, `
-			INSERT INTO user_library_playback_preferences (user_id, profile_id, library_id, audio_language, subtitle_language, subtitle_mode,
-				show_forced_subtitles, updated_at)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-			ON CONFLICT (user_id, profile_id, library_id) DO UPDATE SET audio_language = EXCLUDED.audio_language,
-				subtitle_language = EXCLUDED.subtitle_language, subtitle_mode = EXCLUDED.subtitle_mode,
-				show_forced_subtitles = EXCLUDED.show_forced_subtitles, updated_at = EXCLUDED.updated_at
-			WHERE (user_library_playback_preferences.audio_language, user_library_playback_preferences.subtitle_language,
-				user_library_playback_preferences.subtitle_mode, user_library_playback_preferences.show_forced_subtitles)
-				IS DISTINCT FROM (EXCLUDED.audio_language, EXCLUDED.subtitle_language, EXCLUDED.subtitle_mode, EXCLUDED.show_forced_subtitles)
-			RETURNING (xmax = 0)`,
-			target.UserID, target.ProfileID, library, l.AudioLanguage, l.SubtitleLanguage, l.SubtitleMode, l.ShowForcedSubtitles, l.UpdatedAt); err != nil {
-			return fmt.Errorf("restoring a library playback preference: %w", err)
-		}
-	}
-	return nil
-}
-
-func importSeriesPreferences(ctx context.Context, tx pgx.Tx, target userdata.Target, entries []seriesPreference, res *userdata.Result) error {
-	for _, s := range entries {
-		series, ok, err := resolveSeries(ctx, target, s.Series, res)
-		if err != nil {
-			return err
-		}
-		if !ok {
-			continue
-		}
-		if err := upsertCounted(ctx, tx, res, `
-			INSERT INTO user_series_playback_preferences (user_id, profile_id, series_id, resolution, hdr, codec_video, file_id, edition_key, updated_at)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-			ON CONFLICT (user_id, profile_id, series_id) DO UPDATE SET resolution = EXCLUDED.resolution, hdr = EXCLUDED.hdr,
-				codec_video = EXCLUDED.codec_video, file_id = EXCLUDED.file_id, edition_key = EXCLUDED.edition_key, updated_at = EXCLUDED.updated_at
-			WHERE (user_series_playback_preferences.resolution, user_series_playback_preferences.hdr, user_series_playback_preferences.codec_video,
-				user_series_playback_preferences.file_id, user_series_playback_preferences.edition_key)
-				IS DISTINCT FROM (EXCLUDED.resolution, EXCLUDED.hdr, EXCLUDED.codec_video, EXCLUDED.file_id, EXCLUDED.edition_key)
-			RETURNING (xmax = 0)`,
-			target.UserID, target.ProfileID, series, s.Resolution, s.HDR, s.CodecVideo, s.localFileID(target), s.EditionKey, s.UpdatedAt); err != nil {
-			return fmt.Errorf("restoring a series playback preference: %w", err)
-		}
-	}
-	return nil
-}
-
-func importCollectionSorts(ctx context.Context, tx pgx.Tx, target userdata.Target, entries []collectionSort, res *userdata.Result) error {
-	for _, c := range entries {
-		collection, ok, err := c.localCollection(ctx, target)
-		if err != nil {
-			return err
-		}
-		if !ok {
-			res.LeftOut++
-			continue
-		}
-		if err := upsertCounted(ctx, tx, res, `
-			INSERT INTO user_collection_sort_preferences (user_id, profile_id, collection_kind, collection_id, sort_field, sort_order, updated_at)
-			VALUES ($1, $2, $3, $4, $5, $6, $7)
-			ON CONFLICT (user_id, profile_id, collection_kind, collection_id) DO UPDATE SET sort_field = EXCLUDED.sort_field,
-				sort_order = EXCLUDED.sort_order, updated_at = EXCLUDED.updated_at
-			WHERE (user_collection_sort_preferences.sort_field, user_collection_sort_preferences.sort_order)
-				IS DISTINCT FROM (EXCLUDED.sort_field, EXCLUDED.sort_order)
-			RETURNING (xmax = 0)`,
-			target.UserID, target.ProfileID, c.Kind, collection, c.Field, c.Order, c.UpdatedAt); err != nil {
-			return fmt.Errorf("restoring a collection sort preference: %w", err)
-		}
-	}
-	return nil
 }
 
 // canonicalSignature decodes a track signature into its type (into),

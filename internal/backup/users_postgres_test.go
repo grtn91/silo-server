@@ -1454,10 +1454,17 @@ type unknownItems struct{}
 
 func (unknownItems) Resolve(context.Context, string) (string, bool, error) { return "", false, nil }
 
-// TestImportsReadInBatchesDB: an import of 100,000 distinct entries of any
-// data type sends a bounded number of statements, not one per entry: reads
-// are batched as writes are, and the types that cap their entries stop at
-// the cap.
+// sameItems matches every item to itself, so an import writes every entry.
+type sameItems struct{}
+
+func (sameItems) Resolve(_ context.Context, id string) (string, bool, error) { return id, true, nil }
+
+// TestImportsReadInBatchesDB: an import of any data type's entries sends a
+// bounded number of statements, not one per entry: reads and writes are
+// set-based. Each branch of each importer (importerSamples, one per list
+// and per sort kind) is driven with 100,000 distinct entries and with
+// 1,000, every reference mapping, so every entry is planned and written;
+// a document over a type's cap must be refused before the import.
 func TestImportsReadInBatchesDB(t *testing.T) {
 	pool, _ := testDB(t)
 	ctx := t.Context()
@@ -1466,36 +1473,61 @@ func TestImportsReadInBatchesDB(t *testing.T) {
 	profile := "batch-" + sfx
 	testProfile(t, pool, user, profile, "Batch", true, "")
 	for name, d := range importerSamples {
-		t.Run(name, func(t *testing.T) {
-			id, _, _ := strings.Cut(name, " ")
-			dt, _ := userDataType(id)
-			entries := make([]string, 100_000)
-			for i := range entries {
-				e := strings.ReplaceAll(d.entry, `"m1"`, fmt.Sprintf(`"m%d"`, i))
-				e = strings.ReplaceAll(e, `"s1"`, fmt.Sprintf(`"s%d"`, i))
-				e = strings.ReplaceAll(e, `"c1"`, fmt.Sprintf(`"c%d"`, i))
-				e = strings.ReplaceAll(e, `"name":"A"`, fmt.Sprintf(`"name":"A%d"`, i))
-				entries[i] = e
-			}
-			doc := json.RawMessage(d.head + strings.Join(entries, ",") + d.tail)
-			tx, err := pool.Begin(ctx)
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer func() { _ = tx.Rollback(context.Background()) }()
-			counted := &countingTx{Tx: tx}
-			target := userdata.Target{Owner: userdata.Owner{UserID: user, ProfileID: profile}, Items: unknownItems{}, Now: time.Now(), Untrusted: true,
-				Library: func(int) (int, bool) { return 0, false }, Profile: func(string) (string, bool) { return "", false }}
-			if _, err := dt.Validate(doc); err != nil {
-				return // refused before an import plans anything
-			}
-			if _, err := dt.Import(ctx, counted, target, doc); err != nil {
-				t.Fatal(err)
-			}
-			if counted.n > 10_000 {
-				t.Fatalf("100,000 entries sent %d statements", counted.n)
-			}
-		})
+		for _, n := range []int{100_000, 1000} {
+			t.Run(fmt.Sprintf("%s %d", name, n), func(t *testing.T) {
+				id, _, _ := strings.Cut(name, " ")
+				dt, _ := userDataType(id)
+				entries := make([]string, n)
+				for i := range entries {
+					e := strings.ReplaceAll(d.entry, `"m1"`, fmt.Sprintf(`"m%d"`, i))
+					e = strings.ReplaceAll(e, `"s1"`, fmt.Sprintf(`"s%d"`, i))
+					e = strings.ReplaceAll(e, `"c1"`, fmt.Sprintf(`"c%d"`, i))
+					e = strings.ReplaceAll(e, `"name":"A"`, fmt.Sprintf(`"name":"A%d"`, i))
+					e = strings.ReplaceAll(e, `"library":1,`, fmt.Sprintf(`"library":%d,`, i+1))
+					entries[i] = e
+				}
+				doc := json.RawMessage(d.head + strings.Join(entries, ",") + d.tail)
+				tx, err := pool.Begin(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() { _ = tx.Rollback(context.Background()) }()
+				counted := &countingTx{Tx: tx}
+				target := userdata.Target{Owner: userdata.Owner{UserID: user, ProfileID: profile}, Items: sameItems{}, Now: time.Now(), Untrusted: true,
+					SameServer: true, Library: func(id int) (int, bool) { return id, true }, Profile: func(string) (string, bool) { return "", false },
+					Collections: func(_ context.Context, _ string, ids []string) (map[string]string, error) {
+						out := map[string]string{}
+						for _, id := range ids {
+							out[id] = id
+						}
+						return out, nil
+					}}
+				// A personal list has one sort, whatever collection id an
+				// entry names, so distinct entries are repeats.
+				personal := strings.HasSuffix(name, "watchlist sort") || strings.HasSuffix(name, "favorites sort")
+				if _, err := dt.Validate(doc); err != nil {
+					if n == 100_000 || personal {
+						return // over the type's cap, or repeats: refused before an import plans anything
+					}
+					t.Fatalf("%d entries: %v", n, err)
+				} else if personal {
+					t.Fatalf("%d sorts of one personal list were accepted", n)
+				}
+				res, err := dt.Import(ctx, counted, target, doc)
+				if err != nil {
+					t.Fatal(err)
+				}
+				// Collections are created or merged one at a time, by name,
+				// in a few statements each, up to the import's cap of 1,000.
+				limit := 64
+				if id == userdata.Collections {
+					limit += 4 * min(n, 1000)
+				}
+				if counted.n > limit {
+					t.Fatalf("%d entries sent %d statements (%+v)", n, counted.n, res)
+				}
+			})
+		}
 	}
 	// Watchlist titles outside the library, at their cap, in a profile's own
 	// export: the profile's titles are read once.

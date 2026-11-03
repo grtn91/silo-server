@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
-	"strings"
 
 	apimw "github.com/Silo-Server/silo-server/internal/api/middleware"
 	"github.com/Silo-Server/silo-server/internal/catalog"
@@ -90,45 +89,13 @@ var sortPreferenceKinds = []string{
 	userstore.CollectionKindFavorites,
 }
 
-func normalizeCollectionRef(rawKind, rawID string) (string, string, bool) {
-	kind := strings.ToLower(strings.TrimSpace(rawKind))
-	if isPersonalSortPreferenceKind(kind) {
-		return kind, userstore.PersonalSortPreferenceCollectionID, true
-	}
-	if kind != userstore.CollectionKindLibrary && kind != userstore.CollectionKindUser {
-		return "", "", false
-	}
-	collectionID := strings.TrimSpace(rawID)
-	if collectionID == "" {
-		return "", "", false
-	}
-	return kind, collectionID, true
-}
-
-func isPersonalSortPreferenceKind(kind string) bool {
-	return kind == userstore.CollectionKindWatchlist || kind == userstore.CollectionKindFavorites
-}
-
-func normalizeSortPreference(kind, rawField, rawOrder string) (string, string, bool) {
-	field := strings.ToLower(strings.TrimSpace(rawField))
-	if field == "" {
-		return "", "", true
-	}
-	if isPersonalSortPreferenceKind(kind) {
-		qs, ok := catalog.NormalizePersonalSourceSort(field, rawOrder)
-		return qs.Field, qs.Order, ok
-	}
-	qs, ok := catalog.NormalizeCollectionSort(field, rawOrder, true)
-	return qs.Field, qs.Order, ok
-}
-
 func (h *CollectionHandler) SetPersonalCollectionSortPreference(ctx context.Context, userID int, profileID string, access catalog.AccessFilter, req CollectionSortPreferenceRequest) (CollectionSortPreferenceResponse, error) {
-	kind, collectionID, ok := normalizeCollectionRef(req.CollectionKind, req.CollectionID)
+	kind, collectionID, ok := catalog.NormalizeSortPreferenceRef(req.CollectionKind, req.CollectionID)
 	if !ok {
 		return CollectionSortPreferenceResponse{}, apiError(http.StatusBadRequest, "bad_request", "collection_kind must be 'library', 'user', 'watchlist', or 'favorites'; collection_id is required for collection kinds")
 	}
 
-	field, order, valid := normalizeSortPreference(kind, req.Field, req.Order)
+	field, order, valid := catalog.NormalizeSortPreference(kind, req.Field, req.Order)
 	if !valid {
 		return CollectionSortPreferenceResponse{}, apiError(http.StatusBadRequest, "bad_request", "Unsupported sort field or order for this collection")
 	}
@@ -180,7 +147,7 @@ func (h *CollectionHandler) canSaveCollectionSortPreferenceContext(ctx context.C
 }
 
 func (h *CollectionHandler) ClearPersonalCollectionSortPreference(ctx context.Context, userID int, profileID, rawKind, rawID string) error {
-	kind, collectionID, ok := normalizeCollectionRef(rawKind, rawID)
+	kind, collectionID, ok := catalog.NormalizeSortPreferenceRef(rawKind, rawID)
 	if !ok {
 		return apiError(http.StatusBadRequest, "bad_request", "collection_kind must be 'library', 'user', 'watchlist', or 'favorites'; collection_id is required for collection kinds")
 	}

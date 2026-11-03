@@ -212,10 +212,10 @@ func (BackupData) Import(ctx context.Context, tx pgx.Tx, target userdata.Target,
 	if err := importTitles(ctx, tx, target, doc.Titles, &res); err != nil {
 		return res, err
 	}
-	if err := importKeyed(ctx, tx, target, `INSERT INTO user_favorites (user_id, profile_id, media_item_id, added_at) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING`, doc.Favorites, &res); err != nil {
+	if err := importKeyed(ctx, tx, target, `INSERT INTO user_favorites (user_id, profile_id, media_item_id, added_at) SELECT $1, $2, u.item, u.at FROM unnest($3::text[], $4::timestamptz[]) AS u(item, at) ON CONFLICT DO NOTHING`, doc.Favorites, &res); err != nil {
 		return res, fmt.Errorf("restoring favorites: %w", err)
 	}
-	if err := importKeyed(ctx, tx, target, `INSERT INTO user_watchlist (user_id, profile_id, media_item_id, added_at) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING`, doc.Watchlist, &res); err != nil {
+	if err := importKeyed(ctx, tx, target, `INSERT INTO user_watchlist (user_id, profile_id, media_item_id, added_at) SELECT $1, $2, u.item, u.at FROM unnest($3::text[], $4::timestamptz[]) AS u(item, at) ON CONFLICT DO NOTHING`, doc.Watchlist, &res); err != nil {
 		return res, fmt.Errorf("restoring the watchlist: %w", err)
 	}
 	return res, nil
@@ -263,10 +263,12 @@ func importTitles(ctx context.Context, tx pgx.Tx, target userdata.Target, titles
 	return nil
 }
 
-// importKeyed inserts each mapped entry the profile does not have. sql takes
-// user id, profile id, item, and time, and must do nothing on conflict.
+// importKeyed inserts, in one statement, each mapped entry the profile
+// does not have. sql takes user id, profile id, an array of items, and an
+// array of times, and must do nothing on conflict.
 func importKeyed(ctx context.Context, tx pgx.Tx, target userdata.Target, sql string, entries []keyedEntry, res *userdata.Result) error {
-	var rows [][]any
+	var items []string
+	var at []time.Time
 	for _, e := range entries {
 		local, ok, err := target.Items.Resolve(ctx, e.Item)
 		if err != nil {
@@ -276,15 +278,19 @@ func importKeyed(ctx context.Context, tx pgx.Tx, target userdata.Target, sql str
 			res.LeftOut++
 			continue
 		}
-		at := e.At
-		if at.IsZero() {
-			at = target.Now
+		when := e.At
+		if when.IsZero() {
+			when = target.Now
 		}
-		rows = append(rows, []any{target.UserID, target.ProfileID, local, at})
+		items, at = append(items, local), append(at, when)
 	}
-	added, err := userdata.InsertEach(ctx, tx, sql, rows)
+	if len(items) == 0 {
+		return nil
+	}
+	tag, err := tx.Exec(ctx, sql, target.UserID, target.ProfileID, items, at)
+	added := int(tag.RowsAffected())
 	res.Added += added
-	res.Unchanged += len(rows) - added
+	res.Unchanged += len(items) - added
 	return err
 }
 

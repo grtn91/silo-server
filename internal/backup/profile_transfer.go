@@ -482,7 +482,7 @@ func (t *ProfileTransfer) Import(ctx context.Context, scope ProfileImportScope, 
 		Library:   func(id int) (int, bool) { return id, libraries[id] },
 		Untrusted: true,
 	}
-	target.Collection = transferCollections(tx, target, doc.Data[userdata.Collections])
+	target.Collections = transferCollections(tx, target, doc.Data[userdata.Collections])
 	for _, dt := range userDataTypes {
 		raw, ok := doc.Data[dt.ID()]
 		if !ok {
@@ -510,23 +510,28 @@ func (t *ProfileTransfer) Import(ctx context.Context, scope ProfileImportScope, 
 // transferCollections maps the collection ids a profile export names: its
 // own personal collections as their import matches them, and an admin
 // collection only on the server that wrote it, while it is still there.
-func transferCollections(tx pgx.Tx, target userdata.Target, collections json.RawMessage) func(ctx context.Context, field, id string) (string, bool, error) {
+func transferCollections(tx pgx.Tx, target userdata.Target, collections json.RawMessage) func(ctx context.Context, field string, ids []string) (map[string]string, error) {
 	carried := usercollections.CarriedCollections(map[string]json.RawMessage{"": collections})
-	return func(ctx context.Context, field, id string) (string, bool, error) {
+	return func(ctx context.Context, field string, ids []string) (map[string]string, error) {
 		switch field {
 		case userdata.UserCollectionField:
-			return usercollections.MapCarried(ctx, tx, target, carried, id)
+			return usercollections.MapCarriedEach(ctx, tx, target, carried, ids)
 		case userdata.LibraryCollectionField:
+			out := map[string]string{}
 			if !target.SameServer {
-				return "", false, nil
+				return out, nil
 			}
-			var found bool
-			if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM library_collections WHERE id = $1)`, id).Scan(&found); err != nil {
-				return "", false, err
+			rows, err := tx.Query(ctx, `SELECT id FROM library_collections WHERE id = ANY($1)`, ids)
+			if err != nil {
+				return nil, err
 			}
-			return id, found, nil
+			found, err := pgx.CollectRows(rows, pgx.RowTo[string])
+			for _, id := range found {
+				out[id] = id
+			}
+			return out, err
 		}
-		return "", false, nil
+		return map[string]string{}, nil
 	}
 }
 

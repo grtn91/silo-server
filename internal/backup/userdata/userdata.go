@@ -134,11 +134,11 @@ type Target struct {
 	// here is that plugin's with the capability. Only consulted across
 	// servers.
 	PluginInstallation func(installationID int, capabilityID string) (int, bool)
-	// Collection maps a source collection id named in field
+	// Collections maps source collection ids named in field
 	// (LibraryCollectionField, an admin collection, or UserCollectionField,
-	// a personal one) to the collection here; false drops the reference.
-	// nil maps none.
-	Collection func(ctx context.Context, field, id string) (string, bool, error)
+	// a personal one) to the collections here, all at once; an id missing
+	// from the result is dropped. nil maps none.
+	Collections func(ctx context.Context, field string, ids []string) (map[string]string, error)
 	// Now stamps rows that need a time of their own.
 	Now time.Time
 	// Untrusted marks a profile's own export, which whoever holds it could
@@ -156,10 +156,18 @@ const (
 // MapCollection maps a source collection id, dropping it when no mapping
 // is set.
 func (t Target) MapCollection(ctx context.Context, field, id string) (string, bool, error) {
-	if t.Collection == nil {
-		return "", false, nil
+	mapped, err := t.MapCollections(ctx, field, []string{id})
+	local, ok := mapped[id]
+	return local, ok, err
+}
+
+// MapCollections maps source collection ids, by id; an id it drops is
+// missing from the result.
+func (t Target) MapCollections(ctx context.Context, field string, ids []string) (map[string]string, error) {
+	if t.Collections == nil || len(ids) == 0 {
+		return map[string]string{}, nil
 	}
-	return t.Collection(ctx, field, id)
+	return t.Collections(ctx, field, ids)
 }
 
 // MapPluginInstallation maps a source plugin installation, dropping it when
@@ -361,39 +369,6 @@ func DecodeStrict(data []byte, into any) error {
 		return errors.New("trailing data after the document")
 	}
 	return CheckBounds(into)
-}
-
-// importBatchSize is how many inserts InsertEach sends in one round trip.
-const importBatchSize = 1000
-
-// InsertEach runs sql once per row of args in the caller's transaction,
-// importBatchSize statements to a round trip, and counts the rows it
-// inserted (an INSERT … ON CONFLICT DO NOTHING inserts none for a row
-// already there). An import's writes are then a few round trips, not one
-// per entry.
-func InsertEach(ctx context.Context, tx pgx.Tx, sql string, args [][]any) (inserted int, err error) {
-	for start := 0; start < len(args); start += importBatchSize {
-		chunk := args[start:min(start+importBatchSize, len(args))]
-		var batch pgx.Batch
-		for _, a := range chunk {
-			batch.Queue(sql, a...)
-		}
-		results := tx.SendBatch(ctx, &batch)
-		for range chunk {
-			tag, err := results.Exec()
-			if err != nil {
-				_ = results.Close()
-				return inserted, err
-			}
-			if tag.RowsAffected() > 0 {
-				inserted++
-			}
-		}
-		if err := results.Close(); err != nil {
-			return inserted, err
-		}
-	}
-	return inserted, nil
 }
 
 // Distinct refuses an entry a document lists twice, by its key. Every

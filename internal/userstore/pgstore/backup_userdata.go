@@ -56,10 +56,12 @@ func validateKeyed(kind string, entries []keyedEntry, sum *userdata.Summary) err
 	return nil
 }
 
-// importKeyed inserts each mapped entry the profile does not have. sql takes
-// user id, profile id, item, and time, and must do nothing on conflict.
+// importKeyed inserts, in one statement, each mapped entry the profile
+// does not have. sql takes user id, profile id, an array of items, and an
+// array of times, and must do nothing on conflict.
 func importKeyed(ctx context.Context, tx pgx.Tx, target userdata.Target, sql string, entries []keyedEntry, res *userdata.Result) error {
-	var rows [][]any
+	var items []string
+	var at []time.Time
 	for _, e := range entries {
 		local, ok, err := target.Items.Resolve(ctx, e.Item)
 		if err != nil {
@@ -69,15 +71,19 @@ func importKeyed(ctx context.Context, tx pgx.Tx, target userdata.Target, sql str
 			res.LeftOut++
 			continue
 		}
-		at := e.At
-		if at.IsZero() {
-			at = target.Now
+		when := e.At
+		if when.IsZero() {
+			when = target.Now
 		}
-		rows = append(rows, []any{target.UserID, target.ProfileID, local, at})
+		items, at = append(items, local), append(at, when)
 	}
-	added, err := userdata.InsertEach(ctx, tx, sql, rows)
+	if len(items) == 0 {
+		return nil
+	}
+	tag, err := tx.Exec(ctx, sql, target.UserID, target.ProfileID, items, at)
+	added := int(tag.RowsAffected())
 	res.Added += added
-	res.Unchanged += len(rows) - added
+	res.Unchanged += len(items) - added
 	return err
 }
 
@@ -207,43 +213,60 @@ func (DismissalsBackupData) Import(ctx context.Context, tx pgx.Tx, target userda
 		return userdata.Result{}, err
 	}
 	var res userdata.Result
-	for _, d := range doc.Home {
+	if err := importHomeDismissals(ctx, tx, target, doc.Home, &res); err != nil {
+		return res, err
+	}
+	if err := importKeyed(ctx, tx, target, `INSERT INTO user_not_interested (user_id, profile_id, media_item_id, added_at) SELECT $1, $2, u.item, u.at FROM unnest($3::text[], $4::timestamptz[]) AS u(item, at) ON CONFLICT DO NOTHING`, doc.NotInterested, &res); err != nil {
+		return res, fmt.Errorf("restoring not interested: %w", err)
+	}
+	if err := importKeyed(ctx, tx, target, `INSERT INTO user_dropped_series (user_id, profile_id, series_id, dropped_at) SELECT $1, $2, u.item, u.at FROM unnest($3::text[], $4::timestamptz[]) AS u(item, at) ON CONFLICT DO NOTHING`, doc.DroppedSeries, &res); err != nil {
+		return res, fmt.Errorf("restoring dropped series: %w", err)
+	}
+	return res, nil
+}
+
+// importHomeDismissals inserts, in one statement, the home dismissals the
+// profile does not have.
+func importHomeDismissals(ctx context.Context, tx pgx.Tx, target userdata.Target, home []homeDismissal, res *userdata.Result) error {
+	var surfaces, items []string
+	var series []*string
+	var progress []*time.Time
+	var at []time.Time
+	for _, d := range home {
 		local, ok, err := target.Items.Resolve(ctx, d.Item)
 		if err != nil {
-			return res, err
+			return err
 		}
 		if !ok {
 			res.LeftOut++
 			continue
 		}
-		var series *string
+		var mapped *string
 		if d.Series != nil {
-			if mapped, ok, err := target.Items.Resolve(ctx, *d.Series); err != nil {
-				return res, err
+			if id, ok, err := target.Items.Resolve(ctx, *d.Series); err != nil {
+				return err
 			} else if ok {
-				series = &mapped
+				mapped = &id
 			}
 		}
-		tag, err := tx.Exec(ctx, `
-			INSERT INTO user_home_item_dismissals (user_id, profile_id, surface, media_item_id, series_id, progress_updated_at, dismissed_at)
-			VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT DO NOTHING`,
-			target.UserID, target.ProfileID, d.Surface, local, series, d.ProgressUpdatedAt, d.DismissedAt)
-		if err != nil {
-			return res, fmt.Errorf("restoring a home dismissal: %w", err)
-		}
-		if tag.RowsAffected() > 0 {
-			res.Added++
-		} else {
-			res.Unchanged++
-		}
+		surfaces, items, series = append(surfaces, d.Surface), append(items, local), append(series, mapped)
+		progress, at = append(progress, d.ProgressUpdatedAt), append(at, d.DismissedAt)
 	}
-	if err := importKeyed(ctx, tx, target, `INSERT INTO user_not_interested (user_id, profile_id, media_item_id, added_at) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING`, doc.NotInterested, &res); err != nil {
-		return res, fmt.Errorf("restoring not interested: %w", err)
+	if len(items) == 0 {
+		return nil
 	}
-	if err := importKeyed(ctx, tx, target, `INSERT INTO user_dropped_series (user_id, profile_id, series_id, dropped_at) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING`, doc.DroppedSeries, &res); err != nil {
-		return res, fmt.Errorf("restoring dropped series: %w", err)
+	tag, err := tx.Exec(ctx, `
+		INSERT INTO user_home_item_dismissals (user_id, profile_id, surface, media_item_id, series_id, progress_updated_at, dismissed_at)
+		SELECT $1, $2, u.* FROM unnest($3::text[], $4::text[], $5::text[], $6::timestamptz[], $7::timestamptz[]) AS u
+		ON CONFLICT DO NOTHING`,
+		target.UserID, target.ProfileID, surfaces, items, series, progress, at)
+	if err != nil {
+		return fmt.Errorf("restoring home dismissals: %w", err)
 	}
-	return res, nil
+	added := int(tag.RowsAffected())
+	res.Added += added
+	res.Unchanged += len(items) - added
+	return nil
 }
 
 // Pending counts the dismissals Import would add: home dismissals (by

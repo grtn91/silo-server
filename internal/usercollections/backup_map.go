@@ -37,6 +37,22 @@ func CarriedCollections(docs map[string]json.RawMessage) map[string]Carried {
 	return out
 }
 
+// MapCarriedEach is MapCarried for each of ids, by id; an id it drops is
+// missing from the result.
+func MapCarriedEach(ctx context.Context, tx pgx.Tx, target userdata.Target, carried map[string]Carried, ids []string) (map[string]string, error) {
+	out := map[string]string{}
+	for _, id := range ids {
+		local, ok, err := MapCarried(ctx, tx, target, carried, id)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			out[id] = local
+		}
+	}
+	return out, nil
+}
+
 // MapCarried finds the personal collection here that a source collection
 // id names. A collection the document carries maps to the one native
 // collection with its name of its creator's profile here, the collection

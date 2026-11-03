@@ -442,7 +442,7 @@ func (r *accountRestore) importTarget(ctx context.Context, c chosenProfile) (use
 	if a.adminCollections == nil {
 		a.adminCollections = map[string]string{}
 	}
-	target.Collection = newCollectionMap(a.planner(r.tx), r.tx, a.libraryMap(), r.sameServer, a.adminCollections, r.doc).lookup(target)
+	target.Collections = newCollectionMap(a.planner(r.tx), r.tx, a.libraryMap(), r.sameServer, a.adminCollections, r.doc).lookup(target)
 	return target, nil
 }
 

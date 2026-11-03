@@ -146,8 +146,10 @@ func (BackupData) Import(ctx context.Context, tx pgx.Tx, target userdata.Target,
 			res.Updated++
 		}
 	}
+	var series []string
+	var at []time.Time
 	for _, m := range doc.Muted {
-		series, ok, err := target.Items.Resolve(ctx, m.Series)
+		local, ok, err := target.Items.Resolve(ctx, m.Series)
 		if err != nil {
 			return res, err
 		}
@@ -155,17 +157,19 @@ func (BackupData) Import(ctx context.Context, tx pgx.Tx, target userdata.Target,
 			res.LeftOut++
 			continue
 		}
+		series, at = append(series, local), append(at, m.MutedAt)
+	}
+	if len(series) > 0 {
 		tag, err := tx.Exec(ctx, `
-			INSERT INTO profile_series_notification_mutes (user_id, profile_id, series_id, muted_at) VALUES ($1, $2, $3, $4)
-			ON CONFLICT DO NOTHING`, target.UserID, target.ProfileID, series, m.MutedAt)
+			INSERT INTO profile_series_notification_mutes (user_id, profile_id, series_id, muted_at)
+			SELECT $1, $2, u.* FROM unnest($3::text[], $4::timestamptz[]) AS u
+			ON CONFLICT DO NOTHING`, target.UserID, target.ProfileID, series, at)
 		if err != nil {
-			return res, fmt.Errorf("restoring a muted series: %w", err)
+			return res, fmt.Errorf("restoring muted series: %w", err)
 		}
-		if tag.RowsAffected() > 0 {
-			res.Added++
-		} else {
-			res.Unchanged++
-		}
+		added := int(tag.RowsAffected())
+		res.Added += added
+		res.Unchanged += len(series) - added
 	}
 	return res, nil
 }
