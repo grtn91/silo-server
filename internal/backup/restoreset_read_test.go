@@ -327,7 +327,7 @@ func setDocument(index *RestoreSetIndex, entries []testEntry, name string, data 
 // entries lists the first maxUnusableListed and counts the rest in one
 // more, so a preview never builds an item for each.
 func TestUnusableEntriesAreCappedPerSection(t *testing.T) {
-	const bad = 500_000
+	const bad = maxArtworkEntries
 	index, entries := testRestoreSet()
 	setDocument(&index, entries, homeSectionsDocumentName, mustJSON(HomeSectionsDocument{Sections: []HomeSectionEntry{}}), 0)
 	for i := range index.Sections {
@@ -352,6 +352,39 @@ func TestUnusableEntriesAreCappedPerSection(t *testing.T) {
 	last := rs.Unusable[len(rs.Unusable)-1]
 	if listed != maxUnusableListed+1 || last.Label != fmt.Sprintf("%d more entries", bad-maxUnusableListed) {
 		t.Fatalf("listed %d unusable entries, the last %+v; want %d and a count of the rest", listed, last, maxUnusableListed+1)
+	}
+}
+
+// TestValidEntriesAreCappedPerSection: a set of 400,000 valid item
+// artwork entries is refused when read, quickly, rather than previewed as
+// 400,000 items.
+func TestValidEntriesAreCappedPerSection(t *testing.T) {
+	index, entries := testRestoreSet()
+	setDocument(&index, entries, homeSectionsDocumentName, mustJSON(HomeSectionsDocument{Sections: []HomeSectionEntry{}}), 0)
+	for i := range index.Sections {
+		if index.Sections[i].ID == SectionCollections {
+			index.Sections[i].Blobs = []string{}
+		}
+	}
+	entries = slices.DeleteFunc(entries, func(e testEntry) bool { return strings.HasPrefix(e.name, "blobs/collection-images/") })
+	const n = 400_000
+	var doc strings.Builder
+	doc.WriteString(`{"collections":[],"branding":[],"item_artwork":[`)
+	for i := range n {
+		if i > 0 {
+			doc.WriteByte(',')
+		}
+		fmt.Fprintf(&doc, `{"target_type":"movie","content_id":"m%d","image_type":"poster","path":"","source":"","thumbhash":"","title":"","parent_content_id":""}`, i)
+	}
+	doc.WriteString(`]}`)
+	setDocument(&index, entries, collectionsDocumentName, []byte(doc.String()), n)
+	started := time.Now()
+	_, err := ReadRestoreSet(context.Background(), bytes.NewReader(buildTar(t, index, entries)), ReadOptions{})
+	if err == nil || !strings.Contains(err.Error(), "item artwork entries") {
+		t.Fatalf("400,000 artwork entries: %v, want them refused", err)
+	}
+	if elapsed := time.Since(started); elapsed > 10*time.Second {
+		t.Fatalf("refusing took %v", elapsed)
 	}
 }
 

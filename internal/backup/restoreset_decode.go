@@ -38,12 +38,18 @@ func (p *restoreSetParser) decodeSection(si SectionIndex) (int, error) {
 			return 0, requireDocument(spec, ok, err)
 		}
 		n := len(p.rs.Settings.Settings)
+		if err := capEntries("settings", n, maxSettingEntries); err != nil {
+			return 0, err
+		}
 		return n, p.validateSettings()
 	case SectionLibraries:
 		if ok, err := p.document(spec.document, &p.rs.Libraries); err != nil || !ok {
 			return 0, requireDocument(spec, ok, err)
 		}
 		n := len(p.rs.Libraries.Libraries)
+		if err := capEntries("libraries", n, maxLibraryEntries); err != nil {
+			return 0, err
+		}
 		return n, p.validateLibraries()
 	case SectionCollections:
 		if ok, err := p.document(spec.document, &p.rs.Collections); err != nil || !ok {
@@ -51,17 +57,47 @@ func (p *restoreSetParser) decodeSection(si SectionIndex) (int, error) {
 		}
 		d := p.rs.Collections
 		n := len(d.Collections) + len(d.TemplateCollections) + len(d.ItemArtwork) + len(d.Branding)
+		if err := errors.Join(capEntries("collections", len(d.Collections), maxCollectionEntries),
+			capEntries("template collections", len(d.TemplateCollections), maxCollectionEntries),
+			capEntries("item artwork entries", len(d.ItemArtwork), maxArtworkEntries),
+			capEntries("branding assets", len(d.Branding), maxBrandingEntries)); err != nil {
+			return 0, err
+		}
 		return n, p.validateCollections()
 	case SectionHomeSections:
 		if ok, err := p.document(spec.document, &p.rs.HomeSections); err != nil || !ok {
 			return 0, requireDocument(spec, ok, err)
 		}
 		n := len(p.rs.HomeSections.Sections)
+		if err := capEntries("page sections", n, maxSectionEntries); err != nil {
+			return 0, err
+		}
 		return n, p.validateHomeSections()
 	case SectionPlugins:
 		return p.decodePlugins(spec)
 	}
 	return 0, fmt.Errorf("no reader for section %q", si.ID)
+}
+
+// Caps on the entries of one section, at what a large server has: each is
+// an item a preview lists and a restore may write, so a set beyond them is
+// refused rather than previewed.
+const (
+	maxSettingEntries    = 5000
+	maxLibraryEntries    = 1000
+	maxCollectionEntries = 20_000
+	maxArtworkEntries    = 50_000
+	maxBrandingEntries   = 64
+	maxSectionEntries    = 10_000
+	maxPluginEntries     = 500
+)
+
+// capEntries refuses a set with more than max entries of one kind.
+func capEntries(what string, n, maxEntries int) error {
+	if n > maxEntries {
+		return fmt.Errorf("it holds %d %s, more than the %d a restore reads", n, what, maxEntries)
+	}
+	return nil
 }
 
 // UnusableEntry is an entry of a restore set the reader left out.
@@ -468,6 +504,9 @@ func (p *restoreSetParser) itemIDs(spec sectionSpec) []string {
 }
 
 func (p *restoreSetParser) decodePlugins(spec sectionSpec) (int, error) {
+	if err := capEntries("plugins", len(p.itemIDs(spec)), maxPluginEntries); err != nil {
+		return 0, err
+	}
 	for _, id := range p.itemIDs(spec) {
 		var doc PluginDocument
 		docPath := spec.itemDir + id + "/" + pluginDocumentName

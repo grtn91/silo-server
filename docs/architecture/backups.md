@@ -485,7 +485,11 @@ over the collections, template collections, and section-managed collections
 it commits; the rest are left out with `over_restore_budget`, since a
 library's collections are listed whole. The collection editors have no
 per-field limits besides the request body cap, so a restore applies none of
-its own to single fields. A set's collections list at most 1,000,000 items together. The preview
+its own to single fields. A set holds at most 5,000 settings, 1,000 libraries, 500 plugins, 20,000
+collections and as many template collections, 50,000 item artwork entries,
+64 branding assets, and 10,000 page sections, valid or not; a set beyond
+one of them is refused when read, so a preview lists a bounded number of
+items. A set's collections list at most 1,000,000 items together. The preview
 cache charges each set what it holds once read: the bytes read, jsonsize's
 estimate of its decoded documents, and its blob index; and it keeps at most
 one set of a backup this server cannot verify, dropping the older one. A
