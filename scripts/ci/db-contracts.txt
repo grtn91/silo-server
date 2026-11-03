@@ -795,6 +795,7 @@
 ./internal/backup TestUnverifiedRestoreLeavesCostlyWorkOffDB
 ./internal/backup TestUnverifiedSectionCollectionHasNoScheduleDB
 ./internal/backup TestRestoreRefusesCollectionSourcesTheEditorWouldDB
+./internal/backup TestManagedCollectionKeysMapLibrariesDB
 ./internal/api/handlers TestRestoredRateLimitsUseTheirWritePathDB
 ./internal/backup TestIdentityTwinsRestoreOneToOneDB
 ./internal/plugins TestRestoreInstallationDB

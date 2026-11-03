@@ -751,7 +751,11 @@ as an admin save would. Only a collection the section manages stands for the
 carried one: a managed section pointed at an ordinary collection since the
 backup lists "collection replaced", whatever that collection holds, and the
 restore points it back at its managed collection (the one still here with
-its management key, or a new one). A missing one is created, with its backup id when
+its management key, or a new one). The key's section id and each
+`library:<id>` it names are this server's (`remapManagementKey`), and a
+collection here with that key is reused only when its libraries are the
+mapped ones (`collectionScopeIs`); otherwise a new one is created under a
+key of its own. A missing one is created, with its backup id when
 no section here has it. The
 section editor's checks (`SectionHandler.CheckRestoredSection`: type,
 scope, configuration, recipe) run first, the write locks the collections it
