@@ -6,6 +6,7 @@ import (
 
 	"github.com/Silo-Server/silo-server/internal/access"
 	"github.com/Silo-Server/silo-server/internal/requests"
+	"github.com/Silo-Server/silo-server/internal/userstore"
 )
 
 // TestAuthorityComparisonCoversEveryField: every field of the policies an
@@ -85,10 +86,71 @@ func TestAuthorityComparisonCoversEveryField(t *testing.T) {
 			t.Errorf("accountAuthority field %s is not compared: add it to widerThan and here", f.Name)
 		}
 	}
-	profileFields := map[string]bool{"child": true, "ceiling": true, "advisoryAge": true, "requireAdvisoryAge": true, "restricted": true, "libraries": true}
-	for _, f := range reflect.VisibleFields(reflect.TypeFor[profileLimits]()) {
-		if !profileFields[f.Name] {
-			t.Errorf("profileLimits field %s is not compared: add it to looserThan and here", f.Name)
+}
+
+// TestProfileComparisonCoversEveryField: every field of a stored profile is
+// a protection or restriction profileLimits compares, or is named as no
+// authority with why; each, lifted, widens the account.
+func TestProfileComparisonCoversEveryField(t *testing.T) {
+	profileColumns := map[string]string{
+		"PINHash": "pin", "IsPrimary": "primary", "IsChild": "child", "MaxContentRating": "ceiling", "MaxAdvisoryAge": "advisoryAge",
+		"RequireAdvisoryAge": "requireAdvisoryAge", "LibraryRestrictionsEnabled": "restricted", "AllowedLibraryIDs": "libraries",
+		"MaxPlaybackQuality": "quality",
+	}
+	notAuthority := map[string]string{
+		"ID": "identity", "Name": "display", "Avatar": "display", "CreatedAt": "bookkeeping", "UpdatedAt": "bookkeeping",
+		// Verification tokens are bound to it, and a full restore replaces
+		// the signing keys, so no earlier token survives either way.
+		"PINRevision":       "token binding",
+		"QualityPreference": "preference", "Language": "preference", "PreferredMetadataLanguage": "preference",
+		"SubtitleLanguage": "preference", "SubtitleMode": "preference", "AutoSkipIntro": "preference", "AutoSkipCredits": "preference",
+		"AutoSkipRecap": "preference", "AutoPlayNextPreview": "preference", "ShowForcedSubtitles": "preference",
+	}
+	compared := map[string]bool{}
+	for _, f := range reflect.VisibleFields(reflect.TypeFor[userstore.Profile]()) {
+		field, ok := profileColumns[f.Name]
+		if _, why := notAuthority[f.Name]; !ok && !why {
+			t.Errorf("profile field %s is neither compared nor listed as no authority: add it to profileLimits and looserThan, or say why not", f.Name)
 		}
+		compared[field] = ok
+	}
+	for _, f := range reflect.VisibleFields(reflect.TypeFor[profileLimits]()) {
+		if !compared[f.Name] {
+			t.Errorf("profileLimits field %s maps to no profile field", f.Name)
+		}
+	}
+	// Each protection, lifted, widens the account.
+	quality, age := "1080p", 12
+	strict := profileLimits{pin: true, child: true, ceiling: "PG", advisoryAge: &age, requireAdvisoryAge: true, restricted: true,
+		libraries: []int{1}, quality: quality}
+	profileWidenings := map[string]func(*profileLimits){
+		"pin":                func(p *profileLimits) { p.pin = false },
+		"primary":            func(p *profileLimits) { p.primary = true },
+		"child":              func(p *profileLimits) { p.child = false },
+		"ceiling":            func(p *profileLimits) { p.ceiling = "" },
+		"advisoryAge":        func(p *profileLimits) { p.advisoryAge = nil },
+		"requireAdvisoryAge": func(p *profileLimits) { p.requireAdvisoryAge = false },
+		"restricted":         func(p *profileLimits) { p.restricted = false },
+		"libraries":          func(p *profileLimits) { p.libraries = []int{1, 2} },
+		"quality":            func(p *profileLimits) { p.quality = "" },
+	}
+	for _, f := range reflect.VisibleFields(reflect.TypeFor[profileLimits]()) {
+		widen, ok := profileWidenings[f.Name]
+		if !ok {
+			t.Errorf("profileLimits field %s has no widening case", f.Name)
+			continue
+		}
+		loose := strict
+		widen(&loose)
+		if !loose.looserThan(strict) {
+			t.Errorf("looserThan misses a looser %s", f.Name)
+		}
+	}
+	// A household manager without a PIN, where the live one has one, under
+	// another profile id too.
+	live := accountAuthority{profiles: map[string]profileLimits{"a": {primary: true, pin: true}}}
+	restored := accountAuthority{profiles: map[string]profileLimits{"b": {primary: true}}}
+	if !restored.widerThan(live) {
+		t.Error("widerThan misses a primary profile that lost its PIN")
 	}
 }
