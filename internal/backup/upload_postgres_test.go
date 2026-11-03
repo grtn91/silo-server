@@ -312,6 +312,9 @@ func TestUploadRejectsHostileArchivesDB(t *testing.T) {
 		{"newer format", RejectNewerSilo, buildTar(t, newer, entries), ""},
 		{"trailing data", RejectNotRestoreSet, append(buildTar(t, index, entries), bytes.Repeat([]byte{1}, 2<<20)...), ""},
 		{"other bytes than declared", RejectChecksum, buildTar(t, index, entries), strings.Repeat("0", 64)},
+		// Bytes that are no restore set, and not the ones declared: refused
+		// by their digest, before anything decodes them.
+		{"other bytes than declared, not a set", RejectChecksum, bytes.Repeat([]byte("x"), 4096), strings.Repeat("0", 64)},
 	}
 	for _, c := range cases {
 		u, err := svc.CreateUpload(ctx, 0, int64(len(c.data)), c.sha256, MinUploadPartSize)

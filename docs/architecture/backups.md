@@ -529,7 +529,13 @@ digest and discarded, never installed ([Plugins](#plugins)). Readers accept
 every format version up to theirs and refuse a newer one with "This backup is
 from a newer Silo. Upgrade this server first."
 
-**Nothing inside a restore set is decoded before it is verified.** The
+**Nothing inside a restore set is decoded before it is verified,** with
+one exception: an uploaded restore set sent without a SHA-256. One sent
+with a SHA-256 is hashed whole when it completes and decoded only when the
+digest matches; one sent without is decoded unverified, under the reader's
+bounds alone (the tar guard, the entry and size caps, `jsonsize` before
+each document, `DecodeStrict` with `CheckBounds`), and is restorable only
+with the admin's confirmation that it is unauthenticated. The
 manifest records the restore set's digest and the digest of its index
 (`restore_set.index_sha256`), both covered by the manifest's `mac`. For an
 authenticated manifest the reader checks the index against its digest

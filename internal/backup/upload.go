@@ -3,6 +3,8 @@ package backup
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -64,9 +66,10 @@ const (
 	// the sweep deletes it. It exceeds partAttemptLimit, so the sweep never
 	// deletes an object a send can still record.
 	uploadObjectGrace = time.Hour
-	// uploadCheckTimeout bounds a completion's read of the parts, and with
-	// it how long a completion holds the subsystem lock.
-	uploadCheckTimeout = 10 * time.Minute
+	// uploadCheckTimeout bounds a completion's reads of the parts (a hash
+	// pass when a SHA-256 was sent, then the decode), and with them how long
+	// a completion holds the subsystem lock.
+	uploadCheckTimeout = 20 * time.Minute
 	// uploadObjectSweepInterval spaces the sweeps that list the upload
 	// folders on create and list.
 	uploadObjectSweepInterval = 10 * time.Minute
@@ -526,13 +529,22 @@ func (s *Service) recordPart(ctx context.Context, id string, n int, size int64, 
 // it reads every part in order through the restore-set reader, freezes the
 // SHA-256 of the bytes it read, and records what the set says about itself.
 // An upload that is not a restore set this server reads is rejected and its
-// parts deleted. A completed or rejected upload answers as it is.
+// parts deleted. A rejected upload answers as it is, and a completed one too,
+// its retention started again.
 func (s *Service) CompleteUpload(ctx context.Context, id string) (UploadSession, error) {
 	u, err := s.Upload(ctx, id)
 	if err != nil {
 		return UploadSession{}, err
 	}
-	if u.Status == UploadComplete || u.Status == UploadRejected {
+	switch u.Status {
+	case UploadComplete:
+		// Completing again keeps the upload, as a preview or a restore
+		// request does: its 7 days of retention start again.
+		if _, err := s.opts.Pool.Exec(ctx, `UPDATE backup_uploads SET updated_at = now() WHERE id = $1 AND status = 'complete'`, id); err != nil {
+			return UploadSession{}, err
+		}
+		return s.Upload(ctx, id)
+	case UploadRejected:
 		return u, nil
 	}
 	held, err := s.opts.Locker.TryLock(ctx)
@@ -553,9 +565,7 @@ func (s *Service) CompleteUpload(ctx context.Context, id string) (UploadSession,
 	// stalled destination read cannot keep the lock.
 	work, cancelWork := context.WithTimeout(ctx, s.uploadCheckTimeout())
 	defer cancelWork()
-	parts := s.openParts(work, keys)
-	defer func() { _ = parts.Close() }()
-	rs, rejection, err := s.checkUpload(work, parts, u.declaredSHA256)
+	rs, rejection, err := s.checkUploadParts(work, keys, u.declaredSHA256)
 	// Every outcome is written on the lock's own session (held.Exec), so it
 	// fails once the lock is lost: a server that took the lock since may be
 	// checking this upload itself. An upload left checking is recovered by
@@ -683,10 +693,38 @@ func openUploaded(parts *partsReader) *storedReader { return openStored(parts) }
 // checkUpload reads an upload through the restore-set reader. It returns
 // the set, or why the upload is rejected, or an error when the bytes could
 // not be read, which rejects nothing.
+// checkUploadParts checks the upload's parts. When the admin sent a
+// SHA-256, the parts are hashed whole first and compared with it, and only
+// a match is decoded, so nothing of an upload that does not match what was
+// sent is decoded; without one, the set is decoded unverified, under the
+// reader's bounds alone.
+func (s *Service) checkUploadParts(ctx context.Context, keys []string, declared string) (*RestoreSet, *UploadRejection, error) {
+	if declared != "" {
+		parts := s.openParts(ctx, keys)
+		h := sha256.New()
+		_, err := io.Copy(h, parts)
+		_ = parts.Close()
+		switch {
+		case parts.err != nil:
+			return nil, nil, parts.err
+		case err != nil:
+			return nil, nil, err
+		case hex.EncodeToString(h.Sum(nil)) != declared:
+			return nil, &UploadRejection{Reason: RejectChecksum, Message: msgUploadChecksum}, nil
+		}
+	}
+	parts := s.openParts(ctx, keys)
+	defer func() { _ = parts.Close() }()
+	return s.checkUpload(ctx, parts, declared)
+}
+
+// msgUploadChecksum rejects an upload whose bytes are not the ones sent.
+const msgUploadChecksum = "The file that arrived does not match the SHA-256 sent when the upload started."
+
 func (s *Service) checkUpload(ctx context.Context, parts *partsReader, declared string) (*RestoreSet, *UploadRejection, error) {
-	// The admin's upload is checked whole here, its digest compared below
-	// with the one they sent; it is read again, for a preview or a
-	// restore, only with their confirmation (an upload is unauthenticated).
+	// The admin's upload is checked whole here; it is read again, for a
+	// preview or a restore, only with their confirmation (an upload is
+	// unauthenticated).
 	rs, err := readStoredRestoreSet(ctx, openUploaded(parts), ReadOptions{}, "", "")
 	switch {
 	case parts.err != nil:
@@ -698,17 +736,13 @@ func (s *Service) checkUpload(ctx context.Context, parts *partsReader, declared 
 	case err != nil:
 		return nil, &UploadRejection{Reason: RejectNotRestoreSet, Message: truncateRejection(err.Error())}, nil
 	case declared != "" && declared != rs.Digest:
-		return nil, &UploadRejection{Reason: RejectChecksum, Message: "The file that arrived does not match the SHA-256 sent when the upload started."}, nil
+		// Changed between the hash and the read.
+		return nil, &UploadRejection{Reason: RejectChecksum, Message: msgUploadChecksum}, nil
 	}
 	return rs, nil, nil
 }
 
-func truncateRejection(message string) string {
-	if len(message) > maxRejectionMessage {
-		return message[:maxRejectionMessage]
-	}
-	return message
-}
+func truncateRejection(message string) string { return truncateText(message, maxRejectionMessage) }
 
 // rejectUpload records why an upload is unusable and deletes its parts.
 // The row stays until the sweep, so completing it again answers the same.

@@ -3,7 +3,11 @@ import { FileUp, LoaderCircle } from "lucide-react";
 import { useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "react-router";
 
-import { captureProfileRequestContext, type ProfileRequestContextSnapshot } from "@/api/client";
+import {
+  captureProfileRequestContext,
+  StaleApiRequestContextError,
+  type ProfileRequestContextSnapshot,
+} from "@/api/client";
 import { captureAdminAuthority } from "@/api/v2/adminAuthority";
 import {
   completeBackupUpload,
@@ -116,6 +120,14 @@ export function UploadBackupDialog({ open, onOpenChange, maxBytes }: UploadBacku
       });
     } catch (error) {
       if (controller.signal.aborted) return;
+      const failure = error instanceof PartFailedError ? error.failure : error;
+      if (failure instanceof StaleApiRequestContextError) {
+        // Signed out or switched profiles: the parts sent so far are kept,
+        // and "Try again" continues as whoever signs in.
+        const part = error instanceof PartFailedError ? error.part : from;
+        fail({ kind: "signed_out", part, partCount: upload.part_count }, upload, part);
+        return;
+      }
       if (error instanceof PartFailedError && retryable(error.failure))
         fail(
           { kind: "part_failed", part: error.part, partCount: upload.part_count },
@@ -185,6 +197,21 @@ export function UploadBackupDialog({ open, onOpenChange, maxBytes }: UploadBacku
       return;
     }
     await run(upload, 0);
+  };
+
+  /**
+   * Continues the same upload from `from`, as the admin signed in now: the
+   * session it started with may be gone (signed out and in again), and the
+   * parts already sent stay on the server.
+   */
+  const resume = async (upload: AdminBackupUpload, from: number) => {
+    try {
+      authority.current = captureAdminAuthority();
+    } catch {
+      fail({ kind: "signed_out", part: from, partCount: upload.part_count }, upload, from);
+      return;
+    }
+    await run(upload, from);
   };
 
   /** Stops sending and deletes what arrived; the sweep removes it otherwise. */
@@ -323,7 +350,9 @@ export function UploadBackupDialog({ open, onOpenChange, maxBytes }: UploadBacku
             {copy.resumable ? "Cancel" : "Close"}
           </Button>
           {copy.resumable && upload ? (
-            <Button onClick={() => void run(upload, from)}>Try again</Button>
+            <Button onClick={() => void resume(upload, from)}>
+              {phase.failure.kind === "check_failed" ? "Check again" : "Try again"}
+            </Button>
           ) : (
             <Button
               onClick={() => {

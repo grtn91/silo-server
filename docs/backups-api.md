@@ -420,7 +420,12 @@ reading it), `complete`, or `rejected`.
   its end when the client disconnects; `GET /admin/backups/uploads` shows the
   upload `checking` until it does. A check whose server lost the lock before
   writing its outcome answers `409 conflict`, and the upload stays `checking`
-  for the next completion to check again.
+  for the next completion to check again; the upload sweep, under the
+  backup lock, returns one left `checking` for 30 minutes to `uploading`,
+  fully received, and the admin page offers "Check again" for it. With a
+  `sha256`, completion hashes the received file first and decodes nothing
+  of one that does not match. Completing an upload already complete starts
+  its 7 days of retention again.
 - `GET /admin/backups/uploads` answers `{items}`, newest first, after
   deleting uploads unfinished or rejected for 24 hours and complete ones
   unused for 7 days. A complete upload's `expires_at` moves on each
@@ -433,7 +438,13 @@ reading it), `complete`, or `rejected`.
   /admin/backups/uploads/{upload_id}/restore` are the
   [preview](#preview-a-restore-set) and [restore](#restore) of a backup, for
   a complete upload: the same answers, bound to the digest completion
-  froze. `409` for an upload that is not complete. An upload from another
+  froze. `409` for an upload that is not complete. An upload is always
+  unauthenticated (no manifest MAC vouches for it), so both need the admin's
+  confirmation: `accept_unauthenticated=true` (a query parameter on the
+  preview, a body field on the restore); without it they answer `409
+  conflict` as for a backup this server cannot verify, and the admin page
+  sends it only after the admin confirms. The restore leaves out what a
+  restore from an unverified backup leaves out. An upload from another
   server matches accounts by username and email and libraries by folder
   paths, and with another `SECRET_KEY` (`key_matches` false) offers no
   encrypted settings or plugin configuration. The before-restore backup and
