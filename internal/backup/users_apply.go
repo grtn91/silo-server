@@ -190,8 +190,15 @@ func (a *applier) applyAccount(ctx context.Context, tx pgx.Tx, sel UserSelection
 			r.profiles[pp.entry.ID] = pp.localID
 		}
 	}
+	// The backup's primary profile first, so it takes the first free place
+	// under the account's profile limit: an account without one here gets
+	// it before any other (missingPrimary).
+	profiles := slices.Clone(sel.Profiles)
+	slices.SortStableFunc(profiles, func(a, b ProfileSelection) int {
+		return boolRank(isPrimaryIn(doc, b.Profile)) - boolRank(isPrimaryIn(doc, a.Profile))
+	})
 	var chosen []chosenProfile
-	for _, ps := range sel.Profiles {
+	for _, ps := range profiles {
 		c, ok, err := r.choose(ctx, ps)
 		if err != nil {
 			return applied{}, err
@@ -211,6 +218,18 @@ func (a *applier) applyAccount(ctx context.Context, tx pgx.Tx, sel UserSelection
 		item.Notes = append(item.Notes, fmt.Sprintf("%d items are not in this server's catalog and were left out.", len(r.items.unmatched)))
 	}
 	return applied{item: accountOutcome(item, report, r.changed), after: r.itemsChanged()}, nil
+}
+
+// isPrimaryIn reports whether the document's profile id is its primary.
+func isPrimaryIn(doc *UserDocument, id string) bool {
+	return slices.ContainsFunc(doc.Profiles, func(p ProfileEntry) bool { return p.ID == id && p.IsPrimary })
+}
+
+func boolRank(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
 }
 
 // missingPrimary says why sel cannot restore the account, or "": an

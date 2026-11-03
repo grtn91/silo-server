@@ -460,6 +460,31 @@ func (u *userPlanner) planNew(ctx context.Context, plan *accountPlan) error {
 	return nil
 }
 
+// checkPrimaryRoom leaves the account out when it has no primary profile
+// here and no room for the backup's.
+func (u *userPlanner) checkPrimaryRoom(ctx context.Context, plan *accountPlan) error {
+	if !plan.item.Selectable {
+		return nil
+	}
+	for _, pp := range plan.profiles {
+		if !pp.entry.IsPrimary || pp.localID != "" || pp.preview.Reason != ReasonProfileLimit {
+			continue
+		}
+		has := false
+		if plan.localID > 0 {
+			if err := u.q.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM user_profiles WHERE user_id = $1 AND is_primary)`, plan.localID).Scan(&has); err != nil {
+				return fmt.Errorf("checking the account's primary profile: %w", err)
+			}
+		}
+		if !has {
+			plan.item.Selectable, plan.item.Reason = false, ReasonNeedsPrimary
+			plan.item.Message = fmt.Sprintf("The account has no primary profile here and no room for its primary profile, %q: it already has %d profiles, its limit.",
+				pp.entry.Name, plan.profileLimit)
+		}
+	}
+	return nil
+}
+
 // planProfiles matches each profile within the mapped account only.
 func (u *userPlanner) planProfiles(ctx context.Context, plan *accountPlan) error {
 	acct := plan.item.Account
@@ -536,6 +561,12 @@ func (u *userPlanner) planProfiles(ctx context.Context, plan *accountPlan) error
 			pp.preview.Status, pp.preview.Selectable, pp.preview.Reason = ItemNotOnThisServer, false, ReasonProfileLimit
 			pp.preview.Message = fmt.Sprintf("The account already has %d profiles, its limit here.", plan.profileLimit)
 		}
+	}
+	// An account with no primary profile here restores the backup's first,
+	// in the first free place (applyAccount); one with no place for it is
+	// not restored at all (missingPrimary), so say so now.
+	if err := u.checkPrimaryRoom(ctx, plan); err != nil {
+		return err
 	}
 	for _, pp := range plan.profiles {
 		acct.Profiles = append(acct.Profiles, pp.preview)

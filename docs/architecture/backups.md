@@ -1100,7 +1100,9 @@ account here has no primary profile, and a restore never makes another
 profile primary; so an account with none here (a new one, always) that
 restores any profile must restore the backup's primary profile with it,
 or it is left out (`needs_primary_profile`): without one, nothing could
-manage the household. The admin page selects the primary profile, locked,
+manage the household. The primary profile is created first, so it takes
+the first free place under the account's profile limit; an account here
+with no primary and no free place is left out in the preview. The admin page selects the primary profile, locked,
 with any other profile of a new account.
 
 **What a matched account would change.** A preview counts, for each data
