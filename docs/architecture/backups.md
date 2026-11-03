@@ -1578,7 +1578,7 @@ it is written, since other writers share the disk.
 
 **Completion freezes the digest.** It takes the subsystem lock (a busy lock
 answers 409, and the parts stay for another try), moves the session to
-`checking`, publishes the `upload` operation, and, with a 10-minute deadline
+`checking`, publishes the `upload` operation, and, with a 20-minute deadline
 that closes the part being read when it passes (so a stalled read cannot
 keep the lock), reads the parts in order
 through `ReadRestoreSet`, the same checks a backup's restore set gets. The
@@ -1597,6 +1597,14 @@ and refuses bytes with another digest. A set that fails the reader is
 | `newer_silo` | A newer format version |
 | `not_a_restore_set` | Anything else the reader refuses, with its error |
 | `checksum_mismatch` | Other bytes than the SHA-256 declared at creation |
+
+The web admin reads a chosen file's first 512 bytes before it creates an
+upload and refuses only a file that is neither a tar starting with
+`restore-set.json` nor an age file; its picker offers `.tar` and `.age`. An
+age file is uploaded for the server to decide, with the line "Encrypted:
+this server can read it only if it was made with this server's SECRET_KEY."
+shown while it uploads: an age header names no key (a scrypt stanza carries
+a salt and a work factor), so only the server, trying its key, can tell.
 
 A failure to read the destination rejects nothing: the session returns to
 `uploading`, and completing again checks it again. A check does not stop

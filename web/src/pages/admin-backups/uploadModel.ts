@@ -77,6 +77,26 @@ export function sniffRestoreSet(head: Uint8Array): SniffResult {
     : "not_a_restore_set";
 }
 
+/**
+ * Shown while an encrypted file uploads. Only the server can tell whose
+ * SECRET_KEY encrypted it: an age file's header names no key, only a salt.
+ */
+export const ENCRYPTED_NOTICE =
+  "Encrypted: this server can read it only if it was made with this server's SECRET_KEY.";
+
+/**
+ * What the dialog does with a sniffed file before uploading it: refuse what
+ * is not a restore set, and upload the rest. An encrypted file goes to the
+ * server, which reads one made with its own SECRET_KEY and refuses any other
+ * with the decrypt command; the notice says so while it uploads.
+ */
+export function sniffDecision(
+  sniffed: SniffResult,
+): { upload: false } | { upload: true; notice: string | null } {
+  if (sniffed === "not_a_restore_set") return { upload: false };
+  return { upload: true, notice: sniffed === "encrypted" ? ENCRYPTED_NOTICE : null };
+}
+
 /** Why an upload stopped, in the cases the dialog tells apart. */
 export type UploadFailure =
   | { kind: "too_large"; sizeBytes: number; limitBytes: number }

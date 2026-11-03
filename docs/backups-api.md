@@ -478,7 +478,7 @@ reading it), `complete`, or `rejected`.
   minutes.
 - `POST /admin/backups/uploads/{upload_id}/complete` reads every part in
   order through the [restore set checks](architecture/backups.md#restore-set)
-  under the cluster-wide lock, for at most 10 minutes, freezes the SHA-256 of
+  under the cluster-wide lock, for at most 20 minutes (a hash pass when a SHA-256 was declared, then the read), freezes the SHA-256 of
   the bytes it read as `digest` (the file as uploaded, the bytes the client
   sent, whether or not its parts are stored encrypted), and answers `complete` with `source`, or `rejected` with
   `rejection.reason`:
