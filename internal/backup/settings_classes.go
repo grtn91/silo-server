@@ -137,6 +137,14 @@ func isSettingPrefix(entry string) bool {
 	return strings.HasSuffix(entry, ".") || strings.HasSuffix(entry, "_")
 }
 
+// Secret settings of the routes, named once for this package.
+const (
+	settingASRKey             = "ai.asr_api_key"
+	settingSubtitleAIKey      = "subtitle_ai.api_key"
+	settingEmbeddingToken     = "recommendations.embedding_auth_token"
+	settingOpenAIEmbeddingKey = "recommendations.openai_api_key"
+)
+
 // settingRoute is an outside service's address with the secrets this server
 // sends there. A restore never pairs a backup's address with this server's
 // secret: the backup's address could be anyone's.
@@ -158,9 +166,9 @@ type settingRoute struct {
 var settingRoutes = []settingRoute{
 	{endpoint: settingSMTPHost, secrets: []string{settingSMTPPassword}, enabled: settingEmailEnabled, transport: settingSMTPSecurity},
 	{endpoint: settingAIBaseURL, secrets: []string{settingAIKey}},
-	{endpoint: "ai.asr_base_url", secrets: []string{"ai.asr_api_key"}},
-	{endpoint: "subtitle_ai.base_url", secrets: []string{"subtitle_ai.api_key"}},
-	{endpoint: "recommendations.embedding_base_url", secrets: []string{"recommendations.embedding_auth_token", "recommendations.openai_api_key"}},
+	{endpoint: "ai.asr_base_url", secrets: []string{settingASRKey}},
+	{endpoint: "subtitle_ai.base_url", secrets: []string{settingSubtitleAIKey}},
+	{endpoint: "recommendations.embedding_base_url", secrets: []string{settingEmbeddingToken, settingOpenAIEmbeddingKey}},
 }
 
 // keys are every setting of the route.
