@@ -883,6 +883,23 @@ encrypted `server_settings` row this key cannot open and prints their key
 names (never values) for the admin to enter again. Rows are only deleted,
 never renamed: a value is bound to its key name.
 
+### Accounts roll back
+
+A full restore is a rollback of the accounts, by maintainer decision: every
+account, role, and password goes back to the backup's, an admin demoted or a
+password changed since included. Keeping today's accounts beside the backup's
+data would restore neither state, and the backup is the state the operator
+chose. Only what `secretTables` carries and the stricter switches
+(`stricterFlags`) stay the live server's. Before the swap the restore says
+so: "Accounts, roles, and passwords go back to <backup time>", with advice to
+review the admin accounts and reset the passwords that changed since. On the
+deployment the backup came from it prints this only when an account changed
+since the backup, and lists by name (up to 20 per line, then a count) the
+accounts whose role, owner, or break-glass flag changes, whose password
+changes, that were created since and are removed, and that were deleted since
+and come back (`AccountRollback`). Another deployment's backup always gets
+the notice, without the lists: its account ids are other people.
+
 ### Credentials
 
 `secretTables` in `internal/backup/credentials.go` classifies every table

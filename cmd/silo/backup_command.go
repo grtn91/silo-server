@@ -30,7 +30,8 @@ const backupCommandUsage = `usage:
   silo backup restore --from <backup> [--database-only] [--accept-lost-credentials] [--keep-redis] [-env .env]
       Replace the live database (DATABASE_URL) and restore files into the live storage, then
       clear the Redis database Silo uses (FLUSHDB) unless --keep-redis.
-      Stop Silo on every server and turn off automatic restarts first.
+      Stop Silo on every server and turn off automatic restarts first. Accounts, roles, and
+      passwords go back to the backup's; before the swap it names the accounts that change.
   silo backup restore --from <backup> --into <database URL> (--blobs-into <dir> | --database-only)
                       [--accept-lost-credentials] [-env .env]
       Restore into a new, empty database and a separate location; nothing live changes.

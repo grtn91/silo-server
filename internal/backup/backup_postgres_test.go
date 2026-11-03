@@ -432,9 +432,39 @@ func checkCredentials(t *testing.T, loader PGLoader, pool *pgxpool.Pool, dsn, in
 	}
 	checkCarryAuthority(t, loader, pool, dsn, into, restored, userID, keptID, liveKeys)
 	checkCarryInvitation(t, loader, pool, dsn, into, restored, "invite-"+suffix)
+	checkAccountRollback(t, loader, pool, dsn, into, userID, newUser)
 	checkStricterFlags(t, loader, pool, dsn, into, restored, userID)
 	checkStricterSettings(t, loader, pool, dsn, into, restored)
 	checkOtherDeployment(t, loader, pool, dsn, into, restored)
+}
+
+// checkAccountRollback: the restore names the accounts it rolls back, an
+// admin role and a password changed since the backup and an account created
+// since among them. Other tests share the database, so it checks only these.
+func checkAccountRollback(t *testing.T, loader PGLoader, pool *pgxpool.Pool, dsn, into string, userID, newUser int64) {
+	t.Helper()
+	ctx := t.Context()
+	var name, role, hash, created string
+	if err := pool.QueryRow(ctx, `SELECT username, role, COALESCE(password_hash, '') FROM users WHERE id = $1`, userID).Scan(&name, &role, &hash); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_, _ = pool.Exec(context.Background(), `UPDATE users SET role = $2, password_hash = NULLIF($3, '') WHERE id = $1`, userID, role, hash)
+	}()
+	if _, err := pool.Exec(ctx, `UPDATE users SET role = 'admin', password_hash = 'changed-since' WHERE id = $1`, userID); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT username FROM users WHERE id = $1`, newUser).Scan(&created); err != nil {
+		t.Fatal(err)
+	}
+	r, err := loader.AccountRollback(ctx, into, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(r.Authority, name) || !slices.Contains(r.Password, name) || !slices.Contains(r.Lost, created) ||
+		slices.Contains(r.Returned, name) || r.LiveChangedAt.IsZero() {
+		t.Fatalf("rollback %+v, want %s's role and password and %s lost", r, name, created)
+	}
 }
 
 // checkOtherDeployment: the restore reads this server's identity to tell its

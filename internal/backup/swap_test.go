@@ -248,6 +248,9 @@ func (l fakeLoader) RotateSigningSecrets(context.Context, string, *secret.Cipher
 func (l fakeLoader) KeepStricterSettings(context.Context, string, string, *secret.Cipher) ([]string, error) {
 	return nil, nil
 }
+func (l fakeLoader) AccountRollback(context.Context, string, string) (AccountRollback, error) {
+	return AccountRollback{}, nil
+}
 func (l fakeLoader) ServerID(context.Context, string) (string, error) {
 	if l.ctl.liveServerID != "" {
 		return l.ctl.liveServerID, nil
