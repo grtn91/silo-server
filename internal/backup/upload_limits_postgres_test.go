@@ -345,13 +345,13 @@ func TestUploadCompletionDeadlineDB(t *testing.T) {
 		_, err := a.CompleteUpload(ctx, u.ID)
 		done <- err
 	}()
-	<-opened
+	awaitBefore(t, opened, done, "the completion to open a part")
 	dbExec(t, pool, `UPDATE backup_uploads SET updated_at = now() - interval '25 hours' WHERE id = $1`, u.ID)
 	b.sweepUploads(ctx, true, nil)
 	if status := uploadStatus(t, pool, u.ID); status != UploadChecking {
 		t.Fatalf("an upload being checked after the sweep = %s", status)
 	}
-	if err := <-done; err == nil || time.Since(started) > 10*time.Second {
+	if err := await(t, done, "the stalled completion to return"); err == nil || time.Since(started) > 10*time.Second {
 		t.Fatalf("a stalled completion = %v after %v", err, time.Since(started))
 	}
 	if open := dest.openBodies(); open != 0 {
@@ -408,11 +408,11 @@ func TestUploadPartWriteDeadlineDB(t *testing.T) {
 		_, err := a.PutUploadPart(ctx, u.ID, 0, strings.NewReader("0123456789"), 10)
 		first <- err
 	}()
-	<-started
+	awaitBefore(t, started, first, "the first write to start")
 	if _, err := b.PutUploadPart(ctx, u.ID, 0, strings.NewReader("0123456789"), 10); !errors.Is(err, ErrPartBusy) {
 		t.Fatalf("a retry while the first write runs = %v, want ErrPartBusy", err)
 	}
-	if err := <-first; !errors.Is(err, context.DeadlineExceeded) || time.Since(begun) > 10*time.Second {
+	if err := await(t, first, "the stalled write to return"); !errors.Is(err, context.DeadlineExceeded) || time.Since(begun) > 10*time.Second {
 		t.Fatalf("a stalled write = %v after %v, want its deadline", err, time.Since(begun))
 	}
 	if n := countRows(t, pool, `SELECT count(*) FROM backup_upload_attempts`); n != 0 || len(uploadObjects(t, store, u.ID)) != 0 {

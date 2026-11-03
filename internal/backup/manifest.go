@@ -33,6 +33,10 @@ const (
 	// StatusIncomplete: no manifest and nothing running; the sweep deletes it
 	// after 24 hours.
 	StatusIncomplete Status = "incomplete"
+	// StatusUnreadable: the folder has a manifest that could not be read
+	// just now (the destination failed, or the read was cut short). It is
+	// kept, never swept or rotated, until it reads.
+	StatusUnreadable Status = "unreadable"
 	// StatusUnverified: a manifest this server cannot authenticate: written
 	// under another SECRET_KEY or with none recorded, or one naming this key
 	// that does not verify (then nothing in it is shown). A restore from it

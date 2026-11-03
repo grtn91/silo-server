@@ -14383,10 +14383,16 @@ export interface components {
       /** Format: int64 */
       size_bytes: number;
       /**
-       * @description complete: manifest written, checksums recorded, table of contents readable; it does not claim a restore was tested. complete_with_warnings: some referenced files were missing when copied, or the restore set left items out (restore_set_omitted). in_progress: being written now. incomplete: no manifest and nothing running; deleted after 24 hours. unverified: this server cannot authenticate the manifest (another SECRET_KEY, none recorded, or changed since it was written); a restore needs confirmation, and one whose manifest names this key but does not verify shows no details and cannot be restored
+       * @description complete: manifest written, checksums recorded, table of contents readable; it does not claim a restore was tested. complete_with_warnings: some referenced files were missing when copied, or the restore set left items out (restore_set_omitted). in_progress: being written now. incomplete: no manifest and nothing running; deleted after 24 hours. unverified: this server cannot authenticate the manifest (another SECRET_KEY, none recorded, or changed since it was written); a restore needs confirmation, and one whose manifest names this key but does not verify shows no details and cannot be restored. unreadable: its manifest could not be read just now (the destination failed or the read was cut short); it is kept, and neither rotated nor swept, until it reads
        * @enum {string}
        */
-      status: "complete" | "complete_with_warnings" | "in_progress" | "incomplete" | "unverified";
+      status:
+        | "complete"
+        | "complete_with_warnings"
+        | "in_progress"
+        | "incomplete"
+        | "unverified"
+        | "unreadable";
     };
     AdminBackupAcknowledgeKeyBody: {
       /** @description The check value the admin was shown (key_check from the backup list). It must be this server's current one */
@@ -15223,7 +15229,7 @@ export interface components {
     };
     AdminBackupWarning: {
       /**
-       * @description no_recent_backup: no backup completed in 48 hours, at any destination. no_backups_at_destination: backups completed before, but none is at the current destination (it was switched); earlier copies stay where they were written. key_not_confirmed: backups are encrypted (an S3 bucket) and this server's SECRET_KEY was not confirmed, or changed since; encrypted backups and uploads are paused until POST /admin/backups/s3/acknowledge-key
+       * @description no_recent_backup: no backup completed in 48 hours, at any destination. no_backups_at_destination: backups completed before, but none is at the current destination (it was switched); earlier copies stay where they were written. key_not_confirmed: backups are encrypted (an S3 bucket) and this server's SECRET_KEY was not confirmed, or changed since; encrypted backups and uploads are paused until POST /admin/backups/s3/acknowledge-key. backup_unreadable: some backups' manifests could not be read just now
        * @enum {string}
        */
       code:
@@ -15234,7 +15240,8 @@ export interface components {
         | "pg_dump_missing"
         | "pg_dump_too_old"
         | "key_not_confirmed"
-        | "no_backups_at_destination";
+        | "no_backups_at_destination"
+        | "backup_unreadable";
       message: string;
     };
     AdminBrandingAsset: {

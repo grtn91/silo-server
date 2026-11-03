@@ -118,7 +118,7 @@ type AdminBackupOmitted struct {
 type AdminBackup struct {
 	ID           string                   `json:"id" doc:"The backup folder name: UTC start time and kind"`
 	Kind         string                   `json:"kind" enum:"nightly,manual,before-restore"`
-	Status       string                   `json:"status" enum:"complete,complete_with_warnings,in_progress,incomplete,unverified" doc:"complete: manifest written, checksums recorded, table of contents readable; it does not claim a restore was tested. complete_with_warnings: some referenced files were missing when copied, or the restore set left items out (restore_set_omitted). in_progress: being written now. incomplete: no manifest and nothing running; deleted after 24 hours. unverified: this server cannot authenticate the manifest (another SECRET_KEY, none recorded, or changed since it was written); a restore needs confirmation, and one whose manifest names this key but does not verify shows no details and cannot be restored"`
+	Status       string                   `json:"status" enum:"complete,complete_with_warnings,in_progress,incomplete,unverified,unreadable" doc:"complete: manifest written, checksums recorded, table of contents readable; it does not claim a restore was tested. complete_with_warnings: some referenced files were missing when copied, or the restore set left items out (restore_set_omitted). in_progress: being written now. incomplete: no manifest and nothing running; deleted after 24 hours. unverified: this server cannot authenticate the manifest (another SECRET_KEY, none recorded, or changed since it was written); a restore needs confirmation, and one whose manifest names this key but does not verify shows no details and cannot be restored. unreadable: its manifest could not be read just now (the destination failed or the read was cut short); it is kept, and neither rotated nor swept, until it reads"`
 	CreatedAt    Instant                  `json:"created_at"`
 	CompletedAt  *Instant                 `json:"completed_at,omitempty"`
 	SizeBytes    int64                    `json:"size_bytes"`
@@ -157,7 +157,7 @@ type AdminBackupLastRun struct {
 }
 
 type AdminBackupWarning struct {
-	Code    string `json:"code" enum:"disabled,no_recent_backup,destination_unavailable,sqlite_user_store,pg_dump_missing,pg_dump_too_old,key_not_confirmed,no_backups_at_destination" doc:"no_recent_backup: no backup completed in 48 hours, at any destination. no_backups_at_destination: backups completed before, but none is at the current destination (it was switched); earlier copies stay where they were written. key_not_confirmed: backups are encrypted (an S3 bucket) and this server's SECRET_KEY was not confirmed, or changed since; encrypted backups and uploads are paused until POST /admin/backups/s3/acknowledge-key"`
+	Code    string `json:"code" enum:"disabled,no_recent_backup,destination_unavailable,sqlite_user_store,pg_dump_missing,pg_dump_too_old,key_not_confirmed,no_backups_at_destination,backup_unreadable" doc:"no_recent_backup: no backup completed in 48 hours, at any destination. no_backups_at_destination: backups completed before, but none is at the current destination (it was switched); earlier copies stay where they were written. key_not_confirmed: backups are encrypted (an S3 bucket) and this server's SECRET_KEY was not confirmed, or changed since; encrypted backups and uploads are paused until POST /admin/backups/s3/acknowledge-key. backup_unreadable: some backups' manifests could not be read just now"`
 	Message string `json:"message"`
 }
 
