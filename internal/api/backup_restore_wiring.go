@@ -3,6 +3,10 @@ package api
 import (
 	"context"
 	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -24,12 +28,8 @@ import (
 func wireBackupRestore(deps Dependencies, admin *handlers.AdminHandler, libraries *handlers.LibraryHandler, images *handlers.AdminImageHandler, pluginHandler *handlers.PluginHandler,
 	collections *handlers.LibraryCollectionHandler, pageSections *handlers.SectionHandler, rateLimits *handlers.RateLimitHandler) {
 	jobs := adminjob.NewRepository(deps.DB)
-	filesystem := handlers.NewFilesystemHandler()
 	targets := backup.RestoreTargets{
-		CheckFolder: func(ctx context.Context, path string) error {
-			_, err := filesystem.BrowseDirectoryPage(ctx, path, "", "", 1)
-			return err
-		},
+		CheckFolder: func(_ context.Context, path string) error { return checkLibraryFolder(path) },
 		CreateJob: func(ctx context.Context, userID int, req backup.RestoreRequest) (*models.AdminJob, error) {
 			return jobs.Create(ctx, adminjob.CreateJobInput{JobType: adminjob.JobTypeBackupRestore, CreatedByUserID: userID, RequestPayload: req, Message: "Queued restore"})
 		},
@@ -124,4 +124,30 @@ func applyRestoredSettings(ctx context.Context, tx pgx.Tx, admin *handlers.Admin
 			}
 		}
 	}, nil
+}
+
+// checkLibraryFolder reports whether this server can open path as a library
+// folder: an absolute directory it can read. It reads at most one entry,
+// never the whole directory, so a preview's checks cost a few system calls
+// a folder.
+func checkLibraryFolder(path string) error {
+	if !filepath.IsAbs(path) {
+		return errors.New("path must be absolute")
+	}
+	dir, err := os.Open(filepath.Clean(path))
+	if err != nil {
+		return err
+	}
+	defer func() { _ = dir.Close() }()
+	info, err := dir.Stat()
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("%s is not a folder", path)
+	}
+	if _, err := dir.Readdirnames(1); err != nil && !errors.Is(err, io.EOF) {
+		return err
+	}
+	return nil
 }

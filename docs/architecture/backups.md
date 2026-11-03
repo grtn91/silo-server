@@ -665,8 +665,9 @@ A backup library carries its settings, the box set settings among them, its
 folders, and its poster. It matches a library here only by an identical
 folder set. A
 library sharing a folder with another library here cannot be restored, nor
-can one with a folder this server cannot open (checked as the library
-editor's folder browser does). A restored library gets a new id, reserved
+can one with a folder this server cannot open (an absolute directory it
+can read, checked by opening it and reading at most one entry). A library
+entry lists at most 64 folders, none twice. A restored library gets a new id, reserved
 before its transaction so its poster is written under
 `library-posters/<new id>` first; after commit the library editor's
 follow-ups run: sections, provider chain, monitoring, and the first scan
@@ -795,7 +796,10 @@ twice reports what already committed as `unchanged`.
 `interrupted`, keeping the report of what committed. The stale updater waits
 on the row lock an item holds, so it cannot mark the job between an item's
 check and its commit, and a slow original worker's next item finds the job no
-longer running under its claim and writes nothing. Running the same restore
+longer running under its claim and writes nothing. An item's commit writes
+its heartbeat at `clock_timestamp()`, the commit's time: `NOW()` is the
+transaction's start, which an item longer than the stale window would leave
+already stale for the updater waiting behind it. Running the same restore
 again is safe.
 
 ### Blobs a restore writes

@@ -75,6 +75,11 @@ func TestBackupRestoreFencingDB(t *testing.T) {
 		t.Fatalf("after a committed item the job is %+v, %v; want still running", current, err)
 	}
 
+	// An item that outlasts the stale window: its commit writes the
+	// heartbeat at the commit's time, not its transaction's start, so the
+	// recovery waiting behind it does not find the job stale.
+	checkLongItem(t, r, worker, job.ID)
+
 	// A worker that stopped heartbeating is interrupted, not requeued.
 	makeStale()
 	if _, err := r.RequeueStaleRunning(ctx, staleBefore()); err != nil {
@@ -98,5 +103,55 @@ func TestBackupRestoreFencingDB(t *testing.T) {
 	})
 	if !errors.Is(err, ErrJobNotFound) || called {
 		t.Fatalf("fenced write after interruption = %v (ran %v), want ErrJobNotFound without running", err, called)
+	}
+}
+
+// checkLongItem runs an item that holds the job row past a stale window
+// that starts after the item did, with recovery waiting on its row lock.
+func checkLongItem(t *testing.T, r *Repository, worker *Repository, id string) {
+	t.Helper()
+	ctx := t.Context()
+	locked, release := make(chan struct{}), make(chan struct{})
+	fenced := make(chan error, 1)
+	go func() {
+		fenced <- worker.RunFenced(ctx, id, func(pgx.Tx) (FencedUpdate, error) {
+			close(locked)
+			<-release
+			return FencedUpdate{Result: map[string]int{"items": 1}, Current: 1, Total: 2, Message: "item 1, again"}, nil
+		})
+	}()
+	<-locked
+	// Anything older than now is stale: the item's transaction began
+	// before it.
+	var window time.Time
+	if err := r.pool.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&window); err != nil {
+		t.Fatal(err)
+	}
+	recovered := make(chan error, 1)
+	go func() {
+		_, err := r.RequeueStaleRunning(context.Background(), window)
+		recovered <- err
+	}()
+	for waiting := 0; waiting == 0; {
+		if err := r.pool.QueryRow(ctx, `SELECT count(*) FROM pg_stat_activity
+			WHERE wait_event_type = 'Lock' AND query LIKE '%UPDATE admin_jobs%'`).Scan(&waiting); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case err := <-recovered:
+			t.Fatalf("stale recovery did not wait for the item's row lock: %v", err)
+		default:
+		}
+	}
+	close(release)
+	if err := <-fenced; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-recovered; err != nil {
+		t.Fatal(err)
+	}
+	current, err := r.GetByID(ctx, id)
+	if err != nil || current.Status != StatusRunning || current.Message != "item 1, again" {
+		t.Fatalf("after an item longer than the stale window the job is %+v, %v; want still running", current, err)
 	}
 }

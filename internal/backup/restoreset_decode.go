@@ -216,13 +216,26 @@ func libraryProblem(l LibraryEntry) string {
 	if entryTooLarge(l) {
 		return msgEntryTooLarge
 	}
+	if len(l.Paths) > maxLibraryFolders {
+		return fmt.Sprintf("It has more than %d folders.", maxLibraryFolders)
+	}
+	seen := make(map[string]bool, len(l.Paths))
 	for _, folder := range l.Paths {
 		if !filepath.IsAbs(folder) || filepath.Clean(folder) != folder {
 			return "A folder is not a clean absolute path."
 		}
+		if seen[folder] {
+			return "A folder is listed twice."
+		}
+		seen[folder] = true
 	}
 	return ""
 }
+
+// maxLibraryFolders bounds a restored library's folders, each of which a
+// preview checks on this server's disk. The library editor sets no limit;
+// a library has a handful.
+const maxLibraryFolders = 64
 
 func (p *restoreSetParser) validateCollections() error {
 	d := &p.rs.Collections
