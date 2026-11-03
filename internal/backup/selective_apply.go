@@ -538,12 +538,19 @@ func (a *applier) applyLibrary(ctx context.Context, tx pgx.Tx, id string) (appli
 	input := libraryInput(e)
 	input.ID, input.PosterPath = newID, poster
 	input.RealtimeMonitoring, input.CollectionUngroupedSortOrder = &realtime, &ungrouped
+	costly := costlyLibraryOptions(e)
+	if a.rs.unverified {
+		input = withoutCostlyOptions(input)
+	}
 	folder, err := catalog.CreateFolderInTx(ctx, tx, input)
 	if err != nil {
 		return applied{}, err
 	}
 	item.Outcome = OutcomeRestored
 	item.Message = "Created; its first scan is queued."
+	if a.rs.unverified && len(costly) > 0 {
+		item.Notes = append(item.Notes, "Created with "+joinLabels(costly)+" off: they are not restored from a backup this server cannot verify.")
+	}
 	// The editor's follow-ups run after commit; the rows record that they
 	// are owed, so a crash before they finish leaves them for the next run.
 	// Its default sections wait for the end of the restore, which may

@@ -605,7 +605,14 @@ grouped by the admin page that edits each key: a key or prefix with its class.
 - A backup this server cannot authenticate restores no setting that
   connects to an outside service (class `external_service`) and no plugin
   configuration, whatever the admin confirmed: the preview marks them
-  `unverified_backup`.
+  `unverified_backup`. Nor does it turn on work that sends library data to
+  outside services or runs for hours: a new library is created with AI
+  translation of metadata, trickplay previews, intro detection, chapter
+  thumbnails, and box sets off (`costlyLibraryOptions`), a new admin
+  collection without its sync schedule, and a template collection keeps
+  this server's source and sync schedule. The preview says what is left
+  off; for a verified backup it names the library options the restore
+  turns on.
 
 A key the table does not match is never offered. `TestEverySettingIsClassified`
 fails for any admin setting default, sensitive setting, or branding asset key

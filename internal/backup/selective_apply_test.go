@@ -22,6 +22,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/Silo-Server/silo-server/internal/blobstore"
+	"github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/config"
 	"github.com/Silo-Server/silo-server/internal/imageutil"
 	"github.com/Silo-Server/silo-server/internal/models"
@@ -478,5 +479,25 @@ func TestRestoreJobWaitsForTheRequestThatQueuedIt(t *testing.T) {
 	}
 	if _, err := lockWithin(t.Context(), busyLocker{free: make(chan struct{})}, 0); !errors.Is(err, ErrBusy) {
 		t.Fatalf("lock held past the wait: %v, want ErrBusy", err)
+	}
+}
+
+// TestUnverifiedTemplateWithholdsSourceAndSchedule: from a backup this
+// server cannot verify, a template collection's changed source and sync
+// schedule are withheld, not written, since either makes it fetch from
+// outside services; the other changes still apply.
+func TestUnverifiedTemplateWithholdsSourceAndSchedule(t *testing.T) {
+	daily := "0 3 * * *"
+	entry := TemplateCollectionEntry{Title: "Mine", SourceURL: "https://lists.example.test/1", SourceConfig: json.RawMessage(`{"list":"1"}`),
+		SyncSchedule: &daily}
+	def := catalog.CreateLibraryCollectionInput{Title: "Popular"}
+	trusted := customizeTemplate(entry, def, nil, nil, true)
+	if !slices.Equal(trusted.changes, []string{"title", "source", "sync schedule"}) || len(trusted.withheld) != 0 || trusted.update.SyncSchedule == nil {
+		t.Fatalf("verified = %+v", trusted)
+	}
+	untrusted := customizeTemplate(entry, def, nil, nil, false)
+	if !slices.Equal(untrusted.changes, []string{"title"}) || !slices.Equal(untrusted.withheld, []string{"source", "sync schedule"}) ||
+		untrusted.update.SourceURL != nil || untrusted.update.SyncSchedule != nil || untrusted.update.SourceConfig != nil {
+		t.Fatalf("unverified = %+v, want the source and schedule withheld", untrusted)
 	}
 }

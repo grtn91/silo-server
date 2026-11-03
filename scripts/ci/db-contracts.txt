@@ -792,6 +792,7 @@
 ./internal/backup TestRestoredLibrarySectionsWaitForTheRestoreDB
 ./internal/backup TestManagedSectionPointedElsewhereIsRestoredDB
 ./internal/backup TestSelectiveRestoreOnOneConnectionDB
+./internal/backup TestUnverifiedRestoreLeavesCostlyWorkOffDB
 ./internal/api/handlers TestRestoredRateLimitsUseTheirWritePathDB
 ./internal/backup TestIdentityTwinsRestoreOneToOneDB
 ./internal/plugins TestRestoreInstallationDB
