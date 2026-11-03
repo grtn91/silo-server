@@ -498,6 +498,7 @@ func checkCredentials(t *testing.T, loader PGLoader, pool *pgxpool.Pool, dsn, in
 	checkOutboundConnections(t, loader, pool, dsn, into, restored, userID)
 	checkInterruptedWork(t, loader, pool, dsn, into, restored, userID)
 	checkOutboundSettings(t, loader, pool, dsn, into, restored)
+	checkLiveReleasesAndNodes(t, loader, pool, dsn, into, restored)
 	checkAccountRollback(t, loader, pool, dsn, into, userID, newUser)
 	checkStricterFlags(t, loader, pool, dsn, into, restored, userID)
 	checkStricterSettings(t, loader, pool, dsn, into, restored)
@@ -669,6 +670,66 @@ func checkStricterFlags(t *testing.T, loader PGLoader, pool *pgxpool.Pool, dsn, 
 		if !slices.Contains(carried.Stricter, want) {
 			t.Fatalf("reported %v, want %q", carried.Stricter, want)
 		}
+	}
+}
+
+// checkLiveReleasesAndNodes: what the server launches or routes clients
+// through is the live server's. A plugin both have runs the live release,
+// archive and capabilities included; one whose id is another plugin here
+// comes back off and is reported; a stream node removed since the backup
+// stays removed.
+func checkLiveReleasesAndNodes(t *testing.T, loader PGLoader, pool *pgxpool.Pool, dsn, into string, restored *pgxpool.Pool) {
+	t.Helper()
+	ctx := t.Context()
+	exec := func(db *pgxpool.Pool, sql string, args ...any) {
+		t.Helper()
+		if _, err := db.Exec(ctx, sql, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	base, err := strconv.ParseInt(randomHex(t, 3), 16, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	same, other := 700_000_000+base, 710_000_000+base
+	install := func(db *pgxpool.Pool, id int64, plugin, version, checksum string) {
+		t.Helper()
+		exec(db, `INSERT INTO plugin_installations (id, plugin_id, version, install_path, enabled) VALUES ($1, $2, $3, '/plugins/'||$3, true)`, id, plugin, version)
+		exec(db, `INSERT INTO plugin_archives (plugin_installation_id, manifest_json, checksum, archive_bytes) VALUES ($1, '\x7b7d', $2, '\x00')`, id, checksum)
+		exec(db, `INSERT INTO plugin_capabilities (plugin_installation_id, capability_type, capability_id, metadata) VALUES ($1, 'metadata', $2, '{}')`, id, version)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), `DELETE FROM plugin_installations WHERE id = ANY($1)`, []int64{same, other})
+		_, _ = pool.Exec(context.Background(), `DELETE FROM stream_nodes WHERE name = ANY($1)`, []string{"live-node", "removed-node"})
+	})
+	install(pool, same, "release-plugin", "2.0.0", "live")
+	install(restored, same, "release-plugin", "1.0.0", "backup")
+	install(pool, other, "live-plugin", "1.0.0", "live")
+	install(restored, other, "backup-plugin", "1.0.0", "backup")
+	off, err := loader.CarryPluginReleases(ctx, into, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var version, checksum, capability string
+	var enabled bool
+	if err := restored.QueryRow(ctx, `SELECT i.version, a.checksum, c.capability_id FROM plugin_installations i
+		JOIN plugin_archives a ON a.plugin_installation_id = i.id JOIN plugin_capabilities c ON c.plugin_installation_id = i.id
+		WHERE i.id = $1`, same).Scan(&version, &checksum, &capability); err != nil || version != "2.0.0" || checksum != "live" || capability != "2.0.0" {
+		t.Fatalf("a plugin both have runs %s %s %s (%v), want the live release", version, checksum, capability, err)
+	}
+	if err := restored.QueryRow(ctx, `SELECT enabled FROM plugin_installations WHERE id = $1`, other).Scan(&enabled); err != nil || enabled ||
+		!slices.ContainsFunc(off, func(s string) bool { return strings.Contains(s, "backup-plugin") }) {
+		t.Fatalf("an installation of another plugin here: enabled %v (%v), reported %v; want it off and reported", enabled, err, off)
+	}
+	exec(pool, `INSERT INTO stream_nodes (name, type, url, enabled) VALUES ('live-node', 'transcode', 'http://live.invalid', true)`)
+	exec(restored, `INSERT INTO stream_nodes (name, type, url, enabled) VALUES ('removed-node', 'transcode', 'http://removed.invalid', true)`)
+	if _, err := loader.CarryCredentials(ctx, into, dsn); err != nil {
+		t.Fatal(err)
+	}
+	var removed, liveNodes int
+	if err := restored.QueryRow(ctx, `SELECT count(*) FILTER (WHERE name = 'removed-node'), count(*) FILTER (WHERE name = 'live-node') FROM stream_nodes`).Scan(&removed, &liveNodes); err != nil ||
+		removed != 0 || liveNodes != 1 {
+		t.Fatalf("stream nodes: %d removed since, %d live (%v); want the live set", removed, liveNodes, err)
 	}
 }
 
