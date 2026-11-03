@@ -913,7 +913,9 @@ Every mode first validates: the manifest is present and complete (exactly
 each with a size and SHA-256; exactly the core
 inventory tables, each present with a count or absent; a kind matching the
 id; a valid server id), `db.dump` and `blobs.tar` match their checksums,
-`blobs.tar` holds the manifest's file count, every entry is a regular file
+`blobs.tar` holds the manifest's file count (each header checked before
+`tar.Reader` expands it, `tarGuard`: only regular files and PAX records of at
+most 8 KiB, so no sparse map or long-name record is expanded), every entry is a regular file
 in its store's backup namespaces, and no two entries land on the same object
 (stores that share one root count as one place), the backup's goose version
 is not newer than this binary's newest migration, the backup applied no
@@ -1105,11 +1107,16 @@ neither list.
   caps, profiles, downloads, requests, permissions, with access groups
   applied), or, for a profile both sides have, a restriction lifted or
   loosened (child profile, rating or advisory-age ceiling, library
-  restriction). Changing an account's role deletes its keys for the same
-  reason. An invitation or invite code is also dropped when the account it
+  restriction), or a looser request policy (requests at all, without
+  limit, more titles or over a shorter window, or with automatic approval,
+  as `requests.LayeredPolicy` resolves it from the server's, the access
+  group's, and the account's limits). Changing an account's role deletes
+  its keys for the same reason. `TestAuthorityComparisonCoversEveryField`
+  fails on a field of these policies the comparison does not cover. An invitation or invite code is also dropped when the account it
   would create gets a wider effective policy under the restored data than
   live: its role and libraries applied to its access group, or the default
-  group when it names none, as account creation resolves them. A sign-in
+  group when it names none, as account creation resolves them, and the
+  request policy that group gives a new account. A sign-in
   provider that creates accounts on first sign-in (`auto_provision`) is
   compared the same way, for the user it would create in the default group;
   where that is wider it is carried with account creation off, so people
