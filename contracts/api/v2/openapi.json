@@ -4237,7 +4237,8 @@
               "files_missing_here",
               "needs_install",
               "kept_stricter",
-              "unverified_backup"
+              "unverified_backup",
+              "over_restore_budget"
             ],
             "type": "string"
           },
@@ -4751,7 +4752,8 @@
               "files_missing_here",
               "needs_install",
               "kept_stricter",
-              "unverified_backup"
+              "unverified_backup",
+              "over_restore_budget"
             ],
             "type": "string"
           },

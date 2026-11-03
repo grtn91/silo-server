@@ -238,6 +238,10 @@ type applier struct {
 	// objects, or why it could not; an item it did not write is absent,
 	// and applyArtwork never publishes one.
 	staged map[string]error
+	// collectionBytes and libraryCollectionBytes are the collection
+	// metadata committed items wrote (overCollectionBudget).
+	collectionBytes        int64
+	libraryCollectionBytes map[int]int64
 	// filesWritten marks the artwork items stageArtwork wrote missing files
 	// back for: the catalog already showed them, so their transaction
 	// finds them the same and has nothing more to do.
@@ -250,6 +254,9 @@ type applied struct {
 	after func(context.Context)
 	// mapLibrary records a backup library id and the library it became.
 	mapLibrary [2]int
+	// metadata is the collection metadata the item wrote, charged to the
+	// restore's budget once it commits (overCollectionBudget).
+	metadata collectionCharge
 }
 
 func (a *applier) clone() *SelectiveReport {
@@ -310,6 +317,7 @@ func (a *applier) apply(ctx context.Context, section, id string) error {
 	if err != nil {
 		return err
 	}
+	a.charge(result.metadata)
 	if result.after != nil {
 		result.after(ctx)
 	}
@@ -701,8 +709,21 @@ func (a *applier) applyCollection(ctx context.Context, tx pgx.Tx, id string) (ap
 	if unknown := plan.item.Collection.UnknownItems; unknown > 0 {
 		item.Notes = append(item.Notes, fmt.Sprintf("%d of its items are not in this server's catalog and were left out.", unknown))
 	}
+	charge := collectionCharge{library: libMap[c.LibraryID], bytes: collectionCost(*c)}
+	if over, ok := a.overCollectionBudget(item, charge); ok {
+		return over, nil
+	}
+	result, err := a.writeCollection(ctx, tx, id, plan, *c, libMap, item)
+	if result.item.Outcome == OutcomeRestored {
+		result.metadata = charge
+	}
+	return result, err
+}
+
+// writeCollection creates the collection or restores it onto the one here.
+func (a *applier) writeCollection(ctx context.Context, tx pgx.Tx, id string, plan collectionPlan, c CollectionEntry, libMap map[int]int, item ReportItem) (applied, error) {
 	if plan.localID != "" {
-		return a.restoreOntoCollection(ctx, tx, id, plan, *c, libMap, item)
+		return a.restoreOntoCollection(ctx, tx, id, plan, c, libMap, item)
 	}
 
 	// A smart query or a sync source names libraries too; one that would
@@ -744,7 +765,7 @@ func (a *applier) applyCollection(ctx context.Context, tx pgx.Tx, id string) (ap
 	if _, err := catalog.AddMissingItemsInTx(ctx, tx, newID, plan.missing); err != nil {
 		return applied{}, err
 	}
-	if _, err := restoreGroups(ctx, tx, newID, *c, libMap); err != nil {
+	if _, err := restoreGroups(ctx, tx, newID, c, libMap); err != nil {
 		return applied{}, err
 	}
 	a.claim(claimCollection, newID, id)
@@ -911,4 +932,82 @@ func groupSortMode(mode string) string {
 		return mode
 	}
 	return "manual"
+}
+
+// Budgets for the collection metadata (everything but item lists) one
+// restore writes, in all and into one library: an entry may hold up to
+// maxRestoredEntryBytes, and a library's collections are listed whole.
+const (
+	maxRestoreCollectionMetadata = 16 << 20
+	maxLibraryCollectionMetadata = 8 << 20
+)
+
+// collectionCharge is the collection metadata one item writes into one
+// library here.
+type collectionCharge struct {
+	library int
+	bytes   int64
+}
+
+// collectionCost is the encoded size of a collection entry without its
+// item list.
+func collectionCost(v any) int64 {
+	if c, ok := v.(CollectionEntry); ok {
+		c.Items = nil
+		v = c
+	}
+	data, err := json.Marshal(v)
+	if err != nil {
+		return maxRestoreCollectionMetadata
+	}
+	return int64(len(data))
+}
+
+// overCollectionBudget leaves an item out when its metadata would take the
+// restore, or its library, past the collection metadata budget.
+func (a *applier) overCollectionBudget(item ReportItem, c collectionCharge) (applied, bool) {
+	if a.collectionBytes+c.bytes <= maxRestoreCollectionMetadata && a.libraryCollectionBytes[c.library]+c.bytes <= maxLibraryCollectionMetadata {
+		return applied{}, false
+	}
+	return leftOut(item, ReasonOverRestoreBudget, "This restore already wrote as much collection metadata as one restore may, in all or into its library. Restore it on its own."), true
+}
+
+// charge adds a committed item's collection metadata to the budget.
+func (a *applier) charge(c collectionCharge) {
+	if c.bytes == 0 {
+		return
+	}
+	if a.libraryCollectionBytes == nil {
+		a.libraryCollectionBytes = map[int]int64{}
+	}
+	a.collectionBytes += c.bytes
+	a.libraryCollectionBytes[c.library] += c.bytes
+}
+
+// withCollectionBudget runs write for a template collection or a section
+// that carries a collection, charging its collection metadata as
+// applyCollection does; anything else runs as it is.
+func (a *applier) withCollectionBudget(id string, write func(context.Context, pgx.Tx, string) (applied, error)) func(context.Context, pgx.Tx) (applied, error) {
+	return func(ctx context.Context, tx pgx.Tx) (applied, error) {
+		var charge collectionCharge
+		item := ReportItem{Label: id}
+		libMap := a.libraryMap()
+		if t := indexed(a.rs.Collections.TemplateCollections, a.rs.lookup().templates, id); t != nil {
+			item.Kind, item.Label = KindTemplateCollection, t.Title
+			charge = collectionCharge{library: libMap[t.LibraryID], bytes: collectionCost(*t)}
+		} else if e := indexed(a.rs.HomeSections.Sections, a.rs.lookup().sections, id); e != nil && e.Collection != nil {
+			item.Kind, item.Label = KindHomeSection, e.Title
+			charge = collectionCharge{library: libMap[e.Collection.LibraryID], bytes: collectionCost(e.Collection.CollectionEntry)}
+		}
+		if charge.bytes > 0 {
+			if over, ok := a.overCollectionBudget(item, charge); ok {
+				return over, nil
+			}
+		}
+		result, err := write(ctx, tx, id)
+		if result.item.Outcome == OutcomeRestored {
+			result.metadata = charge
+		}
+		return result, err
+	}
 }

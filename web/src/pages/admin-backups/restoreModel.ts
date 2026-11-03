@@ -56,6 +56,8 @@ export const REASON_SENTENCES: Record<RestoreReason, string> = {
     "Its settings that differ would widen access, so this server keeps its stricter current values.",
   unverified_backup:
     "It connects to outside services, so it isn't restored from a backup this server can't verify.",
+  over_restore_budget:
+    "This restore already wrote as much collection detail as one restore may. Restore it on its own.",
 };
 
 export const SECTION_TITLES: Record<RestoreSectionId, string> = {

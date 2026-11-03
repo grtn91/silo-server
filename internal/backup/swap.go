@@ -260,7 +260,9 @@ func lockLive(ctx context.Context, ctl ControlDB, liveURL string) (string, func(
 
 // carryLiveState says which accounts the restore rolls back to the backup's
 // (taken), carries the live server's credentials into the restored
-// database, and keeps its stricter access settings and security switches.
+// database, ends the backup's unfinished work with the live storage
+// transition (interruptWork), and keeps its stricter access settings and
+// security switches.
 // They are as they will be at the swap only while no other client is on the
 // live database: one that connected since preflight stops the restore here,
 // and the swap checks again once the live database is closed (swap.run).
@@ -279,6 +281,9 @@ func carryLiveState(ctx context.Context, ctl ControlDB, live string, loader Data
 		carryFrom = ""
 	}
 	if err := carryCredentials(ctx, loader, restoredURL, carryFrom, out); err != nil {
+		return err
+	}
+	if err := interruptWork(ctx, loader, restoredURL, opts.LiveURL, out); err != nil {
 		return err
 	}
 	return keepStricterSettings(ctx, loader, restoredURL, opts.LiveURL, opts.Cipher, out)

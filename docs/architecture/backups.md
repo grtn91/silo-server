@@ -486,7 +486,13 @@ a branding asset, a page section, and each account's profiles) is left out
 as unusable when it encodes to more than 1 MiB, the v2 API's request body
 cap (`maxRestoredEntryBytes`), and a stored thumbhash is the one computed
 from the restored image (item artwork) or one of thumbhash form, never
-anything else. A set lists at most the first 100 entries of a section it
+anything else. A selective restore also writes at most 16 MiB of collection metadata
+(every field but the item list) in all and 8 MiB into one library, counted
+over the collections, template collections, and section-managed collections
+it commits; the rest are left out with `over_restore_budget`, since a
+library's collections are listed whole. The collection editors have no
+per-field limits besides the request body cap, so a restore applies none of
+its own to single fields. A set lists at most the first 100 entries of a section it
 leaves out, and one more entry counting the rest, so a preview of a set of
 malformed entries stays small. A plugin archive is checked against its
 digest and discarded, never installed ([Plugins](#plugins)). Readers accept
@@ -1207,6 +1213,22 @@ after verification such a restore deletes, in the restored database, every
 encrypted `server_settings` row this key cannot open and prints their key
 names (never values) for the admin to enter again. Rows are only deleted,
 never renamed: a value is bound to its key name.
+
+### Interrupted work
+
+Nothing the backup had queued or running runs by itself after a full
+restore (either mode). In the restored database, before Silo starts on it,
+`InterruptWork` cancels admin jobs of every kind (backups, restores,
+imports, storage transitions, scans, exports), history import runs, and scan
+runs that were queued or running; fails running collection syncs and pending
+or retrying deliveries to notification destinations (push, webhooks, browser
+push); and clears storage transition checkpoints and cursors, all with the
+reason "interrupted by restore". Finished rows stay as history. The storage
+transition target (`storage.transition.target`) is the live server's, or
+none for separate mode or when the live server has none, so a transition
+canceled since the backup stays canceled and a staged target is never
+revived. Leases and claims in other queues (match queues, enrichment and
+trickplay state) are local work a server reclaims when they expire.
 
 ### Accounts roll back
 

@@ -421,3 +421,25 @@ func TestRetryableItemError(t *testing.T) {
 		}
 	}
 }
+
+// TestCollectionMetadataBudget: once a restore's committed collections
+// reach its budget, in all or in one library, the next is left out with
+// its reason; another library still has room until the total is reached.
+func TestCollectionMetadataBudget(t *testing.T) {
+	a := &applier{}
+	big := collectionCharge{library: 1, bytes: maxLibraryCollectionMetadata - 10}
+	if _, over := a.overCollectionBudget(ReportItem{}, big); over {
+		t.Fatal("the first collection is over the budget")
+	}
+	a.charge(big)
+	if got, over := a.overCollectionBudget(ReportItem{}, collectionCharge{library: 1, bytes: 11}); !over || got.item.Reason != ReasonOverRestoreBudget {
+		t.Fatalf("over the library's budget = %+v, %v", got.item, over)
+	}
+	if _, over := a.overCollectionBudget(ReportItem{}, collectionCharge{library: 2, bytes: 11}); over {
+		t.Fatal("another library has room")
+	}
+	a.charge(collectionCharge{library: 2, bytes: maxRestoreCollectionMetadata - maxLibraryCollectionMetadata})
+	if _, over := a.overCollectionBudget(ReportItem{}, collectionCharge{library: 3, bytes: 11}); !over {
+		t.Fatal("the restore's total budget is spent")
+	}
+}
