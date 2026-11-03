@@ -937,7 +937,9 @@ inventory tables, each present with a count or absent; a kind matching the
 id; a valid server id), `db.dump` and `blobs.tar` match their checksums,
 `blobs.tar` holds the manifest's file count (each header checked before
 `tar.Reader` expands it, `tarGuard`: only regular files and PAX records of at
-most 8 KiB, so no sparse map or long-name record is expanded), every entry is a regular file
+most 8 KiB holding only the keys the writer emits (`path`, `size`, `mtime`),
+each once, so no sparse map or long-name record is expanded, and every entry
+`tar.Reader` returns must have the size the guard let its data run for), every entry is a regular file
 in its store's backup namespaces, and no two entries land on the same object
 (stores that share one root count as one place), the backup's goose version
 is not newer than this binary's newest migration, the backup applied no

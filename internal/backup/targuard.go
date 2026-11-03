@@ -33,8 +33,11 @@ type tarGuard struct {
 	pending   []byte
 	remaining int64
 	ended     bool
-	// sizeOverride is the size a PAX record gave the next entry.
+	// sizeOverride is the size a PAX record gave the next entry; entrySize
+	// the size the guard let the last entry's data run for, which
+	// tar.Reader must agree with (checkEntry).
 	sizeOverride int64
+	entrySize    int64
 }
 
 func newTarGuard(r io.Reader) *tarGuard { return &tarGuard{r: r, sizeOverride: -1} }
@@ -87,32 +90,54 @@ func (g *tarGuard) Read(p []byte) (int, error) {
 		size = g.sizeOverride
 	}
 	g.sizeOverride = -1
-	g.pending, g.remaining = block, (size+511)/512*512
+	g.pending, g.remaining, g.entrySize = block, (size+511)/512*512, size
 	return g.Read(p)
 }
 
-// paxSize finds the size a PAX record sets, or -1 for none.
+// checkEntry requires the entry tar.Reader's Next returned to have the
+// size the guard let its data run for: were they to differ, the reader
+// would take what the guard passed as data for headers it never checked.
+func (g *tarGuard) checkEntry(size int64) error {
+	if size != g.entrySize {
+		return fmt.Errorf("%w: its size reads as %d bytes, not %d", errTarShape, size, g.entrySize)
+	}
+	return nil
+}
+
+// paxKeys are the PAX records the writer emits for a regular file (Go's
+// archive/tar writer in PAX format): a long or non-ASCII name, a size its
+// header cannot hold, and a precise modification time.
+var paxKeys = map[string]bool{"path": true, "size": true, "mtime": true}
+
+// paxSize finds the size a PAX record sets, or -1 for none. It refuses a
+// key the writer never emits (paxKeys) and any key given twice: tar.Reader
+// keeps a repeated key's last value, so a guard that read another would
+// disagree with it about where the entry's data ends.
 func paxSize(record []byte) (int64, error) {
+	size := int64(-1)
+	seen := map[string]bool{}
 	for len(record) > 0 {
 		space := bytes.IndexByte(record, ' ')
 		if space < 1 {
 			return 0, fmt.Errorf("%w: a malformed PAX record", errTarShape)
 		}
 		n, err := strconv.Atoi(string(record[:space]))
-		if err != nil || n <= space || n > len(record) {
+		if err != nil || n <= space || n > len(record) || record[n-1] != '\n' {
 			return 0, fmt.Errorf("%w: a malformed PAX record", errTarShape)
 		}
-		key, value, _ := strings.Cut(strings.TrimSuffix(string(record[space+1:n]), "\n"), "=")
+		key, value, ok := strings.Cut(string(record[space+1:n-1]), "=")
+		if !ok || !paxKeys[key] || seen[key] {
+			return 0, fmt.Errorf("%w: a PAX record %q", errTarShape, key)
+		}
+		seen[key] = true
 		if key == "size" {
-			size, err := strconv.ParseInt(value, 10, 64)
-			if err != nil || size < 0 {
+			if size, err = strconv.ParseInt(value, 10, 64); err != nil || size < 0 {
 				return 0, fmt.Errorf("%w: a PAX record with an invalid size", errTarShape)
 			}
-			return size, nil
 		}
 		record = record[n:]
 	}
-	return -1, nil
+	return size, nil
 }
 
 // checkTarHeader accepts a regular file's header or a small PAX record's,
