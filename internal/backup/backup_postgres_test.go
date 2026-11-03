@@ -1431,3 +1431,27 @@ func TestServerSpecificSettingsComeFromTheLiveServerDB(t *testing.T) {
 		}
 	}
 }
+
+// TestControlConnectionIsNeverOnTheLiveDatabaseDB: a deployment whose live
+// database is named postgres gets its control connection on template1,
+// since a swap renames the live database.
+func TestControlConnectionIsNeverOnTheLiveDatabaseDB(t *testing.T) {
+	_, dsn := backuptest.Database(t)
+	ctx := t.Context()
+	for live, want := range map[string]string{maintenancePostgres: "template1", "silo": maintenancePostgres} {
+		url, err := WithDatabase(dsn, live)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctl, err := ConnectControl(ctx, url)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var on string
+		err = ctl.Conn.QueryRow(ctx, `SELECT current_database()`).Scan(&on)
+		_ = ctl.Close(context.Background())
+		if err != nil || on != want || ctl.Like != live {
+			t.Fatalf("live %s: control on %q (%v), like %q; want %s", live, on, err, ctl.Like, want)
+		}
+	}
+}
