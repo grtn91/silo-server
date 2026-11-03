@@ -118,3 +118,39 @@ func TestEveryCredentialSettingIsDecided(t *testing.T) {
 		}
 	}
 }
+
+// TestOutboundBundlesCoverTheirConsumers: each unit a full restore takes
+// from the live server holds every setting its consumer reads to reach and
+// sign in to the service, so a restore never mixes the two servers' values,
+// and every endpoint and secret route is in a unit.
+func TestOutboundBundlesCoverTheirConsumers(t *testing.T) {
+	unitOf := func(key string) int {
+		for i, b := range outboundBundles {
+			if slices.Contains(b.keys, key) {
+				return i
+			}
+		}
+		return -1
+	}
+	smtp := mail.SMTPSettingKeys()
+	for _, key := range []string{mail.SettingSMTPHost, mail.SettingSMTPPort, mail.SettingSMTPUsername, mail.SettingSMTPPassword, mail.SettingFromAddress} {
+		if !slices.Contains(smtp, key) {
+			t.Fatalf("the mail sender's keys %v leave out %s", smtp, key)
+		}
+	}
+	for consumer, keys := range map[string][]string{"mail": smtp, "AI": config.AIConnectionSettingKeys()} {
+		unit := unitOf(keys[0])
+		for _, key := range keys {
+			if unitOf(key) != unit || unit < 0 {
+				t.Errorf("%s setting %s is not in the unit of %s", consumer, key, keys[0])
+			}
+		}
+	}
+	for _, r := range settingRoutes {
+		for _, key := range append([]string{r.endpoint}, r.secrets...) {
+			if unitOf(key) < 0 {
+				t.Errorf("route setting %s is in no outbound unit", key)
+			}
+		}
+	}
+}

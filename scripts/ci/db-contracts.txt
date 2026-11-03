@@ -774,6 +774,7 @@
 # could not be read, reports it so it is retried without a fallback chain.
 ./internal/backup TestBackupRestoreRoundTripDB
 ./internal/backup TestFullRestoresAreSerializedDB
+./internal/backup TestServerSpecificSettingsComeFromTheLiveServerDB
 ./internal/backup TestBackupWritesManifestLastDB
 ./internal/backup TestSubsystemLockSerializesBackupsAndDeletesDB
 ./internal/backup TestLostLockSessionCancelsWorkDB

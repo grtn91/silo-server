@@ -948,6 +948,16 @@ re-entry. `TestEveryCredentialSettingIsDecided` fails on an encrypted
 setting that is neither in a unit nor this server's own (signing keys,
 storage, Redis, the web push key pair).
 
+A full restore also keeps every server-specific setting (`SettingKindServerSpecific`:
+the server's identity and public URL, storage, Redis, search, AI
+providers, the push relay, and the rest of `serverSpecificSettings`) as the
+live server has it, deleting one the live server lacks so its default
+applies, whichever deployment the backup came from: they describe this
+server, as a selective restore never writes them
+(`CarryServerSpecificSettings`). The signing keys a restore rotates keep
+their new values. `TestServerSpecificSettingsComeFromTheLiveServerDB`
+checks every classified one.
+
 ### Interrupted work
 
 Nothing the backup had queued or running runs by itself after a full
