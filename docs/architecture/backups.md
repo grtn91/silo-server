@@ -918,6 +918,22 @@ encrypted `server_settings` row this key cannot open and prints their key
 names (never values) for the admin to enter again. Rows are only deleted,
 never renamed: a value is bound to its key name.
 
+### Interrupted work
+
+Nothing the backup had queued or running runs by itself after a full
+restore (either mode). In the restored database, before Silo starts on it,
+`InterruptWork` cancels admin jobs of every kind (backups, restores,
+imports, storage transitions, scans, exports), history import runs, and scan
+runs that were queued or running; fails running collection syncs and pending
+or retrying deliveries to notification destinations (push, webhooks, browser
+push); and clears storage transition checkpoints and cursors, all with the
+reason "interrupted by restore". Finished rows stay as history. The storage
+transition target (`storage.transition.target`) is the live server's, or
+none for separate mode or when the live server has none, so a transition
+canceled since the backup stays canceled and a staged target is never
+revived. Leases and claims in other queues (match queues, enrichment and
+trickplay state) are local work a server reclaims when they expire.
+
 ### Accounts roll back
 
 A full restore is a rollback of the accounts, by maintainer decision: every

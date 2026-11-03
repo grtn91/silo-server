@@ -22,6 +22,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/Silo-Server/silo-server/internal/adminjob"
 	"github.com/Silo-Server/silo-server/internal/auth"
 	"github.com/Silo-Server/silo-server/internal/backup/backuptest"
 	"github.com/Silo-Server/silo-server/internal/blobstore"
@@ -494,6 +495,7 @@ func checkCredentials(t *testing.T, loader PGLoader, pool *pgxpool.Pool, dsn, in
 	checkCarryInvitation(t, loader, pool, dsn, into, restored, "invite-"+suffix)
 	checkCarryAutoProvision(t, loader, pool, dsn, into, restored)
 	checkOutboundConnections(t, loader, pool, dsn, into, restored, userID)
+	checkInterruptedWork(t, loader, pool, dsn, into, restored, userID)
 	checkAccountRollback(t, loader, pool, dsn, into, userID, newUser)
 	checkStricterFlags(t, loader, pool, dsn, into, restored, userID)
 	checkStricterSettings(t, loader, pool, dsn, into, restored)
@@ -665,6 +667,48 @@ func checkStricterFlags(t *testing.T, loader PGLoader, pool *pgxpool.Pool, dsn, 
 		if !slices.Contains(carried.Stricter, want) {
 			t.Fatalf("reported %v, want %q", carried.Stricter, want)
 		}
+	}
+}
+
+// checkInterruptedWork: after a full restore nothing the backup had queued
+// or running runs by itself. A storage transition queued when the backup
+// was taken, and canceled on the live server since, ends canceled, its
+// staged target is not revived, and a finished job stays as it was.
+func checkInterruptedWork(t *testing.T, loader PGLoader, pool *pgxpool.Pool, dsn, into string, restored *pgxpool.Pool, userID int64) {
+	t.Helper()
+	ctx := t.Context()
+	var queued, done string
+	for status, id := range map[string]*string{"queued": &queued, "completed": &done} {
+		if err := restored.QueryRow(ctx, `INSERT INTO admin_jobs (id, job_type, status, created_by_user_id, requested_at, updated_at)
+			VALUES (gen_random_uuid()::text, 'storage_transition', $1, $2, now(), now()) RETURNING id`, status, userID).Scan(id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := restored.Exec(ctx, `INSERT INTO server_settings (key, value) VALUES ($1, 'staged-elsewhere')
+		ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`, config.StorageTransitionTargetKey); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `DELETE FROM server_settings WHERE key = $1`, config.StorageTransitionTargetKey); err != nil {
+		t.Fatal(err)
+	}
+	changed, err := loader.InterruptWork(ctx, into, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	status := func(id string) (s string) {
+		t.Helper()
+		if err := restored.QueryRow(ctx, `SELECT status FROM admin_jobs WHERE id = $1`, id).Scan(&s); err != nil {
+			t.Fatal(err)
+		}
+		return s
+	}
+	var staged int
+	if err := restored.QueryRow(ctx, `SELECT count(*) FROM server_settings WHERE key = $1`, config.StorageTransitionTargetKey).Scan(&staged); err != nil {
+		t.Fatal(err)
+	}
+	if status(queued) != adminjob.StatusCancelled || status(done) != adminjob.StatusCompleted || staged != 0 || len(changed) == 0 {
+		t.Fatalf("queued job %s, finished job %s, staged targets %d, changed %v; want it ended, history kept, no target",
+			status(queued), status(done), staged, changed)
 	}
 }
 
