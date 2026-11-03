@@ -6,10 +6,12 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"io"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Silo-Server/silo-server/internal/secret"
 )
@@ -165,6 +167,20 @@ func TestFetchSourceChecksSpaceAndScope(t *testing.T) {
 	if err := src.Validate(ctx, ValidateOptions{KeyCheck: key.Check, ManifestKey: seedManifestKey(t, "server-a")}); err != nil {
 		t.Fatalf("validating a database-only fetch: %v", err)
 	}
+	// The decrypt command reads an object only beside a manifest that
+	// verifies: a changed one's checksums could be anyone's.
+	data, _ := json.Marshal(&m)
+	objects.objects[ManifestName] = data
+	if err := DecryptObject(ctx, objects, DumpName+EncryptedSuffix, key, io.Discard); err != nil {
+		t.Fatalf("decrypt beside a verified manifest: %v", err)
+	}
+	m.CompletedAt = m.CompletedAt.Add(time.Hour)
+	data, _ = json.Marshal(&m)
+	objects.objects[ManifestName] = data
+	if err := DecryptObject(ctx, objects, DumpName+EncryptedSuffix, key, io.Discard); !errors.Is(err, ErrManifestTampered) {
+		t.Fatalf("decrypt beside a changed manifest = %v, want ErrManifestTampered", err)
+	}
+	delete(objects.objects, ManifestName)
 
 	// The manifest says the dump is smaller than what arrives.
 	for i := range m.Objects {

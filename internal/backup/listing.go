@@ -7,11 +7,8 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"sort"
-	"strings"
 	"time"
 
-	"github.com/Silo-Server/silo-server/internal/blobstore"
 	"github.com/Silo-Server/silo-server/internal/config"
 )
 
@@ -43,14 +40,12 @@ func (s *Service) Delete(ctx context.Context, id string) error {
 	}
 	op := s.beginOperation(ctx, held, ActiveOperation{Operation: OperationDelete, BackupID: id, StartedAt: s.opts.Now()})
 	defer op.end(ctx, nil)
-	objects, err := t.List(ctx, folderPrefix(serverID, id))
-	if err != nil {
+	if found, err := hasObjects(ctx, t, folderPrefix(serverID, id)); err != nil {
 		return err
-	}
-	if len(objects) == 0 {
+	} else if !found {
 		return ErrNotFound
 	}
-	return t.DeletePrefix(ctx, folderPrefix(serverID, id))
+	return deleteBackupFolder(ctx, t, folderPrefix(serverID, id))
 }
 
 // Summary describes one backup folder of this server.
@@ -197,11 +192,12 @@ func (s *Service) list(ctx context.Context) (Listing, error) {
 	listing.DestinationAvailable = true
 	recordedSuccess := listing.LastSuccessAt
 	hereSuccess := false
-	objects, err := t.List(ctx, RootPrefix)
+	// A server id and "uploads" may be among them, so two more than shown.
+	children, err := childFolders(ctx, t, RootPrefix, maxOtherServers+2)
 	if err != nil {
 		return listing, err
 	}
-	listing.OtherServerIDs = otherServerIDs(objects, serverID)
+	listing.OtherServerIDs = otherServerIDs(children, serverID)
 	folders, err := s.folders(ctx, t, serverID)
 	if err != nil {
 		return listing, err
@@ -235,20 +231,14 @@ func (s *Service) list(ctx context.Context) (Listing, error) {
 }
 
 // otherServerIDs lists the server ids other than serverID with backups at
-// a destination, from a listing of RootPrefix.
-func otherServerIDs(objects []blobstore.ObjectInfo, serverID string) []string {
-	others := map[string]bool{}
-	for _, obj := range objects {
-		sid, _, ok := strings.Cut(strings.TrimPrefix(obj.Key, RootPrefix), "/")
-		if ok && sid != serverID && validServerID(sid) && sid != "uploads" {
-			others[sid] = true
+// a destination, from the folders under RootPrefix (childFolders).
+func otherServerIDs(children []string, serverID string) []string {
+	out := make([]string, 0, len(children))
+	for _, sid := range children {
+		if sid != serverID && validServerID(sid) && sid != "uploads" && len(out) < maxOtherServers {
+			out = append(out, sid)
 		}
 	}
-	out := make([]string, 0, len(others))
-	for sid := range others {
-		out = append(out, sid)
-	}
-	sort.Strings(out)
 	return out
 }
 

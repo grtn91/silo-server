@@ -112,10 +112,13 @@ func (d *S3Destination) Open(ctx context.Context, key string) (io.ReadCloser, in
 	return body, info.SizeBytes, nil
 }
 
-func (d *S3Destination) List(ctx context.Context, prefix string) ([]blobstore.ObjectInfo, error) {
-	infos, err := d.client.ListObjectInfos(ctx, d.bucket(), prefix)
+func (d *S3Destination) ListPage(ctx context.Context, prefix, after string, limit int) ([]blobstore.ObjectInfo, string, error) {
+	if err := checkPageLimit(limit); err != nil {
+		return nil, "", err
+	}
+	infos, next, err := d.client.ListObjectInfosAfter(ctx, d.bucket(), prefix, after, limit)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	out := make([]blobstore.ObjectInfo, 0, len(infos))
 	for _, info := range infos {
@@ -125,7 +128,7 @@ func (d *S3Destination) List(ctx context.Context, prefix string) ([]blobstore.Ob
 		}
 		out = append(out, obj)
 	}
-	return out, nil
+	return out, next, nil
 }
 
 // ErrDeleteRefused reports a bucket that would not delete a backup, such as
@@ -133,22 +136,31 @@ func (d *S3Destination) List(ctx context.Context, prefix string) ([]blobstore.Ob
 // as a warning and leaves retention to the bucket's lifecycle rules.
 var ErrDeleteRefused = errors.New("the bucket refused to delete it; its lifecycle rules decide when it goes")
 
-// DeletePrefix deletes a backup folder with its manifest first: a bucket
-// that refuses deletes then leaves the backup whole, and a delete that stops
-// partway leaves an incomplete folder the sweep finishes, never a manifest
-// that lists objects that are gone.
+// DeletePrefix deletes what is under prefix a page at a time, each key
+// once, so neither a large folder nor a listing that never ends holds more
+// than a page in memory.
 func (d *S3Destination) DeletePrefix(ctx context.Context, prefix string) error {
 	if err := checkDeletePrefix(prefix); err != nil {
 		return err
 	}
-	if err := d.deleteKeys(ctx, []string{prefix + ManifestName}); err != nil {
-		return err
+	after := ""
+	for {
+		page, next, err := d.ListPage(ctx, prefix, after, listPageSize)
+		if err != nil {
+			return err
+		}
+		keys := make([]string, len(page))
+		for i, obj := range page {
+			keys[i] = obj.Key
+		}
+		if err := d.deleteKeys(ctx, keys); err != nil {
+			return err
+		}
+		if next == "" {
+			return nil
+		}
+		after = next
 	}
-	keys, err := d.client.ListObjects(ctx, d.bucket(), prefix)
-	if err != nil {
-		return err
-	}
-	return d.deleteKeys(ctx, keys)
 }
 
 func (d *S3Destination) Delete(ctx context.Context, keys ...string) error {
@@ -163,6 +175,12 @@ func (d *S3Destination) deleteKeys(ctx context.Context, keys []string) error {
 		return nil
 	}
 	_, err := d.client.DeleteObjects(ctx, d.bucket(), keys)
+	return refusedDelete(ctx, err)
+}
+
+// refusedDelete marks a delete the bucket denied as ErrDeleteRefused, at
+// every destination.
+func refusedDelete(ctx context.Context, err error) error {
 	if err != nil && ctx.Err() == nil && deleteRefused(err) {
 		return fmt.Errorf("%w (%w)", ErrDeleteRefused, err)
 	}

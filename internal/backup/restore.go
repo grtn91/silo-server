@@ -970,7 +970,8 @@ func DecryptObjectToFile(ctx context.Context, objects Objects, name string, key 
 // manifestEntry reads the manifest beside an object, when there is one, and
 // returns the object's entry: nil when the folder has no manifest or the
 // manifest does not list the object. A manifest that names another key
-// refuses the decrypt.
+// refuses the decrypt, and so does one of this key whose MAC does not
+// verify: its checksums could be anyone's.
 func manifestEntry(ctx context.Context, objects Objects, name string, key *ArchiveKey) (*ObjectEntry, error) {
 	m, err := ReadSourceManifest(ctx, objects, "")
 	if errors.Is(err, ErrNotFound) {
@@ -984,6 +985,11 @@ func manifestEntry(ctx context.Context, objects Objects, name string, key *Archi
 	}
 	if err := CheckKey(m, key); err != nil {
 		return nil, err
+	}
+	if authenticated, err := m.checkMAC(key.manifest, key.Check); err != nil {
+		return nil, err
+	} else if !authenticated {
+		return nil, fmt.Errorf("%w: the manifest beside %s cannot be verified with this key", ErrManifestTampered, name)
 	}
 	for _, o := range m.Objects {
 		if o.Name == name {

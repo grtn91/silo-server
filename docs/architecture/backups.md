@@ -57,8 +57,21 @@ the private bucket ([Destinations](#destinations), [Encryption](#encryption)).
   object written, so its presence is the commit point. Listing shows an
   incomplete folder as `in_progress` only while the published active
   operation (see [Status](#status)) is that backup, and `incomplete`
-  otherwise. The sweep deletes incomplete folders whose name and newest
-  object are both older than 24 hours.
+  otherwise. So is a folder whose manifest lists an object that is not
+  there, or not at its recorded size: a delete that stopped partway. The
+  sweep deletes incomplete folders whose name and newest object are both
+  older than 24 hours.
+- **Listings are bounded.** Anyone who can write a bucket, or answer for its
+  endpoint, could otherwise hold enough keys, or page without end, to
+  exhaust the server's memory on every scheduled backup. Every listing pages
+  through `Destination.ListPage` (at most 1,000 objects a request) and stops
+  at a cap (`listing_bounded.go`): one server's backup folders are read in
+  key order, at most 2,000 folders and 1,000 requests, and a child that is
+  not a backup folder (a full restore's overwritten files) is skipped by
+  listing after it, as a delimiter would. A folder with more than 32
+  objects, which no backup writes, is read only that far and left alone like
+  a tampered one. Other servers' folders are named one request each, at most
+  100, and the upload sweep reads at most 100,000 objects.
 
 ### Manifest
 
@@ -473,9 +486,10 @@ unencrypted copy to this server instead of the S3 bucket, and one of
   running restore reads it.
 - A destination that refuses a delete (object lock, or a policy that denies
   deletes) leaves a warning in the task result, and retention to the bucket's
-  lifecycle rules. An S3 folder is deleted manifest first, so a refused delete
-  leaves the backup whole, and one that stops partway leaves an incomplete
-  folder for the sweep, never a manifest listing objects that are gone.
+  lifecycle rules. A folder is deleted manifest first at every destination
+  (`deleteBackupFolder`), so a refused delete leaves the backup whole, and
+  one that stops partway leaves an incomplete folder for the sweep, never a
+  manifest listing objects that are gone.
 
 ## Restore set
 
@@ -1531,8 +1545,9 @@ one is fetched first: the manifest is read and an encrypted backup with
 another key check value is refused, then `db.dump` and `blobs.tar` (only
 `db.dump` with `--database-only`) are copied into a working folder in the
 current directory as plaintext, decrypted as they stream, each checked
-against the manifest's size and SHA-256 of the stored bytes. Before anything
-downloads, the folder's filesystem must have room for the objects' stored
+against the manifest's size and SHA-256 of the stored bytes. The manifest's
+MAC is checked before anything downloads (validation checks it again), so
+a changed manifest fetches nothing. Before anything downloads, the folder's filesystem must have room for the objects' stored
 sizes (a plaintext is never larger) plus 256 MiB, and an object that writes
 more than its stored size is stopped. The folder is mode 0700, its files
 0600, and it is removed when the command ends. `pg_restore` then reads the
@@ -1554,8 +1569,9 @@ prints the journal and the `--recover` command.
 `silo backup decrypt <file | s3://bucket/key> [-o <file | ->]` writes the
 plaintext of one encrypted object (to `<name>` without `.age` beside a local
 file, or in the current directory for an object). With `manifest.json` in
-the same folder it refuses a key with another check value before reading,
-and checks the stored bytes against the manifest. The plaintext lands in
+the same folder it refuses a key with another check value, and a manifest
+whose MAC does not verify under this key, before reading, and checks the
+stored bytes against the manifest. The plaintext lands in
 `<output>.partial` and is renamed only after every check passed.
 
 Every mode first validates: the manifest is present and complete (exactly

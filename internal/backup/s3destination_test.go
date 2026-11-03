@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"sync"
@@ -131,6 +132,101 @@ func TestRotationRecordsRefusedDeletes(t *testing.T) {
 	srv.RefuseDeletes(false)
 	if rotated, _, warnings := svc.rotate(ctx, nil, tgt, "server", nil); len(rotated) != 2 || len(warnings) != 0 {
 		t.Fatalf("rotation = rotated %v, warnings %v", rotated, warnings)
+	}
+}
+
+// failingPrefixDelete deletes single objects but fails every folder delete,
+// as a delete that stops partway does.
+type failingPrefixDelete struct{ Destination }
+
+func (failingPrefixDelete) DeletePrefix(context.Context, string) error {
+	return errors.New("the connection dropped")
+}
+
+// TestBackupFoldersAreDeletedManifestFirst: at the dedicated bucket and at
+// the default destination on a private bucket, a bucket that refuses
+// deletes leaves the backup whole, and a delete that stops partway leaves
+// a folder without its manifest, which lists as incomplete, never a
+// manifest whose objects are gone.
+func TestBackupFoldersAreDeletedManifestFirst(t *testing.T) {
+	key := testArchiveKey(t, "server-a")
+	for name, open := range map[string]func(*s3test.Server) Destination{
+		"dedicated bucket": func(srv *s3test.Server) Destination { return NewS3Destination(s3TestConfig(srv)) },
+		"private bucket": func(srv *s3test.Server) Destination {
+			return NewStoreDestination(blobstore.NewS3(s3TestConfig(srv).Client()))
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			srv := s3test.New(t, testBucket)
+			ctx := t.Context()
+			dest := open(srv)
+			svc := New(Options{Destination: dest, ArchiveKey: key, KeyCheck: key.Check, ManifestKey: seedManifestKey(t, "server-a")})
+			id := putEncryptedBackup(t, srv, "server-a", "server", "20261031T040000Z-manual", []byte("set")).ID
+			prefix := folderPrefix("server", id)
+			srv.RefuseDeletes(true)
+			if err := deleteBackupFolder(ctx, dest, prefix); !errors.Is(err, ErrDeleteRefused) || len(srv.Keys(testBucket, "silo/"+prefix)) != 4 {
+				t.Fatalf("a refused delete = %v, left %v; want ErrDeleteRefused and the backup whole", err, srv.Keys(testBucket, "silo/"+prefix))
+			}
+			srv.RefuseDeletes(false)
+			if err := deleteBackupFolder(ctx, failingPrefixDelete{dest}, prefix); err == nil {
+				t.Fatal("a delete that stopped partway succeeded")
+			}
+			folders, err := svc.folders(ctx, target{Destination: dest}, "server")
+			if err != nil || len(folders) != 1 || folders[0].manifest != nil || len(srv.Keys(testBucket, "silo/"+prefix)) != 3 {
+				t.Fatalf("after a partial delete: folders %+v, %v; want one incomplete folder of 3 objects", folders, err)
+			}
+		})
+	}
+}
+
+// TestBackupListingsAreBounded: a destination anyone else can write cannot
+// make a listing read without end. A child folder that is not a backup is
+// skipped without reading it, a backup folder holding more objects than a
+// backup writes is read only that far and left alone, other servers are
+// named one request each, and a capped listing stops past its cap.
+func TestBackupListingsAreBounded(t *testing.T) {
+	srv := s3test.New(t, testBucket)
+	ctx := t.Context()
+	dest := NewS3Destination(s3TestConfig(srv))
+	put := func(key string, n int) {
+		for i := range n {
+			srv.Put(testBucket, "silo/"+key+fmt.Sprintf("%05d", i), []byte("x"))
+		}
+	}
+	server := serverPrefix("server")
+	put(server+"20261031T040000Z-nightly/object-", 4)
+	put(server+"20261030T040000Z-overwritten-blobs/library-posters/", 2500)
+	put(server+"20261029T040000Z-manual/object-", maxFolderObjects+100)
+	put(server+"20261028T040000Z-nightly/object-", 2)
+	for _, other := range []string{"other-a", "other-b", "uploads"} {
+		put(serverPrefix(other)+"20261031T040000Z-nightly/object-", 1500)
+	}
+
+	before := srv.ListRequests()
+	folders, err := listBackupFolders(ctx, dest, server)
+	shape := make([]string, len(folders))
+	for i, f := range folders {
+		shape[i] = fmt.Sprintf("%s:%d:%v", f.id, len(f.objects), f.overflow)
+	}
+	if want := fmt.Sprintf("20261028T040000Z-nightly:2:false,20261029T040000Z-manual:%d:true,20261031T040000Z-nightly:4:false", maxFolderObjects); err != nil || strings.Join(shape, ",") != want {
+		t.Fatalf("folders = %v, %v; want %s", shape, err, want)
+	}
+	if n := srv.ListRequests() - before; n > 4 {
+		t.Fatalf("listing the server's folders took %d requests", n)
+	}
+
+	before = srv.ListRequests()
+	children, err := childFolders(ctx, dest, RootPrefix, maxOtherServers+2)
+	if err != nil || strings.Join(otherServerIDs(children, "server"), ",") != "other-a,other-b" {
+		t.Fatalf("other servers = %v, %v", children, err)
+	}
+	if n := srv.ListRequests() - before; n > 5 {
+		t.Fatalf("naming the servers took %d requests", n)
+	}
+
+	before = srv.ListRequests()
+	if _, err := listObjects(ctx, dest, server+"20261030T040000Z-overwritten-blobs/", 100); !errors.Is(err, ErrTooManyObjects) || srv.ListRequests()-before != 1 {
+		t.Fatalf("a capped listing = %v after %d requests", err, srv.ListRequests()-before)
 	}
 }
 

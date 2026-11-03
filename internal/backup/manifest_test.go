@@ -121,7 +121,8 @@ func TestManifestMAC(t *testing.T) {
 // TestListShowsUnverifiedBackups: the listing says a backup is unverified
 // when its manifest names another SECRET_KEY or none, and when it names
 // this key but does not verify; that one shows no details and the sweep
-// leaves it.
+// leaves it. One whose manifest lists an object that is gone (a delete
+// that stopped partway) is incomplete, and the sweep finishes it.
 func TestListShowsUnverifiedBackups(t *testing.T) {
 	ctx := t.Context()
 	store, err := blobstore.NewFilesystem(t.TempDir())
@@ -136,6 +137,11 @@ func TestListShowsUnverifiedBackups(t *testing.T) {
 		m := validTestManifest()
 		m.ID = FolderName(now.AddDate(0, 0, -day), KindNightly)
 		m.CreatedAt, m.CompletedAt, m.KeyCheck = now.AddDate(0, 0, -day), now.AddDate(0, 0, -day), keyCheck
+		for _, o := range m.Objects {
+			if err := store.Put(ctx, objectKey("server", m.ID, o.Name), make([]byte, o.Size)); err != nil {
+				t.Fatal(err)
+			}
+		}
 		if err := writeManifest(ctx, target{Destination: svc.opts.Destination}, &m, svc.opts.ManifestKey); err != nil {
 			t.Fatal(err)
 		}
@@ -149,6 +155,10 @@ func TestListShowsUnverifiedBackups(t *testing.T) {
 		return m.ID
 	}
 	verified, other, none, tampered := write(1, "aaaa-bbbb-cccc-dddd", false), write(2, "1111-2222-3333-4444", false), write(3, "", false), write(4, "aaaa-bbbb-cccc-dddd", true)
+	partial := write(5, "aaaa-bbbb-cccc-dddd", false)
+	if _, err := store.Delete(ctx, []string{objectKey("server", partial, DumpName)}); err != nil {
+		t.Fatal(err)
+	}
 	listing, err := svc.List(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -158,14 +168,14 @@ func TestListShowsUnverifiedBackups(t *testing.T) {
 		status[b.ID] = b
 	}
 	if status[verified].Status != StatusComplete || status[other].Status != StatusUnverified || status[none].Status != StatusUnverified ||
-		status[tampered].Status != StatusUnverified || len(status[tampered].Objects) != 0 {
+		status[tampered].Status != StatusUnverified || len(status[tampered].Objects) != 0 || status[partial].Status != StatusIncomplete {
 		t.Fatalf("statuses = %+v", status)
 	}
 	folders, err := svc.folders(ctx, target{Destination: svc.opts.Destination}, "server")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if swept := planSweep(folders, now.AddDate(0, 1, 0)); len(swept) != 0 {
-		t.Fatalf("the sweep would delete %v", swept)
+	if swept := planSweep(folders, now.AddDate(0, 1, 0)); len(swept) != 1 || swept[0] != partial {
+		t.Fatalf("the sweep would delete %v, want only %s", swept, partial)
 	}
 }

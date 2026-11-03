@@ -1,7 +1,11 @@
 package backup
 
 import (
+	"context"
+	"errors"
+	"log/slog"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -113,4 +117,61 @@ func planSweep(folders []folder, now time.Time) []string {
 	}
 	sort.Strings(deletes)
 	return deletes
+}
+
+// folders lists this server's backup folders at t, reading each manifest
+// (listBackupFolders bounds the listing). A folder whose manifest lists an
+// object that is not there, or not at its recorded size, is incomplete: a
+// delete that stopped partway, which the sweep finishes. One with more
+// objects than Silo writes is left alone, like a tampered one.
+func (s *Service) folders(ctx context.Context, t target, serverID string) ([]folder, error) {
+	listed, err := listBackupFolders(ctx, t, serverPrefix(serverID))
+	if err != nil {
+		return nil, err
+	}
+	out := make([]folder, 0, len(listed))
+	for _, l := range listed {
+		at, kind, _ := ParseFolderName(l.id)
+		f := folder{id: l.id, kind: kind, at: at}
+		sizes := make(map[string]int64, len(l.objects))
+		for _, obj := range l.objects {
+			f.size += obj.Size
+			if obj.ModTime.After(f.newest) {
+				f.newest = obj.ModTime
+			}
+			sizes[strings.TrimPrefix(obj.Key, folderPrefix(serverID, l.id))] = obj.Size
+		}
+		if l.overflow {
+			f.tampered = true
+			slog.WarnContext(ctx, "backup folder holds more objects than a backup writes; leaving it alone", "component", "backup", "id", l.id)
+			out = append(out, f)
+			continue
+		}
+		if _, ok := sizes[ManifestName]; ok {
+			m, err := s.readManifest(ctx, t, serverID, l.id)
+			switch {
+			case err != nil:
+				f.tampered = errors.Is(err, ErrManifestTampered)
+				slog.WarnContext(ctx, "unreadable backup manifest", "component", "backup", "id", l.id, "error", err)
+			case !m.objectsPresent(sizes):
+				slog.WarnContext(ctx, "backup manifest lists objects that are gone; the folder is incomplete", "component", "backup", "id", l.id)
+			default:
+				f.manifest, f.verified = m, m.authenticated || s.opts.ManifestKey == nil
+			}
+		}
+		out = append(out, f)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].at.After(out[j].at) })
+	return out, nil
+}
+
+// objectsPresent reports whether every object m lists is in sizes (a
+// folder's listing, by name) at its recorded size.
+func (m *Manifest) objectsPresent(sizes map[string]int64) bool {
+	for _, o := range m.Objects {
+		if size, ok := sizes[o.Name]; !ok || size != o.Size {
+			return false
+		}
+	}
+	return true
 }

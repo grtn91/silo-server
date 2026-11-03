@@ -14,7 +14,6 @@ import (
 	"log/slog"
 	"maps"
 	"path"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -817,7 +816,7 @@ func (s *Service) rotate(ctx context.Context, held Held, t target, serverID stri
 		pinned[active.backupID] = true
 	}
 	for _, id := range planRotation(folders, keep, now, pinned) {
-		if err := t.DeletePrefix(ctx, folderPrefix(serverID, id)); err != nil {
+		if err := deleteBackupFolder(ctx, t, folderPrefix(serverID, id)); err != nil {
 			// A bucket that refuses deletes (object lock) leaves retention to
 			// its lifecycle rules.
 			warnings = append(warnings, fmt.Sprintf("could not delete %s: %v", id, err))
@@ -826,7 +825,7 @@ func (s *Service) rotate(ctx context.Context, held Held, t target, serverID stri
 		rotated = append(rotated, id)
 	}
 	for _, id := range planSweep(folders, now) {
-		if err := t.DeletePrefix(ctx, folderPrefix(serverID, id)); err != nil {
+		if err := deleteBackupFolder(ctx, t, folderPrefix(serverID, id)); err != nil {
 			warnings = append(warnings, fmt.Sprintf("could not delete incomplete %s: %v", id, err))
 			continue
 		}
@@ -838,52 +837,6 @@ func (s *Service) rotate(ctx context.Context, held Held, t target, serverID stri
 		slog.WarnContext(ctx, "backup rotation", "component", "backup", "warning", w)
 	}
 	return rotated, swept, warnings
-}
-
-// folders lists this server's backup folders at t, reading each manifest.
-func (s *Service) folders(ctx context.Context, t target, serverID string) ([]folder, error) {
-	objects, err := t.List(ctx, serverPrefix(serverID))
-	if err != nil {
-		return nil, err
-	}
-	byID := map[string]*folder{}
-	var order []string
-	for _, obj := range objects {
-		rest := strings.TrimPrefix(obj.Key, serverPrefix(serverID))
-		id, name, ok := strings.Cut(rest, "/")
-		if !ok {
-			continue
-		}
-		at, kind, ok := ParseFolderName(id)
-		if !ok {
-			continue
-		}
-		f := byID[id]
-		if f == nil {
-			f = &folder{id: id, kind: kind, at: at}
-			byID[id] = f
-			order = append(order, id)
-		}
-		f.size += obj.Size
-		if obj.ModTime.After(f.newest) {
-			f.newest = obj.ModTime
-		}
-		if name == ManifestName {
-			m, err := s.readManifest(ctx, t, serverID, id)
-			if err != nil {
-				f.tampered = errors.Is(err, ErrManifestTampered)
-				slog.WarnContext(ctx, "unreadable backup manifest", "component", "backup", "id", id, "error", err)
-				continue
-			}
-			f.manifest, f.verified = m, m.authenticated || s.opts.ManifestKey == nil
-		}
-	}
-	out := make([]folder, 0, len(order))
-	for _, id := range order {
-		out = append(out, *byID[id])
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].at.After(out[j].at) })
-	return out, nil
 }
 
 // readManifest reads and checks the manifest of backup id of serverID: it

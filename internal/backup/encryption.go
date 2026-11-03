@@ -40,6 +40,9 @@ var (
 type ArchiveKey struct {
 	passphrase string
 	Check      string
+	// manifest is secret.BackupManifestKey of the same SECRET_KEY, which
+	// authenticates the manifest beside an object the decrypt command reads.
+	manifest []byte
 }
 
 // NewArchiveKey derives the archive key of masterKey.
@@ -52,7 +55,11 @@ func NewArchiveKey(masterKey []byte) (*ArchiveKey, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &ArchiveKey{passphrase: passphrase, Check: check}, nil
+	manifest, err := secret.BackupManifestKey(masterKey)
+	if err != nil {
+		return nil, err
+	}
+	return &ArchiveKey{passphrase: passphrase, Check: check, manifest: manifest}, nil
 }
 
 // Encrypt returns a writer that encrypts into w. Close flushes the final
