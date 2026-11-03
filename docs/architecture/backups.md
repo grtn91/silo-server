@@ -1204,6 +1204,12 @@ may create (`vector` is not trusted) when the role is not a superuser
 (`ErrExtensionNeedsSuperuser`), pointing to a superuser role or separate
 mode into a database where a superuser created them.
 
+The control connection uses the first of `postgres` and `template1` that is
+not the live database and that the role can connect to (a live database
+named `postgres` gets `template1`); a swap renames the live database, which
+PostgreSQL refuses while a session is on it. With neither, the command
+refuses before anything changes.
+
 A swap reaches the maintenance database and the databases it creates through
 URLs derived from `DATABASE_URL` with only the database changed. The
 database is replaced wherever the URL can name it: the path and a `dbname`

@@ -47,8 +47,8 @@ var outboundBundles = func() []outboundBundle {
 	ai := append(config.AIConnectionSettingKeys(), chatgpt.CredentialsKey)
 	out := []outboundBundle{
 		{name: "mail (SMTP)", keys: mail.SMTPSettingKeys(), secrets: []string{settingSMTPPassword}, enabled: settingEmailEnabled},
-		{name: "AI providers", keys: ai, secrets: []string{config.AIProvidersSettingKey, chatgpt.CredentialsKey, settingAIKey, "ai.asr_api_key",
-			"subtitle_ai.api_key", "recommendations.embedding_auth_token", "recommendations.openai_api_key"}},
+		{name: "AI providers", keys: ai, secrets: []string{config.AIProvidersSettingKey, chatgpt.CredentialsKey, settingAIKey, settingASRKey,
+			settingSubtitleAIKey, settingEmbeddingToken, settingOpenAIEmbeddingKey}},
 	}
 	whole := func(keys ...string) outboundBundle { return outboundBundle{name: keys[0], keys: keys, secrets: keys} }
 	out = append(out,
