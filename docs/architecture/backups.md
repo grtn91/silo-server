@@ -801,8 +801,13 @@ Whichever API server claims it:
 5. applies the chosen items section by section. **Each item runs in its own
    transaction that begins with `SELECT … FROM admin_jobs … FOR UPDATE`,
    requiring status running and the worker's claim generation, holds that
-   lock through commit, and writes the item's outcome into the job's result
-   in the same transaction.** The package write paths take that transaction.
+   lock through commit, and records the item's outcome in the same
+   transaction.** The outcome is a `backup_restore_items` row; the job's
+   result holds the counts, the library map, and the latest 20 outcomes, so
+   each item's write is the same size however many came before it. The full
+   list goes into the result once: when the restore returns, however it
+   ends, or when stale recovery marks it interrupted; the rows are then
+   removed. The package write paths take that transaction.
    A failed item rolls back to a savepoint and is recorded as failed; the
    restore continues. Events are published after each commit.
 6. honors cancellation between items, never inside one.

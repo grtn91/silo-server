@@ -81,7 +81,14 @@ func TestBackupRestoreFencingDB(t *testing.T) {
 	checkLongItem(t, r, worker, job.ID)
 
 	// A worker that stopped heartbeating is interrupted, not requeued.
+	// Its committed outcomes, rows until the run ends, go into the report.
 	makeStale()
+	for seq, label := range []string{"first", "second"} {
+		if _, err := r.pool.Exec(ctx, `INSERT INTO backup_restore_items (run_id, seq, item) VALUES ($1, $2, jsonb_build_object('label', $3::text))`,
+			job.ID, seq+1, label); err != nil {
+			t.Fatal(err)
+		}
+	}
 	if _, err := r.RequeueStaleRunning(ctx, staleBefore()); err != nil {
 		t.Fatal(err)
 	}
@@ -89,10 +96,18 @@ func TestBackupRestoreFencingDB(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var report map[string]int
+	var report struct {
+		Items []struct {
+			Label string `json:"label"`
+		} `json:"items"`
+	}
 	_ = json.Unmarshal(current.ResultPayload, &report)
-	if current.Status != StatusFailed || current.ErrorMessage != BackupRestoreInterrupted || report["items"] != 1 {
-		t.Fatalf("stale restore = status %s error %q report %v; want failed, interrupted, report kept", current.Status, current.ErrorMessage, report)
+	if current.Status != StatusFailed || current.ErrorMessage != BackupRestoreInterrupted || len(report.Items) != 2 || report.Items[1].Label != "second" {
+		t.Fatalf("stale restore = status %s error %q report %s; want failed, interrupted, its outcomes kept", current.Status, current.ErrorMessage, current.ResultPayload)
+	}
+	var left int
+	if err := r.pool.QueryRow(ctx, `SELECT count(*) FROM backup_restore_items WHERE run_id = $1`, job.ID).Scan(&left); err != nil || left != 0 {
+		t.Fatalf("%d outcome rows left (%v), want them removed", left, err)
 	}
 
 	// The slow original worker cannot commit another item.

@@ -2,6 +2,7 @@ package backup
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -16,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 
@@ -86,7 +88,11 @@ func (s *Service) ExecuteRestore(ctx context.Context, run RestoreRun) (any, erro
 			return fail(fmt.Errorf("recording the storage: %w", err))
 		}
 	}
-	a := &applier{s: s, rs: rs, run: run, report: report, total: 1, staged: map[string]error{}, filesWritten: map[string]bool{}}
+	a := &applier{s: s, rs: rs, run: run, report: report, total: 1, staged: map[string]error{}, filesWritten: map[string]bool{},
+		runID: cmp.Or(run.JobID, uuid.NewString())}
+	// The report the job keeps lists every item's outcome once the run
+	// ends, however it ends: until then each item's is a row of its own.
+	defer a.collectItems(context.WithoutCancel(ctx))
 	for _, ids := range req.Selection {
 		a.total += len(ids)
 	}
@@ -179,6 +185,8 @@ func (s *Service) readSelected(ctx, work context.Context, req RestoreRequest, wa
 type applier struct {
 	s  *Service
 	rs *RestoreSet
+	// runID names this run's backup_restore_items rows.
+	runID string
 	// seasonal counts the seasonal sections this restore wrote
 	// (maxRestoredSeasonal).
 	seasonal int
@@ -218,12 +226,59 @@ type applied struct {
 	metadata collectionCharge
 }
 
+// recentItems is how many of the latest outcomes the running job's result
+// lists; every outcome is a backup_restore_items row until the run ends.
+const recentItems = 20
+
+// clone is the report an item's commit writes: counts, the library map,
+// and the latest outcomes only, so the write is the same size for the
+// thousandth item as for the first.
 func (a *applier) clone() *SelectiveReport {
 	next := *a.report
-	next.Items = slices.Clone(a.report.Items)
+	next.Items = slices.Clone(a.report.Items[max(len(a.report.Items)-recentItems, 0):])
 	next.Counts = maps.Clone(a.report.Counts)
 	next.LibraryMap = maps.Clone(a.report.LibraryMap)
 	return &next
+}
+
+// recordItem writes an item's outcome as a row in the item's transaction.
+func (a *applier) recordItem(ctx context.Context, tx pgx.Tx, item ReportItem) error {
+	data, _ := json.Marshal(item) // strings, ints, and lists of strings
+	if _, err := tx.Exec(ctx, `INSERT INTO backup_restore_items (run_id, seq, item) VALUES ($1, $2, $3)
+		ON CONFLICT (run_id, seq) DO UPDATE SET item = EXCLUDED.item`, a.runID, a.current, data); err != nil {
+		return fmt.Errorf("recording the item's outcome: %w", err)
+	}
+	return nil
+}
+
+// collectItems puts every item's outcome into the report, in order, once
+// the run ends, and removes the rows. Without them (a failure reading
+// them) the report keeps the latest outcomes.
+func (a *applier) collectItems(ctx context.Context) {
+	pool := a.s.opts.Pool
+	if pool == nil {
+		return
+	}
+	rows, err := pool.Query(ctx, `SELECT item FROM backup_restore_items WHERE run_id = $1 ORDER BY seq`, a.runID)
+	if err != nil {
+		return
+	}
+	items, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (ReportItem, error) {
+		var item ReportItem
+		var data []byte
+		if err := row.Scan(&data); err != nil {
+			return item, err
+		}
+		err := json.Unmarshal(data, &item)
+		return item, err
+	})
+	if err != nil {
+		return
+	}
+	if len(items) > 0 {
+		a.report.Items = items
+	}
+	_, _ = pool.Exec(ctx, `DELETE FROM backup_restore_items WHERE run_id = $1`, a.runID)
 }
 
 // commit records next as the job's result in a fenced transaction of its
@@ -264,6 +319,9 @@ func (a *applier) apply(ctx context.Context, section, id string) error {
 		var err error
 		result, err = a.applyWithRetry(ctx, tx, section, id)
 		if err != nil {
+			return err
+		}
+		if err := a.recordItem(ctx, tx, result.item); err != nil {
 			return err
 		}
 		next.Items = append(next.Items, result.item)
