@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -345,6 +346,23 @@ func checkDrillAsOrdinaryRole(t *testing.T, src *Source, loader PGLoader, pool *
 	if err := VerifyBackup(ctx, src, loader, asRole.String(), validate, io.Discard); err != nil {
 		t.Fatalf("verify as a role that owns only the scratch database: %v", err)
 	}
+	// A swap as that role would create the restored database itself, where
+	// it cannot create vector.
+	extensions, err := loader.Extensions(ctx, src.path(DumpName))
+	if err != nil || !slices.Contains(extensions, "vector") {
+		t.Fatalf("the dump's extensions = %v (%v), want vector among them", extensions, err)
+	}
+	ctl, err := ConnectControl(ctx, asRole.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ctl.Close(context.Background()) }()
+	if err := ctl.CheckExtensions(ctx, extensions); !errors.Is(err, ErrExtensionNeedsSuperuser) {
+		t.Fatalf("extensions as an ordinary role = %v, want ErrExtensionNeedsSuperuser", err)
+	}
+	if err := ctl.CheckExtensions(ctx, []string{"citext", "pg_trgm"}); err != nil {
+		t.Fatalf("trusted extensions as an ordinary role = %v", err)
+	}
 }
 
 // checkManifestTampering: a backup whose manifest was changed after it was
@@ -475,6 +493,7 @@ func checkCredentials(t *testing.T, loader PGLoader, pool *pgxpool.Pool, dsn, in
 	checkCarryAuthority(t, loader, pool, dsn, into, restored, userID, keptID, liveKeys)
 	checkCarryInvitation(t, loader, pool, dsn, into, restored, "invite-"+suffix)
 	checkCarryAutoProvision(t, loader, pool, dsn, into, restored)
+	checkOutboundConnections(t, loader, pool, dsn, into, restored, userID)
 	checkAccountRollback(t, loader, pool, dsn, into, userID, newUser)
 	checkStricterFlags(t, loader, pool, dsn, into, restored, userID)
 	checkStricterSettings(t, loader, pool, dsn, into, restored)
@@ -646,6 +665,64 @@ func checkStricterFlags(t *testing.T, loader PGLoader, pool *pgxpool.Pool, dsn, 
 		if !slices.Contains(carried.Stricter, want) {
 			t.Fatalf("reported %v, want %q", carried.Stricter, want)
 		}
+	}
+}
+
+// checkOutboundConnections: what this server presents to outside services
+// never comes back from the backup. A watch-provider connection removed
+// since the backup stays removed; a history import source keeps the
+// backup's row but takes the live address and token, and one the live
+// server no longer has comes back with its token cleared and turned off.
+func checkOutboundConnections(t *testing.T, loader PGLoader, pool *pgxpool.Pool, dsn, into string, restored *pgxpool.Pool, userID int64) {
+	t.Helper()
+	ctx := t.Context()
+	var profile string
+	if err := restored.QueryRow(ctx, `SELECT id FROM user_profiles WHERE user_id = $1 LIMIT 1`, userID).Scan(&profile); err != nil {
+		t.Fatal(err)
+	}
+	var connection string
+	if err := restored.QueryRow(ctx, `INSERT INTO watch_provider_connections (provider, user_id, profile_id, access_token, scrobble_enabled)
+		VALUES ('trakt', $1, $2, 'removed-since', true) RETURNING id::text`, userID, profile).Scan(&connection); err != nil {
+		t.Fatal(err)
+	}
+	base, err := strconv.ParseUint(randomHex(t, 2), 16, 32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	kept, gone := 900_000_000+int(base), 900_100_000+int(base)
+	source := func(db *pgxpool.Pool, id int, url, token string) {
+		t.Helper()
+		if _, err := db.Exec(ctx, `INSERT INTO history_import_sources (id, name, source_type, base_url, admin_token, enabled)
+			VALUES ($1, 'Source', 'jellyfin', $2, $3, true)`, id, url, token); err != nil {
+			t.Fatal(err)
+		}
+	}
+	source(pool, kept, "https://now.invalid", "live-token")
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), `DELETE FROM history_import_sources WHERE id = $1`, kept)
+	})
+	source(restored, kept, "https://then.invalid", "backup-token")
+	source(restored, gone, "https://gone.invalid", "gone-token")
+	carried, err := loader.CarryCredentials(ctx, into, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var left int
+	if err := restored.QueryRow(ctx, `SELECT count(*) FROM watch_provider_connections WHERE id::text = $1`, connection).Scan(&left); err != nil || left != 0 {
+		t.Fatalf("a watch-provider connection removed since the backup: %d rows (%v), want none", left, err)
+	}
+	read := func(id int) (url, token string, enabled bool) {
+		t.Helper()
+		if err := restored.QueryRow(ctx, `SELECT base_url, coalesce(admin_token, ''), enabled FROM history_import_sources WHERE id = $1`, id).Scan(&url, &token, &enabled); err != nil {
+			t.Fatal(err)
+		}
+		return url, token, enabled
+	}
+	if url, token, enabled := read(kept); url != "https://now.invalid" || token != "live-token" || !enabled {
+		t.Fatalf("a source both have = %s %s %v, want the live address and token", url, token, enabled)
+	}
+	if _, token, enabled := read(gone); token != "" || enabled || !slices.ContainsFunc(carried.Cleared, func(s string) bool { return strings.HasPrefix(s, fmt.Sprintf("history import source %d", gone)) }) {
+		t.Fatalf("a source only the backup has: token %q, enabled %v, cleared %v; want it cleared, off, and reported", token, enabled, carried.Cleared)
 	}
 }
 
@@ -919,8 +996,10 @@ func TestEveryTableIsClassifiedDB(t *testing.T) {
 	for _, name := range restoredDataTables {
 		restoredAsBackedUp[name] = true
 	}
-	for _, table := range secretTablesHandled(secretRestored) {
-		restoredAsBackedUp[table.name] = true
+	for _, h := range []secretHandling{secretRestored, secretScrubbed} {
+		for _, table := range secretTablesHandled(h) {
+			restoredAsBackedUp[table.name] = true
+		}
 	}
 	for _, f := range stricterFlags {
 		var boolean bool

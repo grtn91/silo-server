@@ -77,6 +77,10 @@ type fakeControl struct {
 	// superuser is what Superuser reports for every database.
 	superuser   bool
 	carriedFrom []string
+	// checkedExtensions are what CheckExtensions was asked about, and
+	// extensionsErr its answer.
+	checkedExtensions []string
+	extensionsErr     error
 	// restoreLocks is the restore lock table, shared by every control of
 	// one server; held names the databases locked.
 	restoreLocks *fakeRestoreLocks
@@ -157,6 +161,10 @@ func (f *fakeControl) OtherConnections(_ context.Context, name string) (int, err
 	return 0, nil
 }
 func (f *fakeControl) CheckPrivileges(context.Context, string) error { return nil }
+func (f *fakeControl) CheckExtensions(_ context.Context, names []string) error {
+	f.checkedExtensions = names
+	return f.extensionsErr
+}
 
 func (f *fakeControl) Create(_ context.Context, name string) error {
 	return f.do("create "+name, func() error {
@@ -249,6 +257,9 @@ func (l fakeLoader) RotateSigningSecrets(context.Context, string, *secret.Cipher
 }
 func (l fakeLoader) KeepStricterSettings(context.Context, string, string, *secret.Cipher) ([]string, error) {
 	return nil, nil
+}
+func (l fakeLoader) Extensions(context.Context, string) ([]string, error) {
+	return []string{"vector"}, nil
 }
 func (l fakeLoader) Superuser(context.Context, string) (bool, error) { return l.ctl.superuser, nil }
 func (l fakeLoader) AccountRollback(context.Context, string, string) (AccountRollback, error) {
@@ -841,6 +852,20 @@ func TestSwapCarriesOnlyForTheSameDeployment(t *testing.T) {
 	}
 	if !slices.Equal(f.ctl.carriedFrom, []string{""}) || !strings.Contains(f.output.String(), "is not this deployment's") {
 		t.Fatalf("another deployment carried from %q, want nothing; output:\n%s", f.ctl.carriedFrom, f.output.String())
+	}
+}
+
+// TestSwapRefusesExtensionsTheRoleCannotCreate: the restored database is
+// new, so a role that cannot create an extension the backup needs is
+// refused in preflight, before anything changes.
+func TestSwapRefusesExtensionsTheRoleCannotCreate(t *testing.T) {
+	f := newSwapFixture(t)
+	f.ctl.extensionsErr = ErrExtensionNeedsSuperuser
+	if err, _ := f.restore(); !errors.Is(err, ErrExtensionNeedsSuperuser) || slices.ContainsFunc(f.ctl.calls, func(c string) bool { return strings.HasPrefix(c, "create ") }) {
+		t.Fatalf("restore = %v, calls %v; want ErrExtensionNeedsSuperuser before any database is created", err, f.ctl.calls)
+	}
+	if !slices.Equal(f.ctl.checkedExtensions, []string{"vector"}) {
+		t.Fatalf("checked extensions %v, want the dump's", f.ctl.checkedExtensions)
 	}
 }
 

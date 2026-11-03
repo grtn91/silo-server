@@ -953,15 +953,30 @@ that holds a bearer secret or a public capability, each one way:
   destinations that receive notifications without a session (browser and
   mobile push registrations, notification webhooks, notification email
   addresses, Discord links, server notification channels): one removed
-  since the backup would receive them again. A restore
+  since the backup would receive them again. What this server holds for
+  an outside account is carried the same way: watch-provider connections
+  with their tokens (one removed since would sync again), and plugins'
+  configuration and stored state, which hold the keys and tokens a plugin
+  presents to its service and which the server cannot tell apart from a
+  plugin's other settings. A restore
   never brings back the backup's rows: one revoked after the backup would
   work again, and one created since would stop working. They stay in the
   dump (`marker_edit_audit` refers to API keys), and the restore replaces
   them as below.
+- Restored with live credentials (`secretScrubbed`): connections to outside
+  services that other restored data refers to (history import sources,
+  subtitle provider accounts, autoscan targets, request integrations). The
+  backup's rows come back, but each takes its address and credentials from
+  the live row with its key, so neither the backup's credentials reach a
+  service again nor the live ones the backup's address; a row the live
+  server does not have (deleted since, or any row of another deployment's
+  backup) comes back with its credentials cleared and turned off, and the
+  command lists it.
 - Restored with the data: what looks like a secret admits no one to this
-  server or belongs to the record it comes with (outbound provider tokens,
-  URL slugs, worker leases, delivery histories, account passwords and
-  profile PINs with their accounts).
+  server or belongs to the record it comes with (URL slugs, worker leases,
+  delivery histories, account passwords and profile PINs with their
+  accounts). No table that holds what this server presents to an outside
+  service is restored as the backup has it.
 
 Every other table is classified too (`internal/backup/tables.go`): the
 logs and queues the dump leaves out (`loggedTables`), the server's data
@@ -1124,6 +1139,14 @@ material: any account on the host can read a running command's arguments.
 The command refuses one and points to `PGPASSWORD` or a password file
 (`~/.pgpass`, `PGPASSFILE`), and to a service file (`PGSERVICEFILE`) for an
 `sslpassword`, which both the command and `pg_restore` read.
+
+A swap creates the restored database from `template0`, so `pg_restore`
+creates the backup's extensions in it as the `DATABASE_URL` role. Preflight
+reads them from the dump's table of contents and refuses, before anything
+changes, one this PostgreSQL server does not have, or one only a superuser
+may create (`vector` is not trusted) when the role is not a superuser
+(`ErrExtensionNeedsSuperuser`), pointing to a superuser role or separate
+mode into a database where a superuser created them.
 
 A swap reaches the maintenance database and the databases it creates through
 URLs derived from `DATABASE_URL` with only the database changed. The

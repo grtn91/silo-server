@@ -236,6 +236,8 @@ type DatabaseLoader interface {
 	// ServerID reads the server identity (serveridentity.Key) dbURL's
 	// settings hold, or "" when they hold none.
 	ServerID(ctx context.Context, dbURL string) (string, error)
+	// Extensions lists the extensions the dump at dumpPath creates.
+	Extensions(ctx context.Context, dumpPath string) ([]string, error)
 	// Superuser reports whether the role dbURL connects as is a superuser.
 	Superuser(ctx context.Context, dbURL string) (bool, error)
 	// AccountRollback compares dbURL's accounts with liveURL's, by id.
