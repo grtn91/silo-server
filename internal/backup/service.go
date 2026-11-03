@@ -748,6 +748,7 @@ func (s *Service) folders(ctx context.Context, t target, serverID string) ([]fol
 	}
 	byID := map[string]*folder{}
 	var order []string
+	listedManifest := map[string]bool{}
 	for _, obj := range objects {
 		rest := strings.TrimPrefix(obj.Key, serverPrefix(serverID))
 		id, name, ok := strings.Cut(rest, "/")
@@ -769,9 +770,11 @@ func (s *Service) folders(ctx context.Context, t target, serverID string) ([]fol
 			f.newest = obj.ModTime
 		}
 		if name == ManifestName {
+			listedManifest[id] = true
 			m, err := s.readManifest(ctx, t, serverID, id)
 			if err != nil {
 				f.tampered = errors.Is(err, ErrManifestTampered)
+				f.unreadable = !f.tampered
 				slog.WarnContext(ctx, "unreadable backup manifest", "component", "backup", "id", id, "error", err)
 				continue
 			}
@@ -780,7 +783,11 @@ func (s *Service) folders(ctx context.Context, t target, serverID string) ([]fol
 	}
 	out := make([]folder, 0, len(order))
 	for _, id := range order {
-		out = append(out, *byID[id])
+		f := byID[id]
+		// The listing above is whole or an error: a folder without a
+		// manifest object in it has none.
+		f.noManifest = !listedManifest[id]
+		out = append(out, *f)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].at.After(out[j].at) })
 	return out, nil

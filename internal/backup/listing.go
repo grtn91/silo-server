@@ -90,6 +90,7 @@ const (
 	WarningSQLiteUserStore        = "sqlite_user_store"
 	WarningToolsMissing           = "pg_dump_missing"
 	WarningToolsTooOld            = "pg_dump_too_old"
+	WarningBackupUnreadable       = "backup_unreadable"
 )
 
 // Listing is the Backups page's whole state.
@@ -170,6 +171,7 @@ func (s *Service) list(ctx context.Context) (Listing, error) {
 	if err != nil {
 		return listing, err
 	}
+	unreadable := 0
 	for _, f := range folders {
 		summary := Summary{ID: f.id, Kind: f.kind, CreatedAt: f.at, SizeBytes: f.size, MissingBlobs: []MissingBlob{}, Objects: []ObjectEntry{},
 			Location: t.Location(folderPrefix(serverID, f.id))}
@@ -183,12 +185,19 @@ func (s *Service) list(ctx context.Context) (Listing, error) {
 			}
 		case f.tampered:
 			summary.Status = StatusUnverified
+		case f.unreadable:
+			summary.Status = StatusUnreadable
+			unreadable++
 		case listing.Active != nil && listing.Active.Operation == OperationBackup && listing.Active.BackupID == f.id:
 			summary.Status = StatusInProgress
 		default:
 			summary.Status = StatusIncomplete
 		}
 		listing.Backups = append(listing.Backups, summary)
+	}
+	if unreadable > 0 {
+		listing.Warnings = append(listing.Warnings, Warning{Code: WarningBackupUnreadable, Message: fmt.Sprintf(
+			"%d of the backups could not be read just now. They are kept, and not rotated or swept, until they can be read.", unreadable)})
 	}
 	return listing, nil
 }

@@ -102,7 +102,9 @@ function BackupStatus({
         </SettingFieldStatus>
       );
     case "unverified":
-      // Written with another SECRET_KEY, or changed after it was written.
+    // Written with another SECRET_KEY, or changed after it was written.
+    case "unreadable":
+      // Its manifest could not be read just now; it is kept.
       return <SettingFieldStatus tone="warn">{label}</SettingFieldStatus>;
     default:
       return <SettingFieldStatus tone="muted">{label}</SettingFieldStatus>;

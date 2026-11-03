@@ -85,7 +85,10 @@ are `true` when available.
 - `other_server_ids`: other server identities with backups at the destination.
 - `warnings`: `{code, message}` for the dashboard. Codes are `disabled`,
   `no_recent_backup` (none completed in 48 hours), `destination_unavailable`,
-  `sqlite_user_store`, `pg_dump_missing`, and `pg_dump_too_old`.
+  `sqlite_user_store`, `pg_dump_missing`, `pg_dump_too_old`, and
+  `backup_unreadable` (some backups' manifests could not be read just now;
+  those backups have the status `unreadable`, and are kept, neither rotated
+  nor swept, until they read).
 
 `status` is one of:
 
