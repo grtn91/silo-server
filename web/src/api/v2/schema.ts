@@ -14369,7 +14369,7 @@ export interface components {
       id: string;
       /** @description Check value of the SECRET_KEY the backup was taken with: 16 hex digits in groups of 4 */
       key_check?: string;
-      /** @description Whether key_check is this server's. An encrypted backup that does not match cannot be previewed, restored, or downloaded decrypted here */
+      /** @description Whether key_check is this server's. Settings and credentials the backup holds encrypted cannot be read with another key, and an encrypted backup that does not match cannot be previewed, restored, or downloaded decrypted here */
       key_matches: boolean;
       /** @enum {string} */
       kind: "nightly" | "manual" | "before-restore";
