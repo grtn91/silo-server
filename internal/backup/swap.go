@@ -289,6 +289,9 @@ func carryLiveState(ctx context.Context, ctl ControlDB, live string, loader Data
 	if err := carryPluginReleases(ctx, loader, restoredURL, carryFrom, out); err != nil {
 		return err
 	}
+	if err := carryPolicies(ctx, loader, restoredURL, carryFrom, out); err != nil {
+		return err
+	}
 	// This server's own settings describe it whichever deployment the
 	// backup came from.
 	if err := carryServerSpecificSettings(ctx, loader, restoredURL, opts.LiveURL, out); err != nil {

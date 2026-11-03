@@ -772,6 +772,7 @@
 ./internal/backup TestFullRestoresAreSerializedDB
 ./internal/backup TestServerSpecificSettingsComeFromTheLiveServerDB
 ./internal/backup TestControlConnectionIsNeverOnTheLiveDatabaseDB
+./internal/backup TestCustomPoliciesComeFromTheLiveServerDB
 ./internal/backup TestBackupWritesManifestLastDB
 ./internal/backup TestSubsystemLockSerializesBackupsAndDeletesDB
 ./internal/backup TestLostLockSessionCancelsWorkDB
