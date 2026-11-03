@@ -74,7 +74,9 @@ type fakeControl struct {
 	// liveServerID is the live server's identity; "" is the manifest's.
 	// carriedFrom records the live URL each credential carry read from.
 	liveServerID string
-	carriedFrom  []string
+	// superuser is what Superuser reports for every database.
+	superuser   bool
+	carriedFrom []string
 	// restoreLocks is the restore lock table, shared by every control of
 	// one server; held names the databases locked.
 	restoreLocks *fakeRestoreLocks
@@ -248,6 +250,7 @@ func (l fakeLoader) RotateSigningSecrets(context.Context, string, *secret.Cipher
 func (l fakeLoader) KeepStricterSettings(context.Context, string, string, *secret.Cipher) ([]string, error) {
 	return nil, nil
 }
+func (l fakeLoader) Superuser(context.Context, string) (bool, error) { return l.ctl.superuser, nil }
 func (l fakeLoader) AccountRollback(context.Context, string, string) (AccountRollback, error) {
 	return AccountRollback{}, nil
 }
@@ -838,6 +841,55 @@ func TestSwapCarriesOnlyForTheSameDeployment(t *testing.T) {
 	}
 	if !slices.Equal(f.ctl.carriedFrom, []string{""}) || !strings.Contains(f.output.String(), "is not this deployment's") {
 		t.Fatalf("another deployment carried from %q, want nothing; output:\n%s", f.ctl.carriedFrom, f.output.String())
+	}
+}
+
+// TestUnverifiedDumpsAreNotLoadedAsASuperuser: a backup this key cannot
+// authenticate could have been changed, and pg_restore runs what its dump
+// says with the connecting role's rights. Restored or verified, it needs
+// --accept-lost-credentials, is loaded with a warning, and is refused for a
+// superuser role before anything changes unless the operator passes
+// --accept-superuser. This deployment's own backup loads as any role.
+func TestUnverifiedDumpsAreNotLoadedAsASuperuser(t *testing.T) {
+	unverified := func(f *swapFixture) {
+		f.validate = ValidateOptions{KeyCheck: testKeyCheck}
+		f.ctl.superuser = true
+	}
+	f := newSwapFixture(t)
+	f.ctl.superuser = true
+	if err, _ := f.restore(); err != nil {
+		t.Fatalf("this deployment's backup as a superuser: %v\n%s", err, f.output.String())
+	}
+
+	f = newSwapFixture(t)
+	unverified(f)
+	if err, _ := f.restore(); !errors.Is(err, ErrUnauthenticatedBackup) || len(f.ctl.calls) != 0 {
+		t.Fatalf("unverified backup = %v, calls %v; want ErrUnauthenticatedBackup before any change", err, f.ctl.calls)
+	}
+	f.validate.AcceptLostCredentials = true
+	if err, _ := f.restore(); !errors.Is(err, ErrSuperuserLoad) || len(f.ctl.calls) != 0 || !strings.Contains(f.output.String(), msgUnverifiedLoad) {
+		t.Fatalf("accepted unverified backup as a superuser = %v, calls %v; want ErrSuperuserLoad before any change\n%s", err, f.ctl.calls, f.output.String())
+	}
+	f.validate.AcceptSuperuser = true
+	if err, _ := f.restore(); err != nil {
+		t.Fatalf("with --accept-superuser: %v\n%s", err, f.output.String())
+	}
+
+	f = newSwapFixture(t)
+	unverified(f)
+	loader := fakeLoader{ctl: f.ctl, m: f.src.Manifest}
+	f.ctl.dbs["scratch"] = &fakeDB{oid: 300, allow: true}
+	scratch := "postgres://silo@db.invalid/scratch"
+	if err := VerifyBackup(t.Context(), f.src, loader, scratch, f.validate, io.Discard); !errors.Is(err, ErrUnauthenticatedBackup) {
+		t.Fatalf("verify of an unverified backup = %v, want ErrUnauthenticatedBackup", err)
+	}
+	f.validate.AcceptLostCredentials = true
+	if err := VerifyBackup(t.Context(), f.src, loader, scratch, f.validate, io.Discard); !errors.Is(err, ErrSuperuserLoad) || len(f.ctl.calls) != 0 {
+		t.Fatalf("verify as a superuser = %v, calls %v; want ErrSuperuserLoad before loading", err, f.ctl.calls)
+	}
+	f.ctl.superuser = false
+	if err := VerifyBackup(t.Context(), f.src, loader, scratch, f.validate, io.Discard); err != nil {
+		t.Fatalf("verify as an ordinary role: %v", err)
 	}
 }
 
