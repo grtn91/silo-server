@@ -64,7 +64,9 @@ func (f folder) cleanCopy() bool {
 //     backups this server cannot verify, cannot rotate away the last copy it
 //     can restore with every blob;
 //   - before-restore copies are deleted once older than seven days;
-//   - before-upgrade copies keep the two newest.
+//   - before-upgrade copies keep the two newest, and always the two newest
+//     this server authenticated, so unverified copies at the destination
+//     cannot rotate its own away.
 //
 // Neither special kind counts toward keep.
 func planRotation(folders []folder, keep int, now time.Time, pinned map[string]bool) []string {
@@ -109,8 +111,14 @@ func planRotation(folders []folder, keep int, now time.Time, pinned map[string]b
 			drop(f)
 		}
 	}
+	verifiedUpgrades := map[string]bool{}
+	for _, f := range byKind[KindBeforeUpgrade] {
+		if f.verified && len(verifiedUpgrades) < beforeUpgradeKeep {
+			verifiedUpgrades[f.id] = true
+		}
+	}
 	for i, f := range byKind[KindBeforeUpgrade] {
-		if i >= beforeUpgradeKeep {
+		if i >= beforeUpgradeKeep && !verifiedUpgrades[f.id] {
 			drop(f)
 		}
 	}

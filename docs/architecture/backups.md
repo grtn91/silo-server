@@ -491,7 +491,9 @@ unencrypted copy to this server instead of the S3 bucket, and one of
   stands in for it. The listing sends `clean` per backup, and the page
   predicts rotation from that instead of deciding it again.
 - `before-restore` copies are deleted after 7 days; `before-upgrade` copies
-  keep the 2 newest. Neither counts toward `backup.keep`.
+  keep the 2 newest, and always the 2 newest whose manifests this server
+  authenticated, so unverified copies at the destination cannot rotate its
+  own away. Neither counts toward `backup.keep`.
 - Rotation manages only the current destination and the current server id's
   prefix, and never deletes a backup that is the source of a queued or
   running restore. A running restore holds the subsystem lock for its whole
