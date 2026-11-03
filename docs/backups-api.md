@@ -71,7 +71,8 @@ are `true` when available.
   interrupted run.
 - `keep`: `backup.keep`, how many nightly and manual backups rotation keeps.
 - `last_success_at`: when the latest successful backup finished (the newest
-  manifest when that is later).
+  manifest this server authenticated, when that is later; an unverified
+  manifest's completion time never counts).
 - `items`: this server's backups, newest first. Each has `id`, `kind`
   (`nightly`, `manual`, `before-restore`), `status`,
   `created_at`, `completed_at`, `size_bytes`, `silo_version`, `location`
