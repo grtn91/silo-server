@@ -156,8 +156,8 @@ type settingRoute struct {
 // Discord, TMDB, MDBList, IntroDB, and the watch providers connect to fixed
 // hosts; a plugin's configuration is restored whole or not at all.
 var settingRoutes = []settingRoute{
-	{endpoint: "email.smtp_host", secrets: []string{"email.smtp_password"}, enabled: "email.enabled", transport: settingSMTPSecurity},
-	{endpoint: "ai.base_url", secrets: []string{"ai.api_key"}},
+	{endpoint: settingSMTPHost, secrets: []string{settingSMTPPassword}, enabled: settingEmailEnabled, transport: settingSMTPSecurity},
+	{endpoint: settingAIBaseURL, secrets: []string{settingAIKey}},
 	{endpoint: "ai.asr_base_url", secrets: []string{"ai.asr_api_key"}},
 	{endpoint: "subtitle_ai.base_url", secrets: []string{"subtitle_ai.api_key"}},
 	{endpoint: "recommendations.embedding_base_url", secrets: []string{"recommendations.embedding_auth_token", "recommendations.openai_api_key"}},
