@@ -438,6 +438,7 @@ func (r *accountRestore) importTarget(ctx context.Context, c chosenProfile) (use
 		},
 		HasBlob:            a.rs.HasBlob,
 		PluginInstallation: a.pluginInstallation(ctx, r.tx),
+		Unverified:         a.rs.unverified,
 	}
 	if a.adminCollections == nil {
 		a.adminCollections = map[string]string{}

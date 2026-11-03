@@ -843,3 +843,4 @@
 ./internal/backup TestAccountsAndImportOnOneConnectionDB
 ./internal/backup TestImportsReadInBatchesDB
 ./internal/historyimport TestMatchAllAgreesWithMatchDB
+./internal/backup TestCollectionImportKeepsTheProfileQuotaDB

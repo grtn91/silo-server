@@ -1193,7 +1193,16 @@ for the whole list in one read. A document holds at most 10,000. Every
 list of every data type is written, and compared for a preview, in one
 set-based statement whatever its length (settings in one per scope);
 personal collections, at most 1,000 an import, are created or merged one
-at a time. `TestImportsReadInBatchesDB` drives each list and each sort
+at a time. An import or restore never leaves a profile with more than
+1,000 personal collections, or 50 with a sync schedule, counting the ones
+it has (read under the account's import lock): past either, a collection
+is left out or created without its schedule, and the result says so. The
+collection editor has no such limit. From a backup this server cannot
+verify, personal collections get no sync schedule either
+(`userdata.Target.Unverified`). Once an import or restore commits, a
+profile's notification interest is rebuilt once
+(`InterestUpdater.QueueProfileRebuild`, coalesced, at most 1,000 queued)
+rather than recomputed per item, and its recommendations refreshed once. `TestImportsReadInBatchesDB` drives each list and each sort
 kind with 100,000 and 1,000 distinct entries, every reference mapping,
 and requires a bounded number of statements.
 

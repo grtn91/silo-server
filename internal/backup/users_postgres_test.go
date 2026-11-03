@@ -1455,6 +1455,58 @@ type unknownItems struct{}
 
 func (unknownItems) Resolve(context.Context, string) (string, bool, error) { return "", false, nil }
 
+// TestCollectionImportKeepsTheProfileQuotaDB: an import counts the personal
+// collections the profile has: it creates none past maxProfileCollections,
+// and none with a sync schedule past maxScheduledCollections, so repeated
+// imports cannot grow either; a backup this server cannot verify restores
+// no schedule at all.
+func TestCollectionImportKeepsTheProfileQuotaDB(t *testing.T) {
+	pool, _ := testDB(t)
+	ctx := t.Context()
+	sfx := randomHex(t, 4)
+	user := testAccount(t, pool, "quota-"+sfx, "h", nil, nil)
+	profile := "quota-" + sfx
+	testProfile(t, pool, user, profile, "Quota", true, "")
+	// One short of each quota.
+	dbExec(t, pool, `INSERT INTO user_personal_collections (id, user_id, profile_id, creator_profile_id, name, native, sync_schedule)
+		SELECT 'q-' || $3 || '-' || n, $1, $2, $2, 'Have ' || n, true, CASE WHEN n <= 49 THEN '30 4 * * *' END FROM generate_series(1, 999) AS n`,
+		user, profile, sfx)
+	entry := func(name string) string {
+		return `{"id":"` + name + `","name":"` + name + `","type":"mdblist","source_url":"https://mdblist.com/lists/a/b","sync_schedule":"30 4 * * *",` +
+			`"watch_filter":"all","media_filter":"all","items":[],"shared_with":[]}`
+	}
+	doc := json.RawMessage(`{"collections":[` + entry("New-1") + "," + entry("New-2") + "," + entry("New-3") + `]}`)
+	dt, _ := userDataType(userdata.Collections)
+	scheduled := func(tx pgx.Tx) int {
+		t.Helper()
+		var n int
+		if err := tx.QueryRow(ctx, `SELECT count(*) FROM user_personal_collections WHERE user_id = $1 AND sync_schedule IS NOT NULL`, user).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	for _, unverified := range []bool{false, true} {
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		target := userdata.Target{Owner: userdata.Owner{UserID: user, ProfileID: profile}, Items: unknownItems{}, Now: time.Now(), SameServer: true,
+			Unverified: unverified, Library: func(id int) (int, bool) { return id, true }, Profile: func(string) (string, bool) { return "", false }}
+		res, err := dt.Import(ctx, tx, target, doc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		wantScheduled := 50
+		if unverified {
+			wantScheduled = 49
+		}
+		if res.Added != 1 || res.LeftOut != 2 || scheduled(tx) != wantScheduled {
+			t.Fatalf("unverified %v: imported %+v with %d scheduled, want 1 added, 2 left out, %d scheduled", unverified, res, scheduled(tx), wantScheduled)
+		}
+		_ = tx.Rollback(ctx)
+	}
+}
+
 // unknownRefs are refs for the items m0…m(n-1) and s0…s(n-1) the
 // samples name, with provider ids this catalog lacks, of every kind the
 // matcher reads: movies, episodes with series ids, and series.

@@ -268,6 +268,10 @@ func (BackupData) Import(ctx context.Context, tx pgx.Tx, target userdata.Target,
 		doc.Collections = doc.Collections[:maxImportedCollections]
 	}
 	unmatched, missingPosters, droppedSchedules := 0, 0, 0
+	quota, err := profileQuota(ctx, tx, target)
+	if err != nil {
+		return res, err
+	}
 	for _, c := range doc.Collections {
 		var items []string
 		for _, item := range c.Items {
@@ -287,7 +291,11 @@ func (BackupData) Import(ctx context.Context, tx pgx.Tx, target userdata.Target,
 		}
 		switch len(existing) {
 		case 0:
-			problem, err := createCollection(ctx, tx, target, c, items, &missingPosters, &droppedSchedules)
+			if !quota.take() {
+				res.LeftOut++
+				continue
+			}
+			problem, err := createCollection(ctx, tx, target, c, items, &missingPosters, &droppedSchedules, quota)
 			if err != nil {
 				return res, err
 			}
@@ -329,7 +337,79 @@ func (BackupData) Import(ctx context.Context, tx pgx.Tx, target userdata.Target,
 	if droppedSchedules > 0 {
 		res.Notes = append(res.Notes, fmt.Sprintf("%d collection sync schedules were not daily, weekly, or monthly, so those collections were created without one.", droppedSchedules))
 	}
+	res.Notes = append(res.Notes, quota.notes()...)
 	return res, nil
+}
+
+// The most personal collections, and scheduled ones, a profile has after an
+// import or restore, counting those it already has: an import never grows
+// them, or the provider fetches their schedules run, without bound. (The
+// collection editor has no limit of its own.)
+const (
+	maxProfileCollections   = 1000
+	maxScheduledCollections = 50
+)
+
+// collectionQuota is what an import may still add to a profile.
+type collectionQuota struct {
+	collections, scheduled int
+	// unverified withholds every schedule (userdata.Target.Unverified).
+	unverified bool
+	// What the import was refused: collections over the quota, schedules
+	// over theirs, schedules of an unverified backup.
+	overCollections, overScheduled, unverifiedSchedules int
+}
+
+// profileQuota reads what the profile has, under the account lock the
+// import holds (pgstore.LockAccountForImport).
+func profileQuota(ctx context.Context, tx pgx.Tx, target userdata.Target) (*collectionQuota, error) {
+	var have, scheduled int
+	if err := tx.QueryRow(ctx, `
+		SELECT count(*), count(*) FILTER (WHERE sync_schedule IS NOT NULL AND btrim(sync_schedule) <> '')
+		FROM user_personal_collections WHERE user_id = $1 AND creator_profile_id = $2 AND native`, target.UserID, target.ProfileID).Scan(&have, &scheduled); err != nil {
+		return nil, fmt.Errorf("counting personal collections: %w", err)
+	}
+	return &collectionQuota{collections: maxProfileCollections - have, scheduled: maxScheduledCollections - scheduled, unverified: target.Unverified}, nil
+}
+
+// take counts one new collection; false when the profile is at the quota.
+func (q *collectionQuota) take() bool {
+	if q.collections <= 0 {
+		q.overCollections++
+		return false
+	}
+	q.collections--
+	return true
+}
+
+// schedule is the schedule a new collection stores of the one it carries.
+func (q *collectionQuota) schedule(s *string) *string {
+	switch {
+	case s == nil:
+		return nil
+	case q.unverified:
+		q.unverifiedSchedules++
+		return nil
+	case q.scheduled <= 0:
+		q.overScheduled++
+		return nil
+	}
+	q.scheduled--
+	return s
+}
+
+func (q *collectionQuota) notes() []string {
+	var out []string
+	if q.overCollections > 0 {
+		out = append(out, fmt.Sprintf("%d collections were left out: a profile has at most %d personal collections.", q.overCollections, maxProfileCollections))
+	}
+	if q.overScheduled > 0 {
+		out = append(out, fmt.Sprintf("%d collections were created without their sync schedule: a profile has at most %d scheduled collections.", q.overScheduled, maxScheduledCollections))
+	}
+	if q.unverifiedSchedules > 0 {
+		out = append(out, fmt.Sprintf("%d collections were created without their sync schedule: schedules are not restored from a backup this server cannot verify.", q.unverifiedSchedules))
+	}
+	return out
 }
 
 func collectionsNamed(ctx context.Context, tx pgx.Tx, owner userdata.Owner, name string) ([]string, error) {
@@ -351,7 +431,8 @@ func collectionsNamed(ctx context.Context, tx pgx.Tx, owner userdata.Owner, name
 // copy it is dropped. Any other poster reference is kept as it is.
 // createCollection creates the imported collection, or says why it cannot
 // be created.
-func createCollection(ctx context.Context, tx pgx.Tx, target userdata.Target, c personalCollection, items []string, missingPosters, droppedSchedules *int) (string, error) {
+func createCollection(ctx context.Context, tx pgx.Tx, target userdata.Target, c personalCollection, items []string, missingPosters, droppedSchedules *int,
+	quota *collectionQuota) (string, error) {
 	query, display, source, ok := remapScopes(c, target)
 	if !ok {
 		return "its rules or sync source name only libraries that are not on this server", nil
@@ -373,7 +454,7 @@ func createCollection(ctx context.Context, tx pgx.Tx, target userdata.Target, c 
 	if poster == "" {
 		thumb = ""
 	}
-	schedule := importedSchedule(c, droppedSchedules)
+	schedule := quota.schedule(importedSchedule(c, droppedSchedules))
 	var displayArg any
 	if def.display != "" {
 		displayArg = def.display
@@ -614,6 +695,10 @@ func (BackupData) Pending(ctx context.Context, tx pgx.Tx, target userdata.Target
 		return userdata.Result{}, err
 	}
 	var res userdata.Result
+	quota, err := profileQuota(ctx, tx, target)
+	if err != nil {
+		return res, err
+	}
 	for _, c := range doc.Collections {
 		existing, err := collectionsNamed(ctx, tx, target.Owner, c.Name)
 		if err != nil {
@@ -621,7 +706,7 @@ func (BackupData) Pending(ctx context.Context, tx pgx.Tx, target userdata.Target
 		}
 		switch len(existing) {
 		case 0:
-			if _, _, _, ok := remapScopes(c, target); ok {
+			if _, _, _, ok := remapScopes(c, target); ok && quota.take() {
 				res.Added++
 			} else {
 				res.LeftOut++

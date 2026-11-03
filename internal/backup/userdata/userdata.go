@@ -141,6 +141,10 @@ type Target struct {
 	Collections func(ctx context.Context, field string, ids []string) (map[string]string, error)
 	// Now stamps rows that need a time of their own.
 	Now time.Time
+	// Unverified marks a document from a backup this server cannot verify:
+	// nothing it names may make this server fetch from outside services on
+	// a schedule.
+	Unverified bool
 	// Untrusted marks a profile's own export, which whoever holds it could
 	// have edited. Its import must not write rows other accounts read, such
 	// as shared watchlist titles, from the document.
