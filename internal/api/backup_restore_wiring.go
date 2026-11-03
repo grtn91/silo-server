@@ -12,6 +12,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/notifications"
+	"github.com/Silo-Server/silo-server/internal/recommendations"
 )
 
 // wireBackupRestore gives selective restore the write paths it applies
@@ -84,20 +85,22 @@ func wireBackupRestore(deps Dependencies, admin *handlers.AdminHandler, librarie
 	if pageSections != nil {
 		targets.CheckSection = pageSections.CheckRestoredSection
 	}
-	targets.ItemsChanged = interestChanges(deps.Notifications)
+	targets.ItemsChanged = importedChanges(deps.Notifications, deps.RecWorker)
 	deps.Backups.SetRestoreTargets(targets)
 }
 
-// interestChanges queues a notification interest recompute for each item a
-// profile's restored or imported data names, as the user store's own writes
-// do (notifications.WrapUserStoreProvider); nil without notifications.
-func interestChanges(system *notifications.System) backup.ItemsChanged {
-	if system == nil || system.Interest == nil {
-		return nil
-	}
+// importedChanges is what a profile's restored or imported data sets off
+// after it commits, as the user store's own writes do: a notification
+// interest recompute for each item it names
+// (notifications.WrapUserStoreProvider), and a recommendations refresh,
+// since its ratings, favorites, and history are taste signals.
+func importedChanges(system *notifications.System, rec *recommendations.Worker) backup.ItemsChanged {
 	return func(userID int, profileID string, itemIDs []string) {
-		for _, id := range itemIDs {
-			system.Interest.QueueItemMutation(userID, profileID, id)
+		if system != nil && system.Interest != nil {
+			for _, id := range itemIDs {
+				system.Interest.QueueItemMutation(userID, profileID, id)
+			}
 		}
+		rec.NotifySignalsChanged(context.Background(), userID, profileID)
 	}
 }

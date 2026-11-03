@@ -262,6 +262,11 @@ func (BackupData) Import(ctx context.Context, tx pgx.Tx, target userdata.Target,
 		return userdata.Result{}, err
 	}
 	var res userdata.Result
+	if extra := len(doc.Collections) - maxImportedCollections; extra > 0 {
+		res.LeftOut += extra
+		res.Notes = append(res.Notes, fmt.Sprintf("Only the first %d collections were restored; %d more were left out.", maxImportedCollections, extra))
+		doc.Collections = doc.Collections[:maxImportedCollections]
+	}
 	unmatched, missingPosters, droppedSchedules := 0, 0, 0
 	for _, c := range doc.Collections {
 		var items []string
@@ -282,13 +287,13 @@ func (BackupData) Import(ctx context.Context, tx pgx.Tx, target userdata.Target,
 		}
 		switch len(existing) {
 		case 0:
-			created, err := createCollection(ctx, tx, target, c, items, &missingPosters, &droppedSchedules)
+			problem, err := createCollection(ctx, tx, target, c, items, &missingPosters, &droppedSchedules)
 			if err != nil {
 				return res, err
 			}
-			if !created {
+			if problem != "" {
 				res.LeftOut++
-				res.Notes = append(res.Notes, fmt.Sprintf("The collection %q was left out: its rules or sync source name only libraries that are not on this server.", c.Name))
+				res.Notes = append(res.Notes, fmt.Sprintf("The collection %q was left out: %s.", c.Name, problem))
 				continue
 			}
 			res.Added++
@@ -344,34 +349,34 @@ func collectionsNamed(ctx context.Context, tx pgx.Tx, owner userdata.Owner, name
 // uploaded poster is copied under the new id before the row that references
 // it (a rollback leaves an orphan for the orphan sweeps); with no file to
 // copy it is dropped. Any other poster reference is kept as it is.
-func createCollection(ctx context.Context, tx pgx.Tx, target userdata.Target, c personalCollection, items []string, missingPosters, droppedSchedules *int) (bool, error) {
+// createCollection creates the imported collection, or says why it cannot
+// be created.
+func createCollection(ctx context.Context, tx pgx.Tx, target userdata.Target, c personalCollection, items []string, missingPosters, droppedSchedules *int) (string, error) {
 	query, display, source, ok := remapScopes(c, target)
 	if !ok {
-		return false, nil
+		return "its rules or sync source name only libraries that are not on this server", nil
+	}
+	def, problem := canonicalDefinition(query, display, c.SortConfig, source)
+	if problem != "" {
+		return problem, nil
 	}
 	group, err := ensureGroup(ctx, tx, target.UserID, c.Group)
 	if err != nil {
-		return false, err
+		return "", err
 	}
 	id := uuid.NewString()
 	poster, err := copyPoster(ctx, target, c, id, missingPosters)
 	if err != nil {
-		return false, err
+		return "", err
 	}
 	thumb := c.PosterThumbhash
 	if poster == "" {
 		thumb = ""
 	}
 	schedule := importedSchedule(c, droppedSchedules)
-	orEmpty := func(raw json.RawMessage) string {
-		if len(raw) == 0 {
-			return "{}"
-		}
-		return string(raw)
-	}
 	var displayArg any
-	if len(display) > 0 {
-		displayArg = string(display)
+	if def.display != "" {
+		displayArg = def.display
 	}
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO user_personal_collections (
@@ -381,15 +386,65 @@ func createCollection(ctx context.Context, tx pgx.Tx, target userdata.Target, c 
 		VALUES ($1, $2, $3, $3, $4, $5, $6, $7, $8, $9::jsonb, $10::jsonb, $11::jsonb, $12, $13::jsonb, $14, $15, $16, $17, $18, $19, $20,
 			COALESCE((SELECT MAX(sort_order) + 1 FROM user_personal_collections WHERE user_id = $2 AND creator_profile_id = $3 AND native), 0), TRUE)`,
 		id, target.UserID, target.ProfileID, c.Name, c.Description, c.Type, c.IsShared, c.IncludeInServerCollections,
-		orEmpty(query), displayArg, orEmpty(c.SortConfig), c.SourceURL, orEmpty(source), schedule,
+		def.query, displayArg, def.sort, c.SourceURL, def.source, schedule,
 		InitialNextSyncAt(schedule), c.WatchFilter, c.MediaFilter, poster, thumb, group); err != nil {
-		return false, fmt.Errorf("creating personal collection %q: %w", c.Name, err)
+		return "", fmt.Errorf("creating personal collection %q: %w", c.Name, err)
 	}
 	if _, err := addMissingItems(ctx, tx, target.UserID, id, items); err != nil {
-		return false, err
+		return "", err
 	}
 	_, err = shareWith(ctx, tx, target, id, c.SharedWith)
-	return err == nil, err
+	return "", err
+}
+
+// maxImportedCollections bounds the collections one import creates or
+// merges into: each is a few statements of its own.
+const maxImportedCollections = 1000
+
+// maxDefinitionBytes bounds each of an imported collection's definitions
+// (rules, display filter, sort, sync source) as the API's request body cap
+// bounds what an editor stores.
+const maxDefinitionBytes = 1 << 20
+
+// definition is an imported collection's definitions in the form its
+// editors store them.
+type definition struct {
+	query, display, sort, source string
+}
+
+// canonicalDefinition runs an imported collection's definitions through
+// the editors' canonicalizers and validators (catalog), or says why one
+// fails: a definition an editor would refuse is never stored, since every
+// read of the collection list decodes it.
+func canonicalDefinition(query, display, sort, source json.RawMessage) (definition, string) {
+	for _, raw := range []json.RawMessage{query, display, sort, source} {
+		if len(raw) > maxDefinitionBytes {
+			return definition{}, "its rules are larger than an editor accepts"
+		}
+	}
+	def := definition{query: "{}", sort: "{}", source: "{}"}
+	if trimmed := strings.TrimSpace(string(query)); trimmed != "" && trimmed != "{}" && trimmed != "null" {
+		normalized, err := catalog.NormalizeSmartCollectionQueryJSON(query, true, true, false)
+		if err != nil {
+			return definition{}, "its rules are not ones this server accepts"
+		}
+		def.query = string(normalized)
+	}
+	var err error
+	if def.display, err = catalog.NormalizeDisplayQueryFragment(display); err != nil {
+		return definition{}, "its display filter is not one this server accepts"
+	}
+	if def.sort, err = catalog.NormalizeCollectionSortConfig(sort, true); err != nil {
+		return definition{}, "its sort is not one this server accepts"
+	}
+	if len(source) > 0 {
+		var object map[string]json.RawMessage
+		if json.Unmarshal(source, &object) != nil || object == nil {
+			return definition{}, "its sync source is not one this server accepts"
+		}
+		def.source = string(source)
+	}
+	return def, ""
 }
 
 // remapScopes maps the libraries of the collection's smart rules, display

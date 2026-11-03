@@ -2937,7 +2937,7 @@ func newChiRouter(deps Dependencies) chi.Router {
 		v2deps.AdminStorageTransition = deps.StorageTransition
 	}
 	if deps.ProfileTransfer != nil {
-		deps.ProfileTransfer.SetItemsChanged(interestChanges(deps.Notifications))
+		deps.ProfileTransfer.SetItemsChanged(importedChanges(deps.Notifications, deps.RecWorker))
 		v2deps.ProfileTransfer = deps.ProfileTransfer
 	}
 	if deps.Backups != nil {

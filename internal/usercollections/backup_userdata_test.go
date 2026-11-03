@@ -1,6 +1,8 @@
 package usercollections
 
 import (
+	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/Silo-Server/silo-server/internal/backup/userdata"
@@ -48,5 +50,34 @@ func TestImportedScheduleKeepsOnlyAllowedCadences(t *testing.T) {
 		if (got == nil && tc.want != "") || (got != nil && *got != tc.want) || (dropped == 1) != tc.dropped {
 			t.Errorf("importedSchedule(%s, %v) = %v, dropped %d", tc.kind, tc.schedule, got, dropped)
 		}
+	}
+}
+
+// TestImportedDefinitionsAreCanonical: an imported collection's
+// definitions go through the editors' canonicalizers, and one an editor
+// would refuse leaves the collection out with a reason.
+func TestImportedDefinitionsAreCanonical(t *testing.T) {
+	huge := json.RawMessage(`{"x":"` + strings.Repeat("y", maxDefinitionBytes) + `"}`)
+	for name, c := range map[string]struct {
+		query, display, sort, source json.RawMessage
+		ok                           bool
+	}{
+		"valid":             {query: json.RawMessage(`{"library_ids":[7],"match":"all","groups":[]}`), sort: json.RawMessage(`{}`), source: json.RawMessage(`{}`), ok: true},
+		"manual":            {query: json.RawMessage(`{}`), ok: true},
+		"library ids":       {query: json.RawMessage(`{"library_ids":1}`)},
+		"oversized rules":   {query: huge},
+		"oversized source":  {source: huge},
+		"unsupported sort":  {sort: json.RawMessage(`{"field":"nope","order":"asc"}`)},
+		"source not object": {source: json.RawMessage(`[1]`)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			def, problem := canonicalDefinition(c.query, c.display, c.sort, c.source)
+			if (problem == "") != c.ok {
+				t.Fatalf("problem %q, want ok %v", problem, c.ok)
+			}
+			if c.ok && (def.query == "" || def.sort == "" || def.source == "") {
+				t.Fatalf("definition %+v has an empty part", def)
+			}
+		})
 	}
 }

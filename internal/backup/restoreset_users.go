@@ -614,6 +614,11 @@ func validateUserDocument(doc *UserDocument) ([]string, error) {
 			return nil, fmt.Errorf("profile id %q is not valid or is listed twice", p.ID)
 		}
 		seen[p.ID] = true
+		bounded := *p
+		bounded.Data = nil // each data type bounds its own document
+		if entryTooLarge(bounded) {
+			return nil, fmt.Errorf("profile %q holds more than this server's editors accept in one request", p.ID)
+		}
 		keys, err := validateProfileEntry(p)
 		if err != nil {
 			return nil, err
@@ -639,6 +644,9 @@ func validateUserDocument(doc *UserDocument) ([]string, error) {
 func validateAccountEntry(a AccountEntry) error {
 	if a.ID <= 0 {
 		return fmt.Errorf("account id %d is not valid", a.ID)
+	}
+	if entryTooLarge(a) {
+		return fmt.Errorf("account %d holds more than this server's editors accept in one request", a.ID)
 	}
 	for _, s := range []string{a.Username, a.Email, a.PasswordHash} {
 		if len(s) > maxAccountField || !utf8.ValidString(s) {

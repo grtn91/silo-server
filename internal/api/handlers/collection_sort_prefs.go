@@ -33,46 +33,9 @@ type CollectionSortPreferenceResponse struct {
 	Order          string `json:"order"`
 }
 
-// NormalizeCollectionSortConfig validates the default sort a collection's
-// creator configured and returns its canonical sort_config JSON. Shared by the
-// personal and library collection handlers so both id spaces accept exactly the
-// same vocabulary.
-//
-// allowPersonalized must be false for library collection defaults because
-// those defaults are shared across profiles. Viewer overrides are validated
-// separately and may use profile-scoped fields for either collection kind.
+// NormalizeCollectionSortConfig is catalog.NormalizeCollectionSortConfig.
 func NormalizeCollectionSortConfig(raw json.RawMessage, allowPersonalized bool) (string, error) {
-	trimmed := strings.TrimSpace(string(raw))
-	if trimmed == "" || trimmed == jsonNullLiteral || trimmed == "{}" {
-		return "{}", nil
-	}
-	var cfg struct {
-		Field string `json:"field"`
-		Order string `json:"order"`
-	}
-	if err := json.Unmarshal(raw, &cfg); err != nil {
-		return "", errInvalidSortConfig
-	}
-	if strings.TrimSpace(cfg.Field) == "" {
-		// sort_config predates default sorting and may contain independent
-		// collection modes such as {"mode":"manual_pins"}. Preserve those
-		// configurations byte-for-byte instead of erasing them merely because
-		// they do not contain a sort field.
-		return string(raw), nil
-	}
-	qs, ok := catalog.NormalizeCollectionSort(cfg.Field, cfg.Order, allowPersonalized)
-	if !ok {
-		return "", errInvalidSortConfig
-	}
-	return catalog.EncodeCollectionDefaultSort(qs, true)
-}
-
-var errInvalidSortConfig = &sortConfigError{}
-
-type sortConfigError struct{}
-
-func (*sortConfigError) Error() string {
-	return "sort_config must be {} or {\"field\":\"<supported sort>\",\"order\":\"asc|desc\"}"
+	return catalog.NormalizeCollectionSortConfig(raw, allowPersonalized)
 }
 
 // HandleSetCollectionSortPreference handles PUT /collections/sort-preference.

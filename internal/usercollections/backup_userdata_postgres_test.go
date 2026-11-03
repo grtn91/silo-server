@@ -50,7 +50,7 @@ func TestCollectionImportRemapsLibrariesDB(t *testing.T) {
 	doc := collectionsDocument{Collections: []personalCollection{
 		{ID: "c1", Name: "Remapped", Type: "smart", WatchFilter: "all", MediaFilter: "all", Items: []string{}, SharedWith: []string{}, Group: group,
 			QueryDefinition: json.RawMessage(`{"library_ids":[7,8],"match":"all","groups":[]}`), SortConfig: json.RawMessage(`{}`),
-			DisplayQueryDefinition: json.RawMessage(`{"filter_library_id":7}`), SourceConfig: json.RawMessage(`{"mode":"tmdb","library_ids":[7]}`)},
+			DisplayQueryDefinition: json.RawMessage(`{"match":"all","groups":[{"match":"all","rules":[{"field":"watched","op":"is","value":false}]}]}`), SourceConfig: json.RawMessage(`{"mode":"tmdb","library_ids":[7]}`)},
 		{ID: "c2", Name: "Elsewhere", Type: "smart", WatchFilter: "all", MediaFilter: "all", Items: []string{}, SharedWith: []string{},
 			QueryDefinition: json.RawMessage(`{"library_ids":[8],"match":"all","groups":[]}`), SortConfig: json.RawMessage(`{}`), SourceConfig: json.RawMessage(`{}`)},
 		{ID: "c3", Name: "Source elsewhere", Type: "tmdb", WatchFilter: "all", MediaFilter: "all", Items: []string{}, SharedWith: []string{},
@@ -81,12 +81,12 @@ func TestCollectionImportRemapsLibrariesDB(t *testing.T) {
 	}
 	var query, display, source, slug string
 	if err := pool.QueryRow(ctx, `
-		SELECT c.query_definition->>'library_ids', c.display_query_definition->>'filter_library_id', c.source_config->>'library_ids', g.slug
+		SELECT c.query_definition->>'library_ids', c.display_query_definition->'groups'->0->'rules'->0->>'field', c.source_config->>'library_ids', g.slug
 		FROM user_personal_collections c JOIN user_collection_groups g ON g.user_id = c.user_id AND g.id = c.group_id
 		WHERE c.user_id = $1 AND c.name = 'Remapped'`, userID).Scan(&query, &display, &source, &slug); err != nil {
 		t.Fatal(err)
 	}
-	if query != "[70001]" || display != "70001" || source != "[70001]" || slug != group.Slug {
+	if query != "[70001]" || display != "watched" || source != "[70001]" || slug != group.Slug {
 		t.Fatalf("restored definitions query %s display %s source %s group %s", query, display, source, slug)
 	}
 	var others int
