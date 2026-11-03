@@ -644,6 +644,60 @@ func (f *selectiveFixture) unverify(t *testing.T, backupID string) {
 	}
 }
 
+// sizedFence is a testFence that records how many bytes of result each
+// commit wrote.
+type sizedFence struct {
+	testFence
+	written []int
+}
+
+func (f *sizedFence) run(ctx context.Context, fn func(pgx.Tx) (FencedUpdate, error)) error {
+	return f.testFence.run(ctx, func(tx pgx.Tx) (FencedUpdate, error) {
+		update, err := fn(tx)
+		data, _ := json.Marshal(update.Result)
+		f.written = append(f.written, len(data))
+		return update, err
+	})
+}
+
+// TestRestoreItemWritesDoNotGrowDB: each item's commit writes a result the
+// same size whatever its place in the restore (counts, the library map, the
+// latest outcomes), each outcome is a row of its own, and the report the
+// restore returns lists every item, its rows removed.
+func TestRestoreItemWritesDoNotGrowDB(t *testing.T) {
+	f := newSelectiveFixture(t)
+	ctx := t.Context()
+	source, err := backupUnderLock(t, f.svc, KindManual)
+	if err != nil {
+		t.Fatal(err)
+	}
+	preview, err := f.svc.Preview(ctx, source.ID, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := make([]string, 300)
+	for i := range ids {
+		ids[i] = strconv.Itoa(900000 + i) // not in the backup: left out, each its own item
+	}
+	fence := &sizedFence{testFence: testFence{pool: f.pool}}
+	payload, _ := json.Marshal(RestoreRequest{BackupID: source.ID, Digest: preview.Digest, Selection: map[string][]string{SectionLibraries: ids}})
+	result, err := f.svc.ExecuteRestore(ctx, RestoreRun{JobID: "items-" + randomHex(t, 4), Payload: payload, Fenced: fence.run})
+	if err != nil {
+		t.Fatal(err)
+	}
+	report := result.(*SelectiveReport)
+	if len(report.Items) != len(ids) {
+		t.Fatalf("report lists %d items, want %d", len(report.Items), len(ids))
+	}
+	early, late := fence.written[recentItems+2], fence.written[len(fence.written)-1]
+	if late > early+early/4 {
+		t.Fatalf("the last item's commit wrote %d bytes, the %dth %d: writes grow with the item's place", late, recentItems+2, early)
+	}
+	if n := countRows(t, f.pool, `SELECT count(*) FROM backup_restore_items`); n != 0 {
+		t.Fatalf("%d outcome rows left after the restore", n)
+	}
+}
+
 // TestUnverifiedRestoreLeavesCostlyWorkOffDB: a verified backup's preview
 // names the options of a library that send its data to outside services or
 // run long jobs; restored from a backup this server cannot verify, the

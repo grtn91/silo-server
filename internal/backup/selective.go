@@ -235,6 +235,9 @@ type FencedUpdate struct {
 // RestoreRun is one claimed restore job, as the admin job runner hands it
 // over.
 type RestoreRun struct {
+	// JobID names the run's item outcome rows (backup_restore_items); a
+	// run without one gets an id of its own.
+	JobID   string
 	Payload []byte
 	// Fenced runs fn in a transaction that locks the job row first,
 	// requiring it running under this worker's claim, and records fn's update
