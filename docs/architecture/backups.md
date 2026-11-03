@@ -451,11 +451,21 @@ and digest, and every listed file present; blobs only under their section's
 prefixes and only keys the section references, or variants stored in a
 referenced artwork original's directory; documents that decode strictly
 (unknown fields and trailing data refused) and match the index counts; and
-limits on entries (200,000), document size (64 MiB; 32 MiB for the index,
-16 MiB for `settings.json` and each `plugin.json`), the documents one read
-holds together (256 MiB, checked from the index's listed sizes before any
-document is read), plugin archive and blob size (256 MiB), total bytes
-(32 GiB), and JSON nesting (32). A plugin archive is checked against its
+limits on entries (200,000), document size (64 MiB for the collections and
+account documents, 32 MiB for the index, 8 MiB for `libraries.json` and
+`home-sections.json`, 4 MiB for `settings.json` and each `plugin.json`), the
+documents one read holds together (256 MiB, checked from the index's listed
+sizes before any document is read), plugin archive and blob size (256 MiB),
+total bytes (32 GiB), and JSON nesting (32). What a document decodes to is
+bounded too, before it is decoded: `internal/backup/jsonsize` walks the
+document beside its Go type and adds up what `encoding/json` would allocate
+(each array element at its type's size, doubled for slice growth; map
+entries, pointers, strings, raw values). A document is refused when that is
+over 8 times its size plus 64 KiB, when the set's documents together would
+decode to over 256 MiB, or when one array or object holds over 1,000,000
+elements. A short document of empty elements (`[{},{},…]`) would otherwise
+decode to a whole struct per three bytes; documents Silo writes decode to
+about their size. A plugin archive is checked against its
 digest and discarded, never installed ([Plugins](#plugins)). Readers accept
 every format version up to theirs and refuse a newer one with "This backup is
 from a newer Silo. Upgrade this server first."
