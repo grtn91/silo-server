@@ -85,6 +85,39 @@ func (s *Service) backupTime(ctx context.Context) string {
 	return fmt.Sprintf("%02d:%02d", hour, minute)
 }
 
+// nightlySlot is the scheduled time a nightly run at now belongs to: the
+// latest backup.time (HH:MM) at or before now, in this process's local
+// time zone, the one the daily trigger fires in.
+func nightlySlot(now time.Time, at string) time.Time {
+	hour, minute, ok := config.ParseBackupTime(at)
+	if !ok {
+		hour, minute, _ = config.ParseBackupTime(config.DefaultBackupTime)
+	}
+	local := now.In(time.Local)
+	slot := time.Date(local.Year(), local.Month(), local.Day(), hour, minute, 0, 0, time.Local)
+	if slot.After(local) {
+		slot = slot.AddDate(0, 0, -1)
+	}
+	return slot
+}
+
+// slotBackedUp reports whether a scheduled backup already succeeded for
+// slot, on any server. Servers in different time zones compute different
+// slots for one night; any recorded slot within the 24 hours before this
+// one counts, so a mismatch (or a changed backup.time) at worst skips one
+// night's run, and never takes a second copy in one day. A failed nightly
+// records no slot, so the next server still tries.
+func (s *Service) slotBackedUp(ctx context.Context, slot time.Time) (bool, error) {
+	if s.opts.Status == nil {
+		return false, nil
+	}
+	rec, err := s.opts.Status.Read(ctx)
+	if err != nil {
+		return false, fmt.Errorf("reading the latest nightly backup: %w", err)
+	}
+	return rec.LastNightlySlot != nil && rec.LastNightlySlot.After(slot.Add(-24*time.Hour)), nil
+}
+
 func scheduleFor(at string) []taskmanager.TriggerConfig {
 	return []taskmanager.TriggerConfig{{Type: taskmanager.TriggerTypeDaily, TimeOfDay: at}}
 }

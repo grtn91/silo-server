@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/Silo-Server/silo-server/internal/blobstore"
+	"github.com/Silo-Server/silo-server/internal/config"
 	"github.com/Silo-Server/silo-server/internal/taskmanager"
 )
 
@@ -42,8 +43,10 @@ func TestSubsystemLockSerializesBackupsAndDeletesDB(t *testing.T) {
 		Pool: pool, Stores: blobstore.Stores{Assets: store, Operational: store}, Destination: NewStoreDestination(store),
 		Locker: locker, ServerID: func(context.Context) (string, error) { return serverID, nil },
 		FindTools: func(context.Context) (Tools, error) { return Tools{}, ErrToolMissing },
+		Status:    PostgresStatus{Pool: pool},
 	})
 	svc.SetTaskStarter(starter)
+	t.Cleanup(func() { _, _ = pool.Exec(context.Background(), `UPDATE backup_status SET last_nightly_slot = NULL`) })
 
 	other, err := locker.TryLock(ctx)
 	if err != nil {
@@ -61,6 +64,32 @@ func TestSubsystemLockSerializesBackupsAndDeletesDB(t *testing.T) {
 	result, err := svc.RunTask(ctx, nil)
 	if err != nil || result.Skipped != SkippedBusy {
 		t.Fatalf("scheduled run while locked = %+v, %v; want a skip", result, err)
+	}
+	// Another server already took tonight's backup: the next server's
+	// scheduled run, once the lock is free, skips it and deletes nothing.
+	// Yesterday's backup leaves tonight's to take.
+	slot := nightlySlot(time.Now(), config.DefaultBackupTime)
+	if _, err := pool.Exec(ctx, `INSERT INTO backup_status (singleton) VALUES (true) ON CONFLICT (singleton) DO NOTHING`); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		last time.Time
+		skip bool
+	}{{slot, true}, {slot.Add(-24 * time.Hour), false}} {
+		if _, err := pool.Exec(ctx, `UPDATE backup_status SET last_nightly_slot = $1`, tc.last); err != nil {
+			t.Fatal(err)
+		}
+		other.Release(ctx)
+		result, _ := svc.RunTask(ctx, nil)
+		if (result.Skipped == SkippedAlreadyDone) != tc.skip {
+			t.Fatalf("scheduled run after the slot of %v = %+v; want skipped %v", tc.last, result, tc.skip)
+		}
+		if _, err := store.Stat(ctx, objectKey(serverID, id, ManifestName)); err != nil {
+			t.Fatalf("the backup is gone after a skipped scheduled run: %v", err)
+		}
+		if other, err = locker.TryLock(ctx); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if _, err := store.Stat(ctx, objectKey(serverID, id, ManifestName)); err != nil {
 		t.Fatalf("the backup is gone after refused operations: %v", err)

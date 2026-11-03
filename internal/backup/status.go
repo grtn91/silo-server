@@ -48,6 +48,9 @@ type LastRun struct {
 	StartedAt  time.Time `json:"started_at"`
 	FinishedAt time.Time `json:"finished_at,omitzero"`
 	Error      string    `json:"error,omitempty"`
+	// NightlySlot is a scheduled run's slot (nightlySlot); zero for any
+	// other run. A successful one records it as the latest nightly slot.
+	NightlySlot time.Time `json:"-"`
 }
 
 // succeeded reports a run that wrote its manifest.
@@ -62,6 +65,8 @@ type StatusRecord struct {
 	// LastSuccessAt is when the latest successful run finished, at whichever
 	// destination it wrote to.
 	LastSuccessAt *time.Time
+	// LastNightlySlot is the slot of the latest successful scheduled run.
+	LastNightlySlot *time.Time
 }
 
 // StatusStore publishes what the lock holder is doing. Writes run on the
@@ -149,10 +154,19 @@ func (p PostgresStatus) End(ctx context.Context, held Held, token string, last *
 	_, err := held.Exec(ctx, `UPDATE backup_status SET `+clearActive+`,
 			last_run_id = $2, last_run_kind = $3, last_run_status = $4, last_run_started_at = $5,
 			last_run_finished_at = $6, last_run_error = $7,
-			last_success_at = CASE WHEN $8 THEN $6 ELSE last_success_at END
+			last_success_at = CASE WHEN $8 THEN $6 ELSE last_success_at END,
+			last_nightly_slot = CASE WHEN $8 AND $9::timestamptz IS NOT NULL THEN $9 ELSE last_nightly_slot END
 		WHERE singleton AND active_token = $1 AND $1 <> '' AND `+holdsLock,
-		token, last.ID, string(last.Kind), last.Status, last.StartedAt, finished, last.Error, last.succeeded() && finished != nil)
+		token, last.ID, string(last.Kind), last.Status, last.StartedAt, finished, last.Error, last.succeeded() && finished != nil, nightlySlotArg(last))
 	return err
+}
+
+// nightlySlotArg is a run's slot to record, or nil.
+func nightlySlotArg(last *LastRun) *time.Time {
+	if last.Kind != KindNightly || last.NightlySlot.IsZero() {
+		return nil
+	}
+	return &last.NightlySlot
 }
 
 func (p PostgresStatus) Read(ctx context.Context) (StatusRecord, error) {
@@ -165,19 +179,20 @@ func (p PostgresStatus) Read(ctx context.Context) (StatusRecord, error) {
 		lockStart                               *time.Time
 		lastID, lastKind, lastStatus, lastError string
 		lastStarted, lastFinished, lastSuccess  *time.Time
+		lastSlot                                *time.Time
 	)
 	err := p.Pool.QueryRow(ctx, `
 		SELECT active_operation, active_backup_id, active_kind, active_started_at, active_progress, active_message, active_lock_pid, active_lock_backend_start,
-			last_run_id, last_run_kind, last_run_status, last_run_started_at, last_run_finished_at, last_run_error, last_success_at
+			last_run_id, last_run_kind, last_run_status, last_run_started_at, last_run_finished_at, last_run_error, last_success_at, last_nightly_slot
 		FROM backup_status WHERE singleton`).Scan(&op, &activeID, &activeKind, &activeStarted, &progress, &activeMessage, &lockPID, &lockStart,
-		&lastID, &lastKind, &lastStatus, &lastStarted, &lastFinished, &lastError, &lastSuccess)
+		&lastID, &lastKind, &lastStatus, &lastStarted, &lastFinished, &lastError, &lastSuccess, &lastSlot)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return StatusRecord{}, nil
 	}
 	if err != nil {
 		return StatusRecord{}, err
 	}
-	rec := StatusRecord{LastSuccessAt: lastSuccess}
+	rec := StatusRecord{LastSuccessAt: lastSuccess, LastNightlySlot: lastSlot}
 	if op != "" {
 		rec.Active = &ActiveOperation{Operation: op, BackupID: activeID, Kind: Kind(activeKind), Progress: progress, Message: activeMessage, Lock: LockSession{PID: lockPID}}
 		if lockStart != nil {
