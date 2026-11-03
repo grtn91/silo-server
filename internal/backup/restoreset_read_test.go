@@ -323,6 +323,38 @@ func setDocument(index *RestoreSetIndex, entries []testEntry, name string, data 
 	}
 }
 
+// TestUnusableEntriesAreCappedPerSection: a section of 500,000 malformed
+// entries lists the first maxUnusableListed and counts the rest in one
+// more, so a preview never builds an item for each.
+func TestUnusableEntriesAreCappedPerSection(t *testing.T) {
+	const bad = 500_000
+	index, entries := testRestoreSet()
+	setDocument(&index, entries, homeSectionsDocumentName, mustJSON(HomeSectionsDocument{Sections: []HomeSectionEntry{}}), 0)
+	for i := range index.Sections {
+		if index.Sections[i].ID == SectionCollections {
+			index.Sections[i].Blobs = []string{}
+		}
+	}
+	entries = slices.DeleteFunc(entries, func(e testEntry) bool { return strings.HasPrefix(e.name, "blobs/collection-images/") })
+	malformed := `{"content_id":"m","title":"` + strings.Repeat("t", 40) + `"}`
+	doc := `{"collections":[],"item_artwork":[` + strings.Repeat(malformed+",", bad-1) + malformed + `],"branding":[]}`
+	setDocument(&index, entries, collectionsDocumentName, []byte(doc), bad)
+	rs, err := ReadRestoreSet(context.Background(), bytes.NewReader(buildTar(t, index, entries)), ReadOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	listed := 0
+	for _, e := range rs.Unusable {
+		if e.Section == SectionCollections {
+			listed++
+		}
+	}
+	last := rs.Unusable[len(rs.Unusable)-1]
+	if listed != maxUnusableListed+1 || last.Label != fmt.Sprintf("%d more entries", bad-maxUnusableListed) {
+		t.Fatalf("listed %d unusable entries, the last %+v; want %d and a count of the rest", listed, last, maxUnusableListed+1)
+	}
+}
+
 // TestEveryEntryHasOneSizeBound: every kind of entry a restore writes is
 // left out, as unusable, when it holds more than an editor accepts in one
 // request (maxRestoredEntryBytes); the rest of the set stays readable.

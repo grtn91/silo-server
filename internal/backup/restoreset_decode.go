@@ -75,8 +75,19 @@ type UnusableEntry struct {
 	Message string
 }
 
-// unusable records an entry left out, labeled by what the archive names it.
+// maxUnusableListed bounds the entries left out that a set lists for one
+// section; the rest are counted (summarizeUnusable).
+const maxUnusableListed = 100
+
+// unusable records an entry left out, labeled by what the archive names it:
+// the first maxUnusableListed of a section, and a count of the rest.
 func (p *restoreSetParser) unusable(section, kind, label, message string) {
+	if p.unusableCount == nil {
+		p.unusableCount = map[string]int{}
+	}
+	if p.unusableCount[section]++; p.unusableCount[section] > maxUnusableListed {
+		return
+	}
 	label = strings.TrimSpace(strings.ToValidUTF8(label, ""))
 	if len(label) > 200 {
 		label = strings.ToValidUTF8(label[:200], "")
@@ -86,6 +97,24 @@ func (p *restoreSetParser) unusable(section, kind, label, message string) {
 	}
 	p.rs.Unusable = append(p.rs.Unusable, UnusableEntry{Section: section, ID: fmt.Sprintf("unreadable:%d", len(p.rs.Unusable)+1),
 		Kind: kind, Label: label, Message: message})
+}
+
+// summarizeUnusable adds, for a section with more entries left out than it
+// lists, one entry saying how many more there are.
+func (p *restoreSetParser) summarizeUnusable(section string) {
+	more := p.unusableCount[section] - maxUnusableListed
+	if more <= 0 {
+		return
+	}
+	kind := ""
+	for _, e := range p.rs.Unusable {
+		if e.Section == section {
+			kind = e.Kind
+		}
+	}
+	p.rs.Unusable = append(p.rs.Unusable, UnusableEntry{Section: section, ID: fmt.Sprintf("unreadable:%d", len(p.rs.Unusable)+1),
+		Kind: kind, Label: fmt.Sprintf("%d more entries", more),
+		Message: fmt.Sprintf("They cannot be restored either; only the first %d are listed.", maxUnusableListed)})
 }
 
 func requireDocument(spec sectionSpec, ok bool, err error) error {

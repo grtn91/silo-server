@@ -240,6 +240,8 @@ type restoreSetParser struct {
 	documents map[string][]byte
 	// decoded is what the documents decoded so far take (jsonsize).
 	decoded int64
+	// unusableCount counts each section's entries left out (unusable).
+	unusableCount map[string]int
 	// logical sums the entries' sizes as their headers state them.
 	logical int64
 }
@@ -558,6 +560,7 @@ func (p *restoreSetParser) finish() error {
 		if err != nil {
 			return fmt.Errorf("section %q: %w", si.ID, err)
 		}
+		p.summarizeUnusable(si.ID)
 		if count != si.Count {
 			return fmt.Errorf("section %q holds %d items; the index says %d", si.ID, count, si.Count)
 		}
