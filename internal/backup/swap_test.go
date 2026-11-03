@@ -1169,3 +1169,67 @@ func TestValidateAuthenticatesTheManifest(t *testing.T) {
 		})
 	}
 }
+
+// TestTarGuardRefusesWhatTheWriterNeverMakes: an archive's headers are
+// checked before tar.Reader expands them. Regular files, with PAX records
+// for long names and large sizes, read as before; an old-GNU sparse
+// header with 50,000 extension blocks, a directory, a link, and an
+// oversized PAX record are refused at their header, without expanding them.
+func TestTarGuardRefusesWhatTheWriterNeverMakes(t *testing.T) {
+	var ok bytes.Buffer
+	tw := tar.NewWriter(&ok)
+	for _, h := range []*tar.Header{
+		{Name: "assets/" + strings.Repeat("long/", 40) + "a.jpg", Mode: 0o644, Size: 3, Typeflag: tar.TypeReg, Format: tar.FormatPAX, ModTime: time.Unix(1, 5)},
+		{Name: "assets/b.jpg", Mode: 0o644, Size: 2, Typeflag: tar.TypeReg},
+	} {
+		if err := tw.WriteHeader(h); err != nil {
+			t.Fatal(err)
+		}
+		_, _ = tw.Write(bytes.Repeat([]byte("x"), int(h.Size)))
+	}
+	_ = tw.Close()
+	tr := tar.NewReader(newTarGuard(bytes.NewReader(ok.Bytes())))
+	for range 2 {
+		if _, err := tr.Next(); err != nil {
+			t.Fatalf("a regular archive: %v", err)
+		}
+	}
+	if _, err := tr.Next(); !errors.Is(err, io.EOF) {
+		t.Fatalf("after the last entry: %v", err)
+	}
+
+	header := func(typeflag byte, size int64) []byte {
+		var b bytes.Buffer
+		tw := tar.NewWriter(&b)
+		_ = tw.WriteHeader(&tar.Header{Name: "x", Mode: 0o644, Size: size, Typeflag: tar.TypeReg})
+		raw := b.Bytes()[:512]
+		raw[156] = typeflag
+		// Recompute the checksum as tar.Reader would expect it.
+		copy(raw[148:156], "        ")
+		sum := 0
+		for _, c := range raw {
+			sum += int(c)
+		}
+		copy(raw[148:156], fmt.Sprintf("%06o\x00 ", sum))
+		return raw
+	}
+	sparse := append(header('S', 0), bytes.Repeat(append(make([]byte, 511), 1), 50_000)...)
+	for name, archive := range map[string][]byte{
+		"old GNU sparse":   sparse,
+		"directory":        header('5', 0),
+		"symlink":          header('2', 0),
+		"oversized record": append(header('x', maxPAXRecord+1), make([]byte, maxPAXRecord+512)...),
+	} {
+		var before, after runtime.MemStats
+		runtime.GC()
+		runtime.ReadMemStats(&before)
+		_, err := tar.NewReader(newTarGuard(bytes.NewReader(archive))).Next()
+		runtime.ReadMemStats(&after)
+		if !errors.Is(err, errTarShape) {
+			t.Fatalf("%s: %v, want errTarShape", name, err)
+		}
+		if allocated := after.TotalAlloc - before.TotalAlloc; allocated > 1<<20 {
+			t.Fatalf("%s: refusing allocated %d bytes", name, allocated)
+		}
+	}
+}
