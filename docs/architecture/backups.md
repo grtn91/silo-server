@@ -107,13 +107,20 @@ path (every Silo that writes manifests signs them):
   it is refused (`ErrManifestTampered`), a missing `mac` included, even with
   `--accept-lost-credentials`.
 - It names another check value, none, or `SECRET_KEY` is not set here: it
-  cannot be authenticated. `silo backup restore` refuses it unless the
-  operator passes `--accept-lost-credentials`, the flag that already accepts
-  a backup taken with another key (whose encrypted settings are lost), and
-  says plainly that the backup cannot be verified; `silo backup verify`
-  warns. A selective restore needs the admin's confirmation
-  (`accept_unauthenticated`) before it reads anything inside the restore
-  set, its preview included, and the listing shows it as `unverified`.
+  cannot be authenticated. `silo backup restore` and `silo backup verify`
+  refuse it unless the operator passes `--accept-lost-credentials`, the flag
+  that already accepts a backup taken with another key (whose encrypted
+  settings are lost), and say plainly that the backup cannot be verified.
+  Its `db.dump` could have been changed by anyone who could write to the
+  backup's storage, and `pg_restore` runs what a crafted archive says with
+  the connecting role's rights (`--no-owner --no-privileges` drop ownership
+  and grants, not arbitrary SQL in other entries). So before loading such a
+  dump, every mode (verify's scratch database, `--into`, and a replace's
+  `DATABASE_URL` role) checks the role and refuses a superuser unless the
+  operator also passes `--accept-superuser` (`checkLoadRole`). A selective
+  restore needs the admin's confirmation (`accept_unauthenticated`) before
+  it reads anything inside the restore set, its preview included, and the
+  listing shows it as `unverified`.
 - A manifest a destination read must also name the folder and server it was
   read from. A folder whose manifest names this key and does not verify is
   listed as `unverified` with no details, cannot be restored or downloaded,
@@ -1211,8 +1218,16 @@ went ahead.
 `silo backup verify --from <backup> --scratch <database URL>` runs the
 validation, restores into an empty scratch database, runs the step 4
 verification (not its connection closing). The validation reads
-`blobs.tar` through. It does not need the right `SECRET_KEY`; with another
-one it warns that encrypted values would be lost.
+`blobs.tar` through. It does not need the right `SECRET_KEY`, but a backup
+this key cannot authenticate needs `--accept-lost-credentials`, as for a
+restore. Connect `--scratch` and `--into` as a role that is not a superuser
+and owns only that database (`CREATE ROLE silo_drill LOGIN; CREATE DATABASE
+silo_drill OWNER silo_drill`, then, as a superuser in that database, `CREATE
+EXTENSION vector`, which only a superuser may create): a dump loaded there
+can then reach nothing else on the server. `pg_restore` loads the dump's
+table of contents less the comments on extensions (`--use-list`), which only
+an extension's owner may write and nothing reads, so such a role can load
+it (`TestBackupRestoreRoundTripDB` verifies as one).
 CI runs the same round trip against PostgreSQL
 (`TestBackupRestoreRoundTripDB`): a seeded database with blobs and an
 encrypted setting is backed up, restored in separate mode, and compared

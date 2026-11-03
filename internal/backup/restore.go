@@ -74,6 +74,9 @@ type ValidateOptions struct {
 	// applied migrations against it.
 	BinaryMigrations      []int64
 	AcceptLostCredentials bool
+	// AcceptSuperuser loads a backup that cannot be authenticated as a
+	// PostgreSQL superuser (checkLoadRole).
+	AcceptSuperuser bool
 	// ManifestKey is secret.BackupManifestKey of the SECRET_KEY in the
 	// environment: a backup written under that key must carry a manifest
 	// MAC that verifies. Nil checks none.
@@ -153,6 +156,37 @@ func unauthenticatedError(m *Manifest, keyCheck string) error {
 		ErrUnauthenticatedBackup, m.KeyCheck, keyCheck, ErrKeyMismatch)
 }
 
+// ErrSuperuserLoad refuses to load a dump that cannot be authenticated as a
+// PostgreSQL superuser.
+var ErrSuperuserLoad = errors.New("refusing to load a backup that cannot be verified as a PostgreSQL superuser")
+
+// msgUnverifiedLoad warns that the restore loads a backup it accepted
+// unauthenticated.
+const msgUnverifiedLoad = "Warning: this backup cannot be verified: it was taken with another SECRET_KEY, records none, or SECRET_KEY is not set here. Anyone who could write to its storage could have changed it, and encrypted settings and credentials in it cannot be read."
+
+// checkLoadRole runs before pg_restore loads the dump into the database
+// dbURL names, on that database's server. An authenticated dump is this
+// deployment's own. One that is not could have been changed by anyone who
+// could write to the backup's storage, and a crafted archive runs any SQL
+// pg_restore lets it with the connecting role's rights; for a superuser
+// that is the whole cluster. So it says so, and refuses a superuser role
+// unless the operator passed --accept-superuser.
+func checkLoadRole(ctx context.Context, src *Source, loader DatabaseLoader, dbURL string, validate ValidateOptions, out io.Writer) error {
+	if src.authenticated {
+		return nil
+	}
+	_, _ = fmt.Fprintln(out, msgUnverifiedLoad)
+	super, err := loader.Superuser(ctx, dbURL)
+	if err != nil {
+		return fmt.Errorf("reading whether the restoring role is a superuser: %w", err)
+	}
+	if super && !validate.AcceptSuperuser {
+		return fmt.Errorf("%w: the role in the database URL is a superuser, so a changed dump could run any SQL on the whole PostgreSQL server. "+
+			"Connect as a role that is not a superuser and owns only the database to restore into, or pass --accept-superuser", ErrSuperuserLoad)
+	}
+	return nil
+}
+
 // checkArchive validates blobs.tar against where its entries would land and
 // against the manifest's count. physical is as for validateBlobArchive.
 func (src *Source) checkArchive(ctx context.Context, physical func(store string) (string, bool)) error {
@@ -202,6 +236,8 @@ type DatabaseLoader interface {
 	// ServerID reads the server identity (serveridentity.Key) dbURL's
 	// settings hold, or "" when they hold none.
 	ServerID(ctx context.Context, dbURL string) (string, error)
+	// Superuser reports whether the role dbURL connects as is a superuser.
+	Superuser(ctx context.Context, dbURL string) (bool, error)
 	// AccountRollback compares dbURL's accounts with liveURL's, by id.
 	AccountRollback(ctx context.Context, dbURL, liveURL string) (AccountRollback, error)
 }
@@ -473,12 +509,8 @@ func writeSeparateBlobs(ctx context.Context, src *Source, opts SeparateOptions) 
 // checks of step 4.
 func VerifyBackup(ctx context.Context, src *Source, loader DatabaseLoader, scratch string, validate ValidateOptions, out io.Writer) error {
 	out = writerOrDiscard(out)
-	validate.AcceptLostCredentials = true
 	if err := src.Validate(ctx, validate); err != nil {
 		return err
-	}
-	if authenticated, _ := src.Manifest.checkMAC(validate.ManifestKey, validate.KeyCheck); !authenticated {
-		_, _ = fmt.Fprintln(out, "Warning: this backup cannot be verified: it was taken with another SECRET_KEY, records none, or SECRET_KEY is not set here. Anyone who could write to its storage could have changed it, and encrypted settings and credentials in it cannot be read.")
 	}
 	if err := loadAndVerify(ctx, src, loader, scratch, validate, out); err != nil {
 		return err
@@ -496,6 +528,9 @@ func loadAndVerify(ctx context.Context, src *Source, loader DatabaseLoader, dbUR
 	}
 	if !empty {
 		return errors.New("the target database is not empty; create a new, empty database to restore into")
+	}
+	if err := checkLoadRole(ctx, src, loader, dbURL, validate, out); err != nil {
+		return err
 	}
 	_, _ = fmt.Fprintln(out, "Restoring the database…")
 	if err := loader.Load(ctx, dbURL, src.path(DumpName)); err != nil {
