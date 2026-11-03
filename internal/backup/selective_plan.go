@@ -220,9 +220,61 @@ func (p *planner) planLibraries(ctx context.Context) ([]libraryPlan, error) {
 			continue
 		}
 		plan.item.Selectable = true
+		if costly := costlyLibraryOptions(e); len(costly) > 0 {
+			if p.authenticated {
+				plan.item.Message = "Restoring it turns on " + joinLabels(costly) + "."
+			} else {
+				plan.item.Message = "Restored with " + joinLabels(costly) + " off: a backup this server cannot verify does not turn on work that sends library data to outside services or runs for hours. Turn them on in the library's settings."
+			}
+		}
 		out = append(out, plan)
 	}
 	return out, nil
+}
+
+// costlyLibraryOptions names the options of e, among those that send
+// library data to outside services (with their charges) or run long jobs
+// beyond a new library's defaults, that e turns on: what a restore from an
+// unverified set leaves off (withoutCostlyOptions).
+func costlyLibraryOptions(e LibraryEntry) []string {
+	var out []string
+	for _, o := range []struct {
+		on    bool
+		label string
+	}{
+		{e.AutoTranslateMetadata, "AI translation of metadata"},
+		{e.TrickplayEnabled, "trickplay previews"},
+		{e.IntroDetectionEnabled, "intro detection"},
+		{e.ChapterThumbnailsEnabled, "chapter thumbnails"},
+		{e.BoxSetsEnabled, "box sets"},
+	} {
+		if o.on {
+			out = append(out, o.label)
+		}
+	}
+	return out
+}
+
+// withoutCostlyOptions is in with every option costlyLibraryOptions names
+// off.
+func withoutCostlyOptions(in catalog.CreateFolderInput) catalog.CreateFolderInput {
+	in.AutoTranslateMetadata, in.TrickplayEnabled, in.IntroDetectionEnabled, in.ChapterThumbnailsEnabled, in.BoxSetsEnabled =
+		false, false, false, false, false
+	return in
+}
+
+// joinLabels joins labels as a list in a sentence: "a", "a and b",
+// "a, b, and c".
+func joinLabels(labels []string) string {
+	switch len(labels) {
+	case 0:
+		return ""
+	case 1:
+		return labels[0]
+	case 2:
+		return labels[0] + " and " + labels[1]
+	}
+	return strings.Join(labels[:len(labels)-1], ", ") + ", and " + labels[len(labels)-1]
 }
 
 // ---- Plugins ----
@@ -444,6 +496,9 @@ func (p *planner) planCollection(ctx context.Context, c CollectionEntry, libMap 
 		return plan, nil
 	case match == "":
 		plan.item.Status, plan.item.Selectable = ItemNotOnThisServer, true
+		if c.SyncSchedule != nil && *c.SyncSchedule != "" && !p.authenticated {
+			plan.item.Message = "Restored without its sync schedule: a backup this server cannot verify does not make a collection fetch from outside services on a schedule."
+		}
 		for _, id := range c.Items {
 			if known[id] {
 				plan.missing = append(plan.missing, id)

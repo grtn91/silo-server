@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"maps"
 	"os"
 	"path"
@@ -296,6 +297,9 @@ func (a *applier) apply(ctx context.Context, section, id string) error {
 	case section == SectionCollections && strings.HasPrefix(id, "artwork:"):
 		a.stageArtwork(ctx, id)
 	}
+	if section == SectionPlugins {
+		a.stagePlugin(ctx, id)
+	}
 	var result applied
 	next := a.clone()
 	err := a.commit(ctx, next, "Restoring "+section, func(tx pgx.Tx) error {
@@ -581,12 +585,19 @@ func (a *applier) applyLibrary(ctx context.Context, tx pgx.Tx, id string) (appli
 	input := libraryInput(e)
 	input.ID, input.PosterPath = newID, poster
 	input.RealtimeMonitoring, input.CollectionUngroupedSortOrder = &realtime, &ungrouped
+	costly := costlyLibraryOptions(e)
+	if a.rs.unverified {
+		input = withoutCostlyOptions(input)
+	}
 	folder, err := catalog.CreateFolderInTx(ctx, tx, input)
 	if err != nil {
 		return applied{}, err
 	}
 	item.Outcome = OutcomeRestored
 	item.Message = "Created; its first scan is queued."
+	if a.rs.unverified && len(costly) > 0 {
+		item.Notes = append(item.Notes, "Created with "+joinLabels(costly)+" off: they are not restored from a backup this server cannot verify.")
+	}
 	// The editor's follow-ups run after commit; the rows record that they
 	// are owed, so a crash before they finish leaves them for the next run.
 	// Its default sections wait for the end of the restore, which may
@@ -630,6 +641,19 @@ func (a *applier) restoreLibraryPoster(ctx context.Context, key string, libraryI
 }
 
 // ---- Plugins ----
+
+// stagePlugin reads the plugin's installed manifest before the item's
+// transaction opens. Best effort: RestorePlugin reads it again, inside the
+// transaction, when this did not leave it in the cache.
+func (a *applier) stagePlugin(ctx context.Context, id string) {
+	doc := indexed(a.rs.Plugins, a.rs.lookup().plugins, id)
+	if doc == nil || a.rs.unverified || a.s.targets.Plugins == nil {
+		return
+	}
+	if err := a.s.targets.Plugins.PrepareRestorePlugin(ctx, doc.PluginID); err != nil {
+		slog.WarnContext(ctx, "reading a plugin's manifest before restoring it", "component", "backup", "plugin_id", doc.PluginID, "error", err)
+	}
+}
 
 func (a *applier) applyPlugin(ctx context.Context, tx pgx.Tx, id string) (applied, error) {
 	item := ReportItem{Kind: KindPlugin, Label: id}

@@ -606,7 +606,25 @@ func TestRestoreNeverSendsLiveSecretsToARestoredAddressDB(t *testing.T) {
 	}
 
 	// The same backup under another key: nothing that reaches a service.
-	manifestKey := objectKey(f.serverID, source.ID, ManifestName)
+	f.unverify(t, source.ID)
+	if err := f.settings.Set(ctx, host, "mail.example.com"); err != nil {
+		t.Fatal(err)
+	}
+	unverified, err := f.svc.Preview(ctx, source.ID, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if page := previewItem(t, unverified, SectionSettings, pageEmail); page.Selectable || page.Reason != ReasonUnverifiedBackup {
+		t.Fatalf("email page of an unverified backup = %+v, want unselectable, unverified_backup", page)
+	}
+}
+
+// unverify rewrites the backup's manifest with another key's check value,
+// so this server cannot verify it.
+func (f *selectiveFixture) unverify(t *testing.T, backupID string) {
+	t.Helper()
+	ctx := t.Context()
+	manifestKey := objectKey(f.serverID, backupID, ManifestName)
 	body, _, err := f.store.Get(ctx, manifestKey)
 	if err != nil {
 		t.Fatal(err)
@@ -624,15 +642,49 @@ func TestRestoreNeverSendsLiveSecretsToARestoredAddressDB(t *testing.T) {
 	if err := f.store.Put(ctx, manifestKey, data); err != nil {
 		t.Fatal(err)
 	}
-	if err := f.settings.Set(ctx, host, "mail.example.com"); err != nil {
+}
+
+// TestUnverifiedRestoreLeavesCostlyWorkOffDB: a verified backup's preview
+// names the options of a library that send its data to outside services or
+// run long jobs; restored from a backup this server cannot verify, the
+// library is created with them off, and the preview says so.
+func TestUnverifiedRestoreLeavesCostlyWorkOffDB(t *testing.T) {
+	f := newSelectiveFixture(t)
+	ctx := t.Context()
+	seed := seedSelective(t, f.pool, f.settings, f.store)
+	dbExec(t, f.pool, `UPDATE media_folders SET auto_translate_metadata = true, trickplay_enabled = true, intro_detection_enabled = true WHERE id = $1`,
+		seed.library2ID)
+	source, err := backupUnderLock(t, f.svc, KindManual)
+	if err != nil {
 		t.Fatal(err)
 	}
+	f.lose(t, seed)
+	ref := strconv.Itoa(seed.library2ID)
+	verified, err := f.svc.Preview(ctx, source.ID, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const costly = "AI translation of metadata, trickplay previews, and intro detection"
+	if item := previewItem(t, verified, SectionLibraries, ref); !item.Selectable || item.Message != "Restoring it turns on "+costly+"." {
+		t.Fatalf("library of a verified backup = %+v, want its costly options named", item)
+	}
+	f.unverify(t, source.ID)
 	unverified, err := f.svc.Preview(ctx, source.ID, true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if page := previewItem(t, unverified, SectionSettings, pageEmail); page.Selectable || page.Reason != ReasonUnverifiedBackup {
-		t.Fatalf("email page of an unverified backup = %+v, want unselectable, unverified_backup", page)
+	if item := previewItem(t, unverified, SectionLibraries, ref); !item.Selectable || !strings.HasPrefix(item.Message, "Restored with "+costly+" off") {
+		t.Fatalf("library of an unverified backup = %+v, want its costly options off", item)
+	}
+	report := f.restoreRequest(t, RestoreRequest{BackupID: source.ID, Digest: unverified.Digest,
+		Selection: map[string][]string{SectionLibraries: {ref}}, AcceptUnauthenticated: true})
+	var translate, trickplay, intro bool
+	if err := f.pool.QueryRow(ctx, `SELECT auto_translate_metadata, trickplay_enabled, intro_detection_enabled FROM media_folders WHERE id = $1`,
+		report.LibraryMap[ref]).Scan(&translate, &trickplay, &intro); err != nil {
+		t.Fatalf("restored library %v: %v (%+v)", report.LibraryMap, err, report.Items)
+	}
+	if translate || trickplay || intro {
+		t.Fatalf("library restored from an unverified backup: translate %v, trickplay %v, intro detection %v; want all off", translate, trickplay, intro)
 	}
 }
 

@@ -792,6 +792,7 @@
 ./internal/backup TestRestoredLibrarySectionsWaitForTheRestoreDB
 ./internal/backup TestManagedSectionPointedElsewhereIsRestoredDB
 ./internal/backup TestSelectiveRestoreOnOneConnectionDB
+./internal/backup TestUnverifiedRestoreLeavesCostlyWorkOffDB
 ./internal/backup TestAccountsAndImportOnOneConnectionDB
 ./internal/backup TestImportsReadInBatchesDB
 ./internal/historyimport TestMatchAllAgreesWithMatchDB
