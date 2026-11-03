@@ -501,3 +501,23 @@ func TestUnverifiedTemplateWithholdsSourceAndSchedule(t *testing.T) {
 		t.Fatalf("unverified = %+v, want the source and schedule withheld", untrusted)
 	}
 }
+
+// TestRestoredLibraryFoldersAreBounded: a library entry whose folders the
+// preview would check on disk is refused past maxLibraryFolders folders,
+// or with a folder listed twice.
+func TestRestoredLibraryFoldersAreBounded(t *testing.T) {
+	entry := LibraryEntry{ID: 1, Name: "Movies", Type: "movies", Paths: []string{"/media/a", "/media/b"}}
+	if problem := libraryProblem(entry); problem != "" {
+		t.Fatalf("two folders: %s", problem)
+	}
+	many := LibraryEntry{ID: 1, Name: "Movies", Type: "movies"}
+	for i := range maxLibraryFolders + 1 {
+		many.Paths = append(many.Paths, fmt.Sprintf("/media/%d", i))
+	}
+	twice := LibraryEntry{ID: 1, Name: "Movies", Type: "movies", Paths: []string{"/", "/"}}
+	for name, e := range map[string]LibraryEntry{"too many folders": many, "a folder twice": twice} {
+		if libraryProblem(e) == "" {
+			t.Errorf("%s was accepted", name)
+		}
+	}
+}
