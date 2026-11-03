@@ -20,12 +20,19 @@ type folder struct {
 	kind Kind
 	at   time.Time
 	// manifest is nil for an incomplete folder, and for one whose manifest
-	// did not verify (tampered).
+	// did not verify (tampered) or could not be read (unreadable).
 	manifest *Manifest
 	// tampered is set when the folder's manifest named this server's
 	// SECRET_KEY and did not verify: nothing in it is trusted, and the
 	// sweep leaves the folder for the admin to look at.
 	tampered bool
+	// unreadable is set when the folder lists a manifest that could not be
+	// read for any other reason (a timeout, a destination error): what it
+	// holds is unknown, so it is neither rotated nor swept.
+	unreadable bool
+	// noManifest is set only when a complete listing of the folder showed
+	// no manifest object: the one state the sweep deletes.
+	noManifest bool
 	// verified is set when the manifest verified under this server's
 	// SECRET_KEY, or the service checks none (tests).
 	verified bool
@@ -98,13 +105,16 @@ func planRotation(folders []folder, keep int, now time.Time, pinned map[string]b
 	return deletes
 }
 
-// planSweep returns incomplete folders (no manifest) whose name and newest
-// object are both older than a day. The sweep runs under the subsystem lock,
-// so no backup is writing to any folder it sees.
+// planSweep returns incomplete folders whose name and newest object are
+// both older than a day. It deletes only a folder a complete listing showed
+// without a manifest object (noManifest): one whose manifest could not be
+// read, or did not verify, may be a complete backup and is left alone. The
+// sweep runs under the subsystem lock, so no backup is writing to any
+// folder it sees.
 func planSweep(folders []folder, now time.Time) []string {
 	var deletes []string
 	for _, f := range folders {
-		if f.manifest != nil || f.tampered {
+		if !f.noManifest {
 			continue
 		}
 		if now.Sub(f.at) > incompleteSweepAge && now.Sub(f.newest) > incompleteSweepAge {

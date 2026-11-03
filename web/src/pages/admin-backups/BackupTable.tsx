@@ -102,8 +102,10 @@ function BackupStatus({
           {active?.operation === "backup" ? `${label}, ${Math.round(active.progress)}%` : label}
         </SettingFieldStatus>
       );
+    // Unverified: written with another SECRET_KEY, or changed after it was
+    // written. Unreadable: its manifest could not be read just now; it is kept.
     case "unverified":
-      // Written with another SECRET_KEY, or changed after it was written.
+    case "unreadable":
       return <SettingFieldStatus tone="warn">{label}</SettingFieldStatus>;
     default:
       return <SettingFieldStatus tone="muted">{label}</SettingFieldStatus>;
