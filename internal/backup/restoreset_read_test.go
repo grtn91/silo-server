@@ -242,6 +242,38 @@ func TestRestoreExtractsOnlyReferencedFiles(t *testing.T) {
 	}
 }
 
+// TestReaderFindsVariantsInConstantTime: originals of many revisions in
+// one directory, each with its variants, are read without scanning the
+// directory's originals once per variant.
+func TestReaderFindsVariantsInConstantTime(t *testing.T) {
+	const originals = 10_000
+	index, entries := testRestoreSet()
+	for i := range index.Sections {
+		if index.Sections[i].ID != SectionCollections {
+			continue
+		}
+		for r := range originals {
+			key := fmt.Sprintf("collection-images/c1/poster/original.r%d.jpg", r)
+			index.Sections[i].Blobs = append(index.Sections[i].Blobs, key)
+			entries = append(entries, testEntry{name: "blobs/" + key, data: []byte("o")},
+				testEntry{name: fmt.Sprintf("blobs/collection-images/c1/poster/w1.r%d.jpg", r), data: []byte("v")},
+				testEntry{name: fmt.Sprintf("blobs/collection-images/c1/poster/w2.r%d.jpg", r), data: []byte("v")})
+		}
+	}
+	data := buildTar(t, index, entries)
+	started := time.Now()
+	rs, err := ReadRestoreSet(context.Background(), bytes.NewReader(data), ReadOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := len(rs.blobFamily("collection-images/c1/poster/original.r7.jpg")); got != 3 {
+		t.Fatalf("family of one original = %d keys, want it and its two variants", got)
+	}
+	if elapsed := time.Since(started); elapsed > 20*time.Second {
+		t.Fatalf("reading %d originals with their variants took %v", originals, elapsed)
+	}
+}
+
 // TestSelectedBlobsIsLinear: choosing the files of every collection of a set
 // at the archive's entry limit classifies each file once. A scan per
 // selected collection would take billions of prefix checks here and run

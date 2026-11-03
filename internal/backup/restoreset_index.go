@@ -5,6 +5,8 @@ import (
 	"slices"
 	"strings"
 	"unicode"
+
+	"github.com/Silo-Server/silo-server/internal/artworkkey"
 )
 
 // restoreSetIndex finds a restore set's entries by the ids and keys planning
@@ -19,8 +21,11 @@ type restoreSetIndex struct {
 	plugins                                             map[string]int
 	// By backup id: a collection's or template collection's, a section's.
 	collectionIDs, templateIDs, sectionIDs map[string]int
-	// blobDirs lists the blob keys in each directory, sorted.
-	blobDirs map[string][]string
+	// variants lists, by original, the blob keys stored beside it
+	// (ladderSibling), sorted; legacyKeys are, by directory, the blob keys
+	// without a revision.
+	variants   map[string][]string
+	legacyKeys map[string][]string
 	// The backup's entries that count as twins of one another, by what
 	// makes them twins, and then by their backup library (noLibrary for
 	// none): sectionTwins, collectionTwins, templateTwins.
@@ -45,7 +50,7 @@ func buildRestoreSetIndex(rs *RestoreSet) *restoreSetIndex {
 		libraryNames: map[int]string{}, collections: map[string]int{}, templates: map[string]int{},
 		sections: map[string]int{}, artwork: map[string]int{}, branding: map[string]int{}, plugins: map[string]int{},
 		collectionIDs: map[string]int{}, templateIDs: map[string]int{}, sectionIDs: map[string]int{},
-		blobDirs:     map[string][]string{},
+		variants: map[string][]string{}, legacyKeys: map[string][]string{},
 		sectionTwins: map[sectionTwinKey]map[int]int{}, collectionTwins: map[string]map[int]int{}, templateTwins: map[[2]string]map[int]int{},
 	}
 	// The reader refuses two entries with one item id, so the first is
@@ -99,10 +104,29 @@ func buildRestoreSetIndex(rs *RestoreSet) *restoreSetIndex {
 		first(x.plugins, doc.PluginID, i)
 	}
 	for key := range rs.blobs {
-		dir := path.Dir(key) + "/"
-		x.blobDirs[dir] = append(x.blobDirs[dir], key)
+		if artworkkey.Revision(key) == "" {
+			dir := path.Dir(key) + "/"
+			x.legacyKeys[dir] = append(x.legacyKeys[dir], key)
+		} else if original := artworkkey.OriginalOf(key); original != key {
+			x.variants[original] = append(x.variants[original], key)
+		}
 	}
-	for _, keys := range x.blobDirs {
+	// A legacy original's variants are the directory's other keys without
+	// a revision; a directory holds one legacy original per image format,
+	// so each is found once here rather than on every family lookup.
+	for _, keys := range x.legacyKeys {
+		for _, original := range keys {
+			if !strings.HasPrefix(path.Base(original), artworkkey.OriginalVariant+".") {
+				continue
+			}
+			for _, key := range keys {
+				if ladderSibling(original, key) {
+					x.variants[original] = append(x.variants[original], key)
+				}
+			}
+		}
+	}
+	for _, keys := range x.variants {
 		slices.Sort(keys)
 	}
 	return x
