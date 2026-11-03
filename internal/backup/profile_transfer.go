@@ -32,6 +32,10 @@ const (
 	ProfileExportVersion = 1
 	// MaxProfileImportBytes bounds an import's document.
 	MaxProfileImportBytes = 64 << 20
+	// maxProfileItems bounds the items an export names (its items list):
+	// a profile's history, ratings, and lists name a few thousand titles,
+	// tens of thousands at most.
+	maxProfileItems = 100_000
 )
 
 // ProfileExport is the silo-profile-export document.
@@ -184,7 +188,7 @@ func (t *ProfileTransfer) Capability() ProfileExportCapability {
 
 // ErrProfileExportTooLarge refuses an export larger than an import
 // accepts: no server could import it.
-var ErrProfileExportTooLarge = fmt.Errorf("this profile's data is larger than an import accepts (%d bytes)", MaxProfileImportBytes)
+var ErrProfileExportTooLarge = fmt.Errorf("this profile's data is larger than an import accepts (%d bytes, %d items)", MaxProfileImportBytes, maxProfileItems)
 
 // Export writes the profile's data, read in one snapshot, as the profile
 // may see it now: rows about titles its library access or maturity limits
@@ -236,6 +240,9 @@ func (t *ProfileTransfer) Export(ctx context.Context, scope ProfileImportScope) 
 	}
 	if doc.Items, err = readItemRefs(ctx, tx, items); err != nil {
 		return nil, err
+	}
+	if len(doc.Items) > maxProfileItems {
+		return nil, ErrProfileExportTooLarge
 	}
 	out, err := json.Marshal(doc)
 	if err == nil && len(out) > MaxProfileImportBytes {
@@ -366,8 +373,8 @@ func ParseProfileExport(data []byte) (*ProfileExport, error) {
 		}
 		doc.summaries[id] = sum
 	}
-	if len(doc.Items) > userdata.MaxEntries {
-		return nil, &InvalidProfileExportError{Err: errors.New("too many items")}
+	if len(doc.Items) > maxProfileItems {
+		return nil, &InvalidProfileExportError{Err: fmt.Errorf("names more than %d items", maxProfileItems)}
 	}
 	seen := map[string]bool{}
 	for _, r := range doc.Items {

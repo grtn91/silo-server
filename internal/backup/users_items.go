@@ -13,33 +13,27 @@ import (
 	"github.com/Silo-Server/silo-server/internal/historyimport"
 )
 
-// itemMatcher finds a catalog item by provider ids: the history import
-// matcher, over the resolver's transaction.
-type itemMatcher interface {
-	Match(ctx context.Context, record historyimport.Record) (*historyimport.Match, string, error)
-}
-
 // itemResolver maps a document's content ids to this server's catalog. A
 // content id this catalog holds is the same item (content ids are
-// deterministic); any other goes through the history import matcher with
-// the provider ids the document recorded. Items it cannot map are recorded
-// by title for the report.
+// deterministic); any other is matched by the provider ids the document
+// recorded, through the history import matcher. Items it cannot map are
+// recorded by title for the report.
 type itemResolver struct {
-	q         queryer
 	refs      map[string]ItemRef
 	present   map[string]bool
-	matcher   itemMatcher
 	matched   map[string]string
 	unmatched map[string]string
 	hidden    map[string]string
 }
 
-// newItemResolver checks in one query which ids the catalog holds: every
-// ref and every extra id a document names. Provider-id matching reads
-// through q as well: the caller's transaction already holds a connection,
-// and a match that waited on the pool for another could wait forever.
+// newItemResolver checks in one query which ids the catalog holds, every
+// ref and every extra id a document names, and matches every other ref by
+// its provider ids at once, in batched reads (historyimport.MatchAllOn), so
+// resolving reads nothing per item. Both read through q: the caller's
+// transaction already holds a connection, and a read that waited on the
+// pool for another could wait forever.
 func newItemResolver(ctx context.Context, q queryer, refs []ItemRef, extra []string) (*itemResolver, error) {
-	r := &itemResolver{q: q, refs: map[string]ItemRef{}, present: map[string]bool{}, matcher: historyimport.NewMatcherOn(q), matched: map[string]string{},
+	r := &itemResolver{refs: map[string]ItemRef{}, present: map[string]bool{}, matched: map[string]string{},
 		unmatched: map[string]string{}, hidden: map[string]string{}}
 	ids := map[string]bool{}
 	for _, ref := range refs {
@@ -63,7 +57,42 @@ func newItemResolver(ctx context.Context, q queryer, refs []ItemRef, extra []str
 	for _, id := range found {
 		r.present[id] = true
 	}
+	if err := r.matchAll(ctx, q); err != nil {
+		return nil, err
+	}
 	return r, nil
+}
+
+// matchAll matches every ref the catalog does not hold by its provider
+// ids; one without any matches nothing.
+func (r *itemResolver) matchAll(ctx context.Context, q queryer) error {
+	var sources []string
+	var records []historyimport.Record
+	for _, source := range slices.Sorted(maps.Keys(r.refs)) {
+		if r.present[source] {
+			continue
+		}
+		record, matchable := matchRecord(r.refs[source])
+		if !matchable {
+			r.matched[source] = ""
+			continue
+		}
+		sources, records = append(sources, source), append(records, record)
+	}
+	if len(records) == 0 {
+		return nil
+	}
+	matches, err := historyimport.MatchAllOn(ctx, q, records)
+	if err != nil {
+		return fmt.Errorf("matching items: %w", err)
+	}
+	for i, source := range sources {
+		r.matched[source] = ""
+		if matches[i] != nil {
+			r.matched[source] = matches[i].MediaItemID
+		}
+	}
+	return nil
 }
 
 func (r *itemResolver) Resolve(ctx context.Context, source string) (string, bool, error) {
@@ -86,7 +115,14 @@ type contentFilter struct {
 // so an import never gives a profile data about titles hidden from it.
 func (r *itemResolver) visibleTo(ctx context.Context, tx pgx.Tx, f contentFilter) (*filteredItems, error) {
 	v := &filteredItems{r: r, tx: tx, filter: f, visible: map[string]bool{}}
-	if err := v.check(ctx, slices.Collect(maps.Keys(r.present))); err != nil {
+	// Every item the resolver can return, checked at once.
+	ids := slices.Collect(maps.Keys(r.present))
+	for _, local := range r.matched {
+		if local != "" {
+			ids = append(ids, local)
+		}
+	}
+	if err := v.check(ctx, ids); err != nil {
 		return nil, err
 	}
 	return v, nil
@@ -135,28 +171,11 @@ func (v *filteredItems) Resolve(ctx context.Context, source string) (string, boo
 	return local, true, nil
 }
 
-func (r *itemResolver) find(ctx context.Context, source string) (string, bool, error) {
+func (r *itemResolver) find(_ context.Context, source string) (string, bool, error) {
 	if r.present[source] {
 		return source, true, nil
 	}
-	if local, done := r.matched[source]; done {
-		return local, local != "", nil
-	}
-	ref, ok := r.refs[source]
-	record, matchable := matchRecord(ref)
-	if !ok || !matchable || r.matcher == nil {
-		r.matched[source] = ""
-		return "", false, nil
-	}
-	match, _, err := r.matcher.Match(ctx, record)
-	if err != nil {
-		return "", false, fmt.Errorf("matching %s: %w", ref.label(), err)
-	}
-	local := ""
-	if match != nil {
-		local = match.MediaItemID
-	}
-	r.matched[source] = local
+	local := r.matched[source]
 	return local, local != "", nil
 }
 

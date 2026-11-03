@@ -22,6 +22,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/access"
 	"github.com/Silo-Server/silo-server/internal/backup/userdata"
 	"github.com/Silo-Server/silo-server/internal/catalog"
+	"github.com/Silo-Server/silo-server/internal/historyimport"
 	"github.com/Silo-Server/silo-server/internal/userstore"
 	"github.com/Silo-Server/silo-server/internal/userstore/pgstore"
 	"github.com/Silo-Server/silo-server/internal/watchlist"
@@ -1454,6 +1455,22 @@ type unknownItems struct{}
 
 func (unknownItems) Resolve(context.Context, string) (string, bool, error) { return "", false, nil }
 
+// unknownRefs are refs for the items m0…m(n-1) and s0…s(n-1) the
+// samples name, with provider ids this catalog lacks, of every kind the
+// matcher reads: movies, episodes with series ids, and series.
+func unknownRefs(n int) []ItemRef {
+	refs := make([]ItemRef, 0, 2*n)
+	for i := range n {
+		item := ItemRef{ContentID: fmt.Sprintf("m%d", i), Kind: historyimport.KindMovie, TMDBID: fmt.Sprintf("t%d", i)}
+		if i%2 == 1 {
+			item = ItemRef{ContentID: item.ContentID, Kind: historyimport.KindEpisode, TVDBID: fmt.Sprintf("e%d", i), Season: 1, Episode: i,
+				Series: &SeriesRef{TVDBID: fmt.Sprintf("v%d", i)}}
+		}
+		refs = append(refs, item, ItemRef{ContentID: fmt.Sprintf("s%d", i), Kind: historyimport.KindSeries, TVDBID: fmt.Sprintf("v%d", i)})
+	}
+	return refs
+}
+
 // sameItems matches every item to itself, so an import writes every entry.
 type sameItems struct{}
 
@@ -1463,8 +1480,11 @@ func (sameItems) Resolve(_ context.Context, id string) (string, bool, error) { r
 // bounded number of statements, not one per entry: reads and writes are
 // set-based. Each branch of each importer (importerSamples, one per list
 // and per sort kind) is driven with 100,000 distinct entries and with
-// 1,000, every reference mapping, so every entry is planned and written;
-// a document over a type's cap must be refused before the import.
+// 1,000, once with every reference mapping, so every entry is planned and
+// written, and once with every item a ref whose provider ids this catalog
+// lacks, so every one misses through the import's resolver (its reads
+// counted too); a document over a type's cap must be refused before the
+// import.
 func TestImportsReadInBatchesDB(t *testing.T) {
 	pool, _ := testDB(t)
 	ctx := t.Context()
@@ -1473,8 +1493,16 @@ func TestImportsReadInBatchesDB(t *testing.T) {
 	profile := "batch-" + sfx
 	testProfile(t, pool, user, profile, "Batch", true, "")
 	for name, d := range importerSamples {
-		for _, n := range []int{100_000, 1000} {
-			t.Run(fmt.Sprintf("%s %d", name, n), func(t *testing.T) {
+		for _, run := range []struct {
+			n       int
+			unknown bool
+		}{{100_000, false}, {1000, false}, {100_000, true}, {1000, true}} {
+			n := run.n
+			mode := "mapped"
+			if run.unknown {
+				mode = "unknown"
+			}
+			t.Run(fmt.Sprintf("%s %d %s", name, n, mode), func(t *testing.T) {
 				id, _, _ := strings.Cut(name, " ")
 				dt, _ := userDataType(id)
 				entries := make([]string, n)
@@ -1493,7 +1521,15 @@ func TestImportsReadInBatchesDB(t *testing.T) {
 				}
 				defer func() { _ = tx.Rollback(context.Background()) }()
 				counted := &countingTx{Tx: tx}
-				target := userdata.Target{Owner: userdata.Owner{UserID: user, ProfileID: profile}, Items: sameItems{}, Now: time.Now(), Untrusted: true,
+				var items userdata.Items = sameItems{}
+				if run.unknown {
+					resolver, err := newItemResolver(ctx, counted, unknownRefs(n), nil)
+					if err != nil {
+						t.Fatal(err)
+					}
+					items = resolver
+				}
+				target := userdata.Target{Owner: userdata.Owner{UserID: user, ProfileID: profile}, Items: items, Now: time.Now(), Untrusted: true,
 					SameServer: true, Library: func(id int) (int, bool) { return id, true }, Profile: func(string) (string, bool) { return "", false },
 					Collections: func(_ context.Context, _ string, ids []string) (map[string]string, error) {
 						out := map[string]string{}

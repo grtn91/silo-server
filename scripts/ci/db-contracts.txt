@@ -794,6 +794,7 @@
 ./internal/backup TestSelectiveRestoreOnOneConnectionDB
 ./internal/backup TestAccountsAndImportOnOneConnectionDB
 ./internal/backup TestImportsReadInBatchesDB
+./internal/historyimport TestMatchAllAgreesWithMatchDB
 ./internal/api/handlers TestRestoredRateLimitsUseTheirWritePathDB
 ./internal/backup TestIdentityTwinsRestoreOneToOneDB
 ./internal/backup TestLayoutCollectionsMapAcrossServersDB

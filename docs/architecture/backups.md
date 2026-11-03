@@ -992,12 +992,18 @@ nothing else can hold the locks of an id its transaction has not committed.
 **Items** are named by content id; each document lists every item its data
 names with its kind, title, year, and IMDb, TMDB, and TVDB ids (an episode
 with its series' ids and numbers). A content id this catalog holds is the same
-item. Any other goes through the history import matcher
-(`internal/historyimport`), whose reads run in the restore's or import's own
-transaction (`historyimport.NewMatcherOn`): the transaction already holds a
+item. Every other one the document lists is matched up front, before any
+data type reads it, by the history import matcher's rules
+(`historyimport.MatchAllOn`): its provider-id lookups are collected for all
+items and read in batches, one query per lookup and provider column for up
+to 20,000 values, and a lookup that finds nothing is remembered, so a
+document's unknown items cost a few reads, not one each. The reads run in
+the restore's or import's own transaction: the transaction already holds a
 connection, and a match that waited on the pool for another would wait
-forever on a pool of one. An item still unmatched is left out and listed in
-the report by title. Items the target profile may not see here are left out
+forever on a pool of one. The matched items' visibility is checked in the
+same one read as the present ones'. A profile export names at most 100,000
+items. An item still unmatched is left out and listed in the report by
+title. Items the target profile may not see here are left out
 too and listed as hidden: each profile's data is merged through the canonical
 catalog visibility filter (`catalog.FilterAccessibleContentIDsInTransaction`)
 with its libraries under the account's policy (`access.ProfileLibraries`) and
