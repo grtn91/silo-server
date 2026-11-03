@@ -473,7 +473,13 @@ over 8 times its size plus 64 KiB, when the set's documents together would
 decode to over 256 MiB, or when one array or object holds over 1,000,000
 elements. A short document of empty elements (`[{},{},…]`) would otherwise
 decode to a whole struct per three bytes; documents Silo writes decode to
-about their size. A plugin archive is checked against its
+about their size. Every entry a restore writes (a setting, a library, a
+plugin configuration, a collection, a template collection, an item artwork,
+a branding asset, a page section, and each account's profiles) is left out
+as unusable when it encodes to more than 1 MiB, the v2 API's request body
+cap (`maxRestoredEntryBytes`), and a stored thumbhash is the one computed
+from the restored image (item artwork) or one of thumbhash form, never
+anything else. A plugin archive is checked against its
 digest and discarded, never installed ([Plugins](#plugins)). Readers accept
 every format version up to theirs and refuse a newer one with "This backup is
 from a newer Silo. Upgrade this server first."

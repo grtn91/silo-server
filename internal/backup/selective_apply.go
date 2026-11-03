@@ -872,7 +872,7 @@ func mapIn(m map[int]int) func(int) (int, bool) {
 }
 
 func thumbFor(key, thumb string) string {
-	if key == "" {
+	if key == "" || !validThumbhash(thumb) {
 		return ""
 	}
 	return thumb

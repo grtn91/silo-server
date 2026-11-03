@@ -6,6 +6,7 @@ package backup
 // (RestoreSet.Unusable) and anything that breaks the set refused.
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -110,6 +111,10 @@ func (p *restoreSetParser) validateSettings() error {
 			return fmt.Errorf("setting %q is listed twice", s.Key)
 		}
 		seen[s.Key] = true
+		if entryTooLarge(s) {
+			p.unusable(SectionSettings, KindSettingsPage, s.Key, msgEntryTooLarge)
+			continue
+		}
 		kept = append(kept, s)
 	}
 	d.Settings = kept
@@ -202,6 +207,10 @@ func (p *restoreSetParser) validateCollections() error {
 		if err := claim(a.itemID()); err != nil {
 			return err
 		}
+		if entryTooLarge(a) {
+			p.unusable(SectionCollections, KindItemArtwork, a.ContentID, msgEntryTooLarge)
+			continue
+		}
 		artwork = append(artwork, a)
 	}
 	d.ItemArtwork = artwork
@@ -216,6 +225,10 @@ func (p *restoreSetParser) validateCollections() error {
 		}
 		if err := claim(b.itemID()); err != nil {
 			return err
+		}
+		if entryTooLarge(b) {
+			p.unusable(SectionCollections, KindBranding, b.Key, msgEntryTooLarge)
+			continue
 		}
 		brandingEntries = append(brandingEntries, b)
 	}
@@ -316,8 +329,10 @@ func homeSectionProblem(e HomeSectionEntry) string {
 	return ""
 }
 
-// maxRestoredEntryBytes bounds one library, collection, template
-// collection, or section, encoded, as the v2 API's request body cap
+// maxRestoredEntryBytes bounds every entry a restore writes (a setting, a
+// library, a plugin configuration, a collection, a template collection, an
+// item artwork, a branding asset, a page section, and in account documents
+// each profile), encoded, as the v2 API's request body cap
 // (apiv2.MaxJSONBodyBytes, which this package cannot import) bounds what one
 // create or update writes: a restore stores no more for one than its editor
 // could. A collection's items are not counted; they are added one by one.
@@ -336,6 +351,22 @@ func entryTooLarge(v any) bool {
 func collectionTooLarge(c CollectionEntry) bool {
 	c.Items = nil
 	return entryTooLarge(c)
+}
+
+// maxThumbhashLength bounds a thumbhash: base64 of at most 25 bytes.
+const maxThumbhashLength = 64
+
+// validThumbhash reports whether s could be a thumbhash; a restore stores
+// none that is not.
+func validThumbhash(s string) bool {
+	if s == "" {
+		return true
+	}
+	if len(s) > maxThumbhashLength {
+		return false
+	}
+	_, err := base64.StdEncoding.DecodeString(s)
+	return err == nil
 }
 
 // validBrandingEntry admits only a branding asset setting whose reference
@@ -442,6 +473,9 @@ func pluginConfigProblem(doc PluginDocument) string {
 		keys[c.Key] = true
 		if !json.Valid(c.Value) {
 			return "A configuration value is not valid JSON."
+		}
+		if entryTooLarge(c) {
+			return msgEntryTooLarge
 		}
 	}
 	return ""
