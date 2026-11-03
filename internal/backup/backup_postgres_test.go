@@ -646,18 +646,28 @@ func checkStricterFlags(t *testing.T, loader PGLoader, pool *pgxpool.Pool, dsn, 
 	if _, err := restored.Exec(ctx, `INSERT INTO autoscan_settings (id, enabled) VALUES (true, true) ON CONFLICT (id) DO UPDATE SET enabled = true`); err != nil {
 		t.Fatal(err)
 	}
-	// A library deleted here since the backup: it comes back disabled.
-	var library int64
-	if err := restored.QueryRow(ctx, `INSERT INTO media_folders (name, type, enabled) VALUES ('Removed since', 'movies', true) RETURNING id`).Scan(&library); err != nil {
+	// A library, an autoscan source, and a history import source deleted
+	// here since the backup: each comes back off.
+	var library, source, history string
+	if err := restored.QueryRow(ctx, `INSERT INTO media_folders (name, type, enabled) VALUES ('Removed since', 'movies', true) RETURNING id::text`).Scan(&library); err != nil {
+		t.Fatal(err)
+	}
+	if err := restored.QueryRow(ctx, `INSERT INTO autoscan_sources (plugin_id, capability_id, enabled) VALUES ('arr', 'sonarr', true) RETURNING id::text`).Scan(&source); err != nil {
+		t.Fatal(err)
+	}
+	if err := restored.QueryRow(ctx, `INSERT INTO history_import_sources (id, name, source_type, base_url, enabled)
+		VALUES (987654321, 'removed', 'plex', 'http://plex.example', true) RETURNING id::text`).Scan(&history); err != nil {
 		t.Fatal(err)
 	}
 	carried, err := loader.CarryCredentials(ctx, into, dsn)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var libraryOn bool
-	if err := restored.QueryRow(ctx, `SELECT enabled FROM media_folders WHERE id = $1`, library).Scan(&libraryOn); err != nil || libraryOn {
-		t.Fatalf("restored library removed since on %v (%v), want it disabled", libraryOn, err)
+	for table, id := range map[string]string{tableLibraries: library, "autoscan_sources": source, "history_import_sources": history} {
+		var on bool
+		if err := restored.QueryRow(ctx, `SELECT enabled FROM `+table+` WHERE id::text = $1`, id).Scan(&on); err != nil || on {
+			t.Fatalf("restored %s row removed since on %v (%v), want it off", table, on, err)
+		}
 	}
 	var autoscanOn bool
 	if err := restored.QueryRow(ctx, `SELECT enabled FROM autoscan_settings`).Scan(&autoscanOn); err != nil || autoscanOn {
@@ -676,7 +686,8 @@ func checkStricterFlags(t *testing.T, loader PGLoader, pool *pgxpool.Pool, dsn, 
 	}
 	for _, want := range []string{"account " + username + " kept disabled", "account " + username + " still must change its password",
 		"plugin sso-provider kept off", "plugin other-plugin kept off", "plugin removed-plugin restored off: removed after the backup",
-		"library Removed since restored disabled: removed after the backup"} {
+		"library Removed since restored disabled: removed after the backup",
+		"autoscan_sources " + source + " restored with enabled off: removed after the backup"} {
 		if !slices.Contains(carried.Stricter, want) {
 			t.Fatalf("reported %v, want %q", carried.Stricter, want)
 		}
@@ -1290,6 +1301,11 @@ func TestEveryTableIsClassifiedDB(t *testing.T) {
 		}
 		if !restoredAsBackedUp[f.table] || !boolean {
 			t.Errorf("stricterFlags %s.%s: want a boolean column of a table restored as the backup has it, it is in %q", f.table, f.column, listed[f.table])
+		}
+		// A row removed since the backup comes back with an off-wins switch
+		// off, unless the flag says why it rolls back as it was.
+		if !f.stricter && !f.absentOff && f.rollsBack == "" {
+			t.Errorf("stricterFlags %s.%s: a row removed since the backup would come back on; set absentOff or say why it rolls back", f.table, f.column)
 		}
 	}
 	checkFlagColumnsDecided(t, pool, restoredAsBackedUp)

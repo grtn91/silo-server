@@ -277,7 +277,16 @@ job.
   "Delete" answer 409 when the lock is held.
 - A scheduled run that finds the lock held records
   "skipped: another backup or restore is running". Every API server fires the
-  same daily trigger; one backs up and the others record the skip.
+  same daily trigger; one backs up and the others record the skip. A
+  scheduled run that takes the lock after another server already backed up
+  its slot skips too ("skipped: tonight's backup already ran on another
+  server"): a successful nightly records its slot, the latest `backup.time`
+  at or before it started in its server's local time zone, in
+  `backup_status.last_nightly_slot`, and a scheduled run skips when a
+  recorded slot falls within the 24 hours before its own. Servers in
+  different time zones, or a changed `backup.time`, can cost one night's
+  run, never a second copy. A failed nightly records no slot; manual and
+  before-upgrade backups neither record nor check one.
 - A held lock's session is checked every 10 seconds. If it ends, the work
   holding the lock is canceled (`pg_dump`, a restore), and the
   incomplete folder it leaves is the sweep's.
@@ -1207,9 +1216,14 @@ neither list.
   turned off during an incident stays off, and a sign-in provider's carried
   links then sign no one in. A plugin installation or catalog the backup
   has and the live server no longer does comes back off, never on, and so
-  does a library deleted since the backup (disabled, for an admin to turn
-  on deliberately: an account with every library would otherwise see it at
-  once) and a personal collection deleted since (unshared). Nothing
+  does every other row with an off-wins switch that was deleted since the
+  backup: a library (disabled, for an admin to turn on deliberately: an
+  account with every library would otherwise see it at once), a personal
+  collection (unshared), an autoscan source, a history import source, a
+  request integration or route, a subtitle or marker provider's sharing, a
+  plugin task binding, an access group's permissions, a profile's
+  notifications. Only account switches roll back as they were
+  (`rollsBack`), since accounts roll back whole. Nothing
   a full restore does turns a plugin on; the admin does. These switches are
   set before the credential carry compares authority, so it compares the
   restored server as it will start; the carry also counts an account with
