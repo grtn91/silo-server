@@ -21,9 +21,6 @@ type restoreSetIndex struct {
 	collectionIDs, templateIDs, sectionIDs map[string]int
 	// blobDirs lists the blob keys in each directory, sorted.
 	blobDirs map[string][]string
-	// collectionBlobs lists the blob keys under each collection's
-	// collection-images/<id>/ directory.
-	collectionBlobs map[string][]string
 	// The backup's entries that count as twins of one another, by what
 	// makes them twins, and then by their backup library (noLibrary for
 	// none): sectionTwins, collectionTwins, templateTwins.
@@ -48,7 +45,7 @@ func buildRestoreSetIndex(rs *RestoreSet) *restoreSetIndex {
 		libraryNames: map[int]string{}, collections: map[string]int{}, templates: map[string]int{},
 		sections: map[string]int{}, artwork: map[string]int{}, branding: map[string]int{}, plugins: map[string]int{},
 		collectionIDs: map[string]int{}, templateIDs: map[string]int{}, sectionIDs: map[string]int{},
-		blobDirs: map[string][]string{}, collectionBlobs: map[string][]string{},
+		blobDirs:     map[string][]string{},
 		sectionTwins: map[sectionTwinKey]map[int]int{}, collectionTwins: map[string]map[int]int{}, templateTwins: map[[2]string]map[int]int{},
 	}
 	// The reader refuses two entries with one item id, so the first is
@@ -104,11 +101,6 @@ func buildRestoreSetIndex(rs *RestoreSet) *restoreSetIndex {
 	for key := range rs.blobs {
 		dir := path.Dir(key) + "/"
 		x.blobDirs[dir] = append(x.blobDirs[dir], key)
-		if rest, ok := strings.CutPrefix(key, collectionImagePrefix); ok {
-			if id, _, ok := strings.Cut(rest, "/"); ok {
-				x.collectionBlobs[id] = append(x.collectionBlobs[id], key)
-			}
-		}
 	}
 	for _, keys := range x.blobDirs {
 		slices.Sort(keys)

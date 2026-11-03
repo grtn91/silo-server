@@ -461,8 +461,9 @@ devices are refused); canonical relative paths with no empty, `.`, or `..`
 segment, backslash, or NUL; no duplicate paths, sections, or item ids;
 `restore-set.json` first; every other file listed in the index with its size
 and digest, and every listed file present; blobs only under their section's
-prefixes and only keys the section references, or variants stored in a
-referenced artwork original's directory; avatars a user document names
+prefixes and only keys the section references, or variants stored beside a
+referenced artwork original (in its directory and of its revision, or both
+without one; at most 16 per original); avatars a user document names
 listed for the section; documents that decode strictly
 (unknown fields and trailing data refused) and match the index counts; and
 limits on entries (200,000), document size (64 MiB for the collections and
@@ -479,7 +480,15 @@ over 8 times its size plus 64 KiB, when the set's documents together would
 decode to over 256 MiB, or when one array or object holds over 1,000,000
 elements. A short document of empty elements (`[{},{},…]`) would otherwise
 decode to a whole struct per three bytes; documents Silo writes decode to
-about their size. A plugin archive is checked against its
+about their size. Every entry a restore writes (a setting, a library, a
+plugin configuration, a collection, a template collection, an item artwork,
+a branding asset, a page section, and each account's profiles) is left out
+as unusable when it encodes to more than 1 MiB, the v2 API's request body
+cap (`maxRestoredEntryBytes`), and a stored thumbhash is the one computed
+from the restored image (item artwork) or one of thumbhash form, never
+anything else. A set lists at most the first 100 entries of a section it
+leaves out, and one more entry counting the rest, so a preview of a set of
+malformed entries stays small. A plugin archive is checked against its
 digest and discarded, never installed ([Plugins](#plugins)). Readers accept
 every format version up to theirs and refuse a newer one with "This backup is
 from a newer Silo. Upgrade this server first."
@@ -793,10 +802,15 @@ the type its extension serves, and the kind's processing
 WebP by its bytes, and a source `imageutil.CheckImage` accepts. A blob that
 fails fails its item with `ErrRestoredFileRefused`; other items go on.
 
-The job extracts only the blobs its selected items write (`selectedBlobs`),
-sizing them from the preview's read of the same restore set, and refuses to
-start (`ErrNotEnoughTempSpace`) unless the temporary directory has their size
-plus 1 GB free. The rest of the archive is read, checked, and discarded.
+The job extracts only the blobs its selected items write (`selectedBlobs`):
+the exact keys the apply step reads (a library's poster, a branding asset,
+an item artwork's family, a collection's uploaded poster and backdrop with
+their families), never a prefix. It sizes them from the preview's read of the
+same restore set, and refuses to start (`ErrNotEnoughTempSpace`) for more
+than 50,000 files, or unless the temporary directory has their size plus
+1 GB free and a free inode for each plus 10,000. The rest of the archive is
+read, checked, and discarded. Reading the set and extracting stop when the
+job is canceled; once the first item runs, a cancel stops between items.
 
 Before its first item, a restore records each store's identity
 (`blobstore.RecordIdentity`), which a store opened with settings would do on
@@ -1229,15 +1243,30 @@ that holds a bearer secret or a public capability, each one way:
   destinations that receive notifications without a session (browser and
   mobile push registrations, notification webhooks, notification email
   addresses, Discord links, server notification channels): one removed
-  since the backup would receive them again. A restore
+  since the backup would receive them again. What this server holds for
+  an outside account is carried the same way: watch-provider connections
+  with their tokens (one removed since would sync again), and plugins'
+  configuration and stored state, which hold the keys and tokens a plugin
+  presents to its service and which the server cannot tell apart from a
+  plugin's other settings. A restore
   never brings back the backup's rows: one revoked after the backup would
   work again, and one created since would stop working. They stay in the
   dump (`marker_edit_audit` refers to API keys), and the restore replaces
   them as below.
+- Restored with live credentials (`secretScrubbed`): connections to outside
+  services that other restored data refers to (history import sources,
+  subtitle provider accounts, autoscan targets, request integrations). The
+  backup's rows come back, but each takes its address and credentials from
+  the live row with its key, so neither the backup's credentials reach a
+  service again nor the live ones the backup's address; a row the live
+  server does not have (deleted since, or any row of another deployment's
+  backup) comes back with its credentials cleared and turned off, and the
+  command lists it.
 - Restored with the data: what looks like a secret admits no one to this
-  server or belongs to the record it comes with (outbound provider tokens,
-  URL slugs, worker leases, delivery histories, account passwords and
-  profile PINs with their accounts).
+  server or belongs to the record it comes with (URL slugs, worker leases,
+  delivery histories, account passwords and profile PINs with their
+  accounts). No table that holds what this server presents to an outside
+  service is restored as the backup has it.
 
 Every other table is classified too (`internal/backup/tables.go`): the
 logs and queues the dump leaves out (`loggedTables`), the server's data
@@ -1284,9 +1313,15 @@ neither list.
   reason. An invitation or invite code is also dropped when the account it
   would create gets a wider effective policy under the restored data than
   live: its role and libraries applied to its access group, or the default
-  group when it names none, as account creation resolves them. The command
-  counts what it kept per kind and lists what it dropped by id and label,
-  never key material. Identity sequences move past the ids written. Live rows are
+  group when it names none, as account creation resolves them. A sign-in
+  provider that creates accounts on first sign-in (`auto_provision`) is
+  compared the same way, for the user it would create in the default group;
+  where that is wider it is carried with account creation off, so people
+  already linked still sign in, and listed. These are every way a new
+  account appears without an admin: an invite-code signup also needs
+  `signup.enabled`, kept at the stricter of the two servers' values. The
+  command counts what it kept per kind and lists what it dropped or kept
+  with less by id and label, never key material. Identity sequences move past the ids written. Live rows are
   encrypted with this server's key, so they stay readable after
   `--accept-lost-credentials`.
 - Carrying from the live server is for the deployment the backup came from:
@@ -1394,6 +1429,14 @@ material: any account on the host can read a running command's arguments.
 The command refuses one and points to `PGPASSWORD` or a password file
 (`~/.pgpass`, `PGPASSFILE`), and to a service file (`PGSERVICEFILE`) for an
 `sslpassword`, which both the command and `pg_restore` read.
+
+A swap creates the restored database from `template0`, so `pg_restore`
+creates the backup's extensions in it as the `DATABASE_URL` role. Preflight
+reads them from the dump's table of contents and refuses, before anything
+changes, one this PostgreSQL server does not have, or one only a superuser
+may create (`vector` is not trusted) when the role is not a superuser
+(`ErrExtensionNeedsSuperuser`), pointing to a superuser role or separate
+mode into a database where a superuser created them.
 
 A swap reaches the maintenance database and the databases it creates through
 URLs derived from `DATABASE_URL` with only the database changed. The

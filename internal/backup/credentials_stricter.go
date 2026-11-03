@@ -129,13 +129,6 @@ var stricterFlags = func() []stricterFlag {
 			id: `t.user_id::text || ':' || t.profile_id`, key: noKey, scope: everyRow,
 			describe: fmt.Sprintf(`format('notifications of profile %%s kept off (%s)', t.profile_id)`, column)})
 	}
-	// What a watch-provider connection sends to or takes from the provider.
-	for _, column := range []string{"export_favorites_enabled", "export_ratings_enabled", "export_unwatched_enabled", "export_watched_enabled",
-		"export_watchlist_enabled", "import_favorites_enabled", "import_progress_enabled", "import_ratings_enabled", "import_watched_enabled",
-		"import_watchlist_enabled", "scrobble_enabled", "sync_dropped_enabled", "sync_favorite_removals_enabled",
-		"sync_watchlist_order_enabled", "sync_watchlist_removals_enabled"} {
-		flags = append(flags, flag("watch_provider_connections", column, false, "watch-provider connection"))
-	}
 	return flags
 }()
 

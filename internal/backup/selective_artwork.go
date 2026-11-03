@@ -3,10 +3,12 @@ package backup
 import (
 	"context"
 	"errors"
+	"io"
 
 	"github.com/jackc/pgx/v5"
 
 	"github.com/Silo-Server/silo-server/internal/catalog"
+	"github.com/Silo-Server/silo-server/internal/imageutil"
 	"github.com/Silo-Server/silo-server/internal/metadata"
 )
 
@@ -15,6 +17,33 @@ import (
 
 func (a *applier) artworkEntry(id string) *ItemArtworkEntry {
 	return indexed(a.rs.Collections.ItemArtwork, a.rs.lookup().artwork, id)
+}
+
+// artworkThumbhash is the thumbhash of the restored original, as the image
+// cache computes one when it stores artwork; the backup's own is used only
+// when the image cannot be read, and only when it is one (validThumbhash).
+func (a *applier) artworkThumbhash(entry ItemArtworkEntry) string {
+	if thumb, err := a.blobThumbhash(entry.Path); err == nil {
+		return thumb
+	}
+	return thumbFor(entry.Path, entry.Thumbhash)
+}
+
+// blobThumbhash computes the thumbhash of an extracted image.
+func (a *applier) blobThumbhash(key string) (string, error) {
+	f, size, err := a.rs.openBlob(key)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = f.Close() }()
+	if size > maxRestoredFile {
+		return "", ErrRestoredFileRefused
+	}
+	data, err := io.ReadAll(f)
+	if err != nil {
+		return "", err
+	}
+	return imageutil.Thumbhash(data)
 }
 
 // stageArtwork writes an artwork item's objects before its transaction,
@@ -91,7 +120,7 @@ func (a *applier) applyArtwork(ctx context.Context, tx pgx.Tx, id string) (appli
 	}
 	if err := catalog.PublishArtworkSelectionInTx(ctx, tx, catalog.ArtworkSelection{
 		TargetType: entry.TargetType, TargetContentID: entry.ContentID, ParentContentID: entry.ParentContentID,
-		ImageType: entry.ImageType, StoredPath: entry.Path, SourcePath: entry.Source, Thumbhash: entry.Thumbhash,
+		ImageType: entry.ImageType, StoredPath: entry.Path, SourcePath: entry.Source, Thumbhash: a.artworkThumbhash(*entry),
 		LockField: int(metadata.FieldImages),
 	}); err != nil {
 		return applied{}, err

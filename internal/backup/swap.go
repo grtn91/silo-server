@@ -24,6 +24,10 @@ type ControlDB interface {
 	// CheckPrivileges confirms the role can create and rename databases and
 	// change ALLOW_CONNECTIONS on live.
 	CheckPrivileges(ctx context.Context, live string) error
+	// CheckExtensions confirms the role can create each extension in a new
+	// database: a superuser can create any installed one, any other role
+	// only trusted ones.
+	CheckExtensions(ctx context.Context, names []string) error
 	Create(ctx context.Context, name string) error
 	Drop(ctx context.Context, name string) error
 	Rename(ctx context.Context, from, to string) error
@@ -127,7 +131,9 @@ func RestoreSwap(ctx context.Context, src *Source, loader DatabaseLoader, ctl Co
 	}
 	stores := storesOf(opened)
 	// Step 2: preflight. Nothing changes here.
-	liveOID, err := swapPreflight(ctx, ctl, stores, live, restored, before)
+	liveOID, err := swapPreflight(ctx, ctl, stores, live, restored, before, func() ([]string, error) {
+		return loader.Extensions(ctx, src.path(DumpName))
+	})
 	if err != nil {
 		return err
 	}
@@ -346,7 +352,7 @@ func checkLiveIdle(ctx context.Context, ctl ControlDB, live string) error {
 // swapPreflight is §10.2 step 2: no other client on the live database, the
 // privileges a swap needs, free names for the two databases it creates, and
 // writable stores. It changes nothing and returns the live database's oid.
-func swapPreflight(ctx context.Context, ctl ControlDB, stores blobStores, live, restored, before string) (uint32, error) {
+func swapPreflight(ctx context.Context, ctl ControlDB, stores blobStores, live, restored, before string, extensions func() ([]string, error)) (uint32, error) {
 	if others, err := ctl.OtherConnections(ctx, live); err != nil {
 		return 0, fmt.Errorf("checking for other connections: %w", err)
 	} else if others > 0 {
@@ -354,6 +360,15 @@ func swapPreflight(ctx context.Context, ctl ControlDB, stores blobStores, live, 
 	}
 	if err := ctl.CheckPrivileges(ctx, live); err != nil {
 		return 0, fmt.Errorf("%w; stop here and use separate mode (--into) instead", err)
+	}
+	// The restored database is new, from template0: pg_restore creates the
+	// backup's extensions in it as this role.
+	needed, err := extensions()
+	if err != nil {
+		return 0, fmt.Errorf("reading the extensions the backup needs: %w", err)
+	}
+	if err := ctl.CheckExtensions(ctx, needed); err != nil {
+		return 0, err
 	}
 	for _, name := range []string{restored, before} {
 		if _, taken, err := ctl.OID(ctx, name); err != nil {

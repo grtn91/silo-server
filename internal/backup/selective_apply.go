@@ -72,33 +72,16 @@ func (s *Service) ExecuteRestore(ctx context.Context, run RestoreRun) (any, erro
 	work, cancelWork := withLost(context.WithoutCancel(ctx), held)
 	defer cancelWork()
 
-	// Only the files the selected items write are extracted, and only when
-	// the temporary directory has room for them.
-	located, err := s.locateConfirmed(work, req.source(), req.AcceptUnauthenticated)
-	if err != nil {
-		return fail(err)
-	}
-	planned, err := s.cachedSet(work, located)
-	if err != nil {
-		return fail(err)
-	}
-	if planned.Digest != req.Digest {
-		return fail(ErrDigestMismatch)
-	}
-	wanted := selectedBlobs(planned, req.Selection)
-	maps.Copy(wanted, selectedUserBlobs(planned, req.Users))
-	if err := checkTempSpace(os.TempDir(), planned, wanted); err != nil {
-		return fail(err)
-	}
-	rs, err := s.openRestoreSet(work, located, func(key string) bool { return wanted[key] })
+	rs, located, err := s.readSelected(ctx, work, req, func(planned *RestoreSet) map[string]bool {
+		wanted := selectedBlobs(planned, req.Selection)
+		maps.Copy(wanted, selectedUserBlobs(planned, req.Users))
+		return wanted
+	})
 	if err != nil {
 		return fail(err)
 	}
 	rs.unverified = !located.authenticated
 	defer rs.Cleanup()
-	if rs.Digest != req.Digest {
-		return fail(ErrDigestMismatch)
-	}
 
 	if err := s.recordStoreIdentities(work); err != nil {
 		return fail(err)
@@ -189,6 +172,42 @@ func (req RestoreRequest) selectedIDs(section string) []string {
 		ids = append(ids, u.Account)
 	}
 	return ids
+}
+
+// readSelected reads the restore set req names, extracting only the files
+// its selected items write (wanted, from the preview's read of the same
+// set), once the temporary directory has room for them (checkTempSpace).
+// Nothing is written before the first item, so reading stops when the job
+// (ctx) is canceled, as well as when work ends.
+func (s *Service) readSelected(ctx, work context.Context, req RestoreRequest, wanted func(*RestoreSet) map[string]bool) (*RestoreSet, locatedSource, error) {
+	reading, stopReading := context.WithCancel(work)
+	defer stopReading()
+	stop := context.AfterFunc(ctx, stopReading)
+	defer stop()
+	located, err := s.locateConfirmed(reading, req.source(), req.AcceptUnauthenticated)
+	if err != nil {
+		return nil, located, err
+	}
+	planned, err := s.cachedSet(reading, located)
+	if err != nil {
+		return nil, located, err
+	}
+	if planned.Digest != req.Digest {
+		return nil, located, ErrDigestMismatch
+	}
+	keep := wanted(planned)
+	if err := checkTempSpace(os.TempDir(), planned, keep); err != nil {
+		return nil, located, err
+	}
+	rs, err := s.openRestoreSet(reading, located, func(key string) bool { return keep[key] })
+	if err != nil {
+		return nil, located, err
+	}
+	if rs.Digest != req.Digest {
+		rs.Cleanup()
+		return nil, located, ErrDigestMismatch
+	}
+	return rs, located, nil
 }
 
 // applier applies items, one fenced transaction each.
@@ -900,7 +919,7 @@ func mapIn(m map[int]int) func(int) (int, bool) {
 }
 
 func thumbFor(key, thumb string) string {
-	if key == "" {
+	if key == "" || !validThumbhash(thumb) {
 		return ""
 	}
 	return thumb

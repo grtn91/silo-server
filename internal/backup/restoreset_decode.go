@@ -6,6 +6,7 @@ package backup
 // (RestoreSet.Unusable) and anything that breaks the set refused.
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -76,8 +77,19 @@ type UnusableEntry struct {
 	Message string
 }
 
-// unusable records an entry left out, labeled by what the archive names it.
+// maxUnusableListed bounds the entries left out that a set lists for one
+// section; the rest are counted (summarizeUnusable).
+const maxUnusableListed = 100
+
+// unusable records an entry left out, labeled by what the archive names it:
+// the first maxUnusableListed of a section, and a count of the rest.
 func (p *restoreSetParser) unusable(section, kind, label, message string) {
+	if p.unusableCount == nil {
+		p.unusableCount = map[string]int{}
+	}
+	if p.unusableCount[section]++; p.unusableCount[section] > maxUnusableListed {
+		return
+	}
 	label = strings.TrimSpace(strings.ToValidUTF8(label, ""))
 	if len(label) > 200 {
 		label = strings.ToValidUTF8(label[:200], "")
@@ -87,6 +99,24 @@ func (p *restoreSetParser) unusable(section, kind, label, message string) {
 	}
 	p.rs.Unusable = append(p.rs.Unusable, UnusableEntry{Section: section, ID: fmt.Sprintf("unreadable:%d", len(p.rs.Unusable)+1),
 		Kind: kind, Label: label, Message: message})
+}
+
+// summarizeUnusable adds, for a section with more entries left out than it
+// lists, one entry saying how many more there are.
+func (p *restoreSetParser) summarizeUnusable(section string) {
+	more := p.unusableCount[section] - maxUnusableListed
+	if more <= 0 {
+		return
+	}
+	kind := ""
+	for _, e := range p.rs.Unusable {
+		if e.Section == section {
+			kind = e.Kind
+		}
+	}
+	p.rs.Unusable = append(p.rs.Unusable, UnusableEntry{Section: section, ID: fmt.Sprintf("unreadable:%d", len(p.rs.Unusable)+1),
+		Kind: kind, Label: fmt.Sprintf("%d more entries", more),
+		Message: fmt.Sprintf("They cannot be restored either; only the first %d are listed.", maxUnusableListed)})
 }
 
 func requireDocument(spec sectionSpec, ok bool, err error) error {
@@ -112,6 +142,10 @@ func (p *restoreSetParser) validateSettings() error {
 			return fmt.Errorf("setting %q is listed twice", s.Key)
 		}
 		seen[s.Key] = true
+		if entryTooLarge(s) {
+			p.unusable(SectionSettings, KindSettingsPage, s.Key, msgEntryTooLarge)
+			continue
+		}
 		kept = append(kept, s)
 	}
 	d.Settings = kept
@@ -204,6 +238,10 @@ func (p *restoreSetParser) validateCollections() error {
 		if err := claim(a.itemID()); err != nil {
 			return err
 		}
+		if entryTooLarge(a) {
+			p.unusable(SectionCollections, KindItemArtwork, a.ContentID, msgEntryTooLarge)
+			continue
+		}
 		artwork = append(artwork, a)
 	}
 	d.ItemArtwork = artwork
@@ -218,6 +256,10 @@ func (p *restoreSetParser) validateCollections() error {
 		}
 		if err := claim(b.itemID()); err != nil {
 			return err
+		}
+		if entryTooLarge(b) {
+			p.unusable(SectionCollections, KindBranding, b.Key, msgEntryTooLarge)
+			continue
 		}
 		brandingEntries = append(brandingEntries, b)
 	}
@@ -318,8 +360,10 @@ func homeSectionProblem(e HomeSectionEntry) string {
 	return ""
 }
 
-// maxRestoredEntryBytes bounds one library, collection, template
-// collection, or section, encoded, as the v2 API's request body cap
+// maxRestoredEntryBytes bounds every entry a restore writes (a setting, a
+// library, a plugin configuration, a collection, a template collection, an
+// item artwork, a branding asset, a page section, and in account documents
+// each profile), encoded, as the v2 API's request body cap
 // (apiv2.MaxJSONBodyBytes, which this package cannot import) bounds what one
 // create or update writes: a restore stores no more for one than its editor
 // could. A collection's items are not counted; they are added one by one.
@@ -338,6 +382,22 @@ func entryTooLarge(v any) bool {
 func collectionTooLarge(c CollectionEntry) bool {
 	c.Items = nil
 	return entryTooLarge(c)
+}
+
+// maxThumbhashLength bounds a thumbhash: base64 of at most 25 bytes.
+const maxThumbhashLength = 64
+
+// validThumbhash reports whether s could be a thumbhash; a restore stores
+// none that is not.
+func validThumbhash(s string) bool {
+	if s == "" {
+		return true
+	}
+	if len(s) > maxThumbhashLength {
+		return false
+	}
+	_, err := base64.StdEncoding.DecodeString(s)
+	return err == nil
 }
 
 // validBrandingEntry admits only a branding asset setting whose reference
@@ -444,6 +504,9 @@ func pluginConfigProblem(doc PluginDocument) string {
 		keys[c.Key] = true
 		if !json.Valid(c.Value) {
 			return "A configuration value is not valid JSON."
+		}
+		if entryTooLarge(c) {
+			return msgEntryTooLarge
 		}
 	}
 	return ""
