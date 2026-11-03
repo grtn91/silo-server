@@ -261,6 +261,12 @@ func (l fakeLoader) KeepStricterSettings(context.Context, string, string, *secre
 func (l fakeLoader) Extensions(context.Context, string) ([]string, error) {
 	return []string{"vector"}, nil
 }
+func (l fakeLoader) CarryServerSpecificSettings(context.Context, string, string) (int, error) {
+	return 0, nil
+}
+func (l fakeLoader) CarryOutboundSettings(context.Context, string, string) ([]string, []string, error) {
+	return nil, nil, nil
+}
 func (l fakeLoader) InterruptWork(context.Context, string, string) ([]string, error) { return nil, nil }
 func (l fakeLoader) Superuser(context.Context, string) (bool, error)                 { return l.ctl.superuser, nil }
 func (l fakeLoader) AccountRollback(context.Context, string, string) (AccountRollback, error) {

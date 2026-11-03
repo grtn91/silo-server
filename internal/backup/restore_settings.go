@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/Silo-Server/silo-server/internal/branding"
+	"github.com/Silo-Server/silo-server/internal/catalog"
 )
 
 // SettingClass says whether a restore offers a setting.
@@ -138,8 +139,8 @@ var settingRulesByPage = []struct {
 	}},
 	{"search", map[string]SettingClass{
 		"catalog.search.provider":                SettingServerSpecific,
-		"catalog.search.meilisearch.url":         SettingServerSpecific,
-		"catalog.search.meilisearch.api_key":     SettingServerSpecific,
+		catalog.SearchSettingMeilisearchURL:      SettingServerSpecific,
+		catalog.SearchSettingMeilisearchAPIKey:   SettingServerSpecific,
 		"catalog.search.meilisearch.index":       SettingServerSpecific,
 		"catalog.search.meilisearch.index_types": SettingPortable,
 		"catalog.search.meilisearch.":            SettingPortable,
@@ -176,8 +177,8 @@ var settingRulesByPage = []struct {
 		"ai.base_url":           SettingExternalService,
 		"ai.asr_base_url":       SettingExternalService,
 		"subtitle_ai.base_url":  SettingExternalService,
-		"ai.asr_api_key":        SettingExternalService,
-		"subtitle_ai.api_key":   SettingExternalService,
+		settingASRKey:           SettingExternalService,
+		settingSubtitleAIKey:    SettingExternalService,
 		"ai.":                   SettingPortable,
 		"subtitle_ai.":          SettingPortable,
 		"metadata_ai.":          SettingPortable,
@@ -208,8 +209,8 @@ var settingRulesByPage = []struct {
 		// the stored vectors, and the access-policy generation they reflect.
 		"recommendations.embedding_lock":           SettingServerSpecific,
 		"recommendations.policy_marked_generation": SettingServerSpecific,
-		"recommendations.embedding_auth_token":     SettingExternalService,
-		"recommendations.openai_api_key":           SettingExternalService,
+		settingEmbeddingToken:                      SettingExternalService,
+		settingOpenAIEmbeddingKey:                  SettingExternalService,
 		"recommendations.embedding_base_url":       SettingExternalService,
 		"recommendations.":                         SettingPortable,
 	}},

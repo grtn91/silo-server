@@ -2,6 +2,7 @@ package backup
 
 import (
 	"context"
+	"slices"
 	"sync"
 )
 
@@ -121,13 +122,26 @@ func (c *restoreSetCache) storeLocked(digest string, rs *RestoreSet) {
 		c.touch(digest)
 		return
 	}
+	if rs.fromUnverified {
+		// One set of a backup this server cannot verify at a time: anyone
+		// who can write a destination could fill the cache otherwise.
+		for d, other := range c.entries {
+			if other.fromUnverified {
+				c.evictLocked(d)
+			}
+		}
+	}
 	c.entries[digest] = rs
 	c.bytes += rs.metadataBytes
 	c.touch(digest)
 	for len(c.order) > maxCachedRestoreSets || c.bytes > maxCachedRestoreSetBytes {
-		oldest := c.order[0]
-		c.order = c.order[1:]
-		c.bytes -= c.entries[oldest].metadataBytes
-		delete(c.entries, oldest)
+		c.evictLocked(c.order[0])
 	}
+}
+
+// evictLocked drops the set with digest. c.mu is held.
+func (c *restoreSetCache) evictLocked(digest string) {
+	c.order = slices.DeleteFunc(c.order, func(d string) bool { return d == digest })
+	c.bytes -= c.entries[digest].metadataBytes
+	delete(c.entries, digest)
 }

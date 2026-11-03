@@ -492,7 +492,13 @@ over the collections, template collections, and section-managed collections
 it commits; the rest are left out with `over_restore_budget`, since a
 library's collections are listed whole. The collection editors have no
 per-field limits besides the request body cap, so a restore applies none of
-its own to single fields. A set lists at most the first 100 entries of a section it
+its own to single fields. A set's collections list at most 1,000,000 items together. The preview
+cache charges each set what it holds once read: the bytes read, jsonsize's
+estimate of its decoded documents, and its blob index; and it keeps at most
+one set of a backup this server cannot verify, dropping the older one. A
+restore job claimed while the request that queued it still holds the
+subsystem lock waits up to 10 seconds for it (`lockWithin`) before it
+gives up. A set lists at most the first 100 entries of a section it
 leaves out, and one more entry counting the rest, so a preview of a set of
 malformed entries stays small. A plugin archive is checked against its
 digest and discarded, never installed ([Plugins](#plugins)). Readers accept
@@ -1214,6 +1220,34 @@ encrypted `server_settings` row this key cannot open and prints their key
 names (never values) for the admin to enter again. Rows are only deleted,
 never renamed: a value is bound to its key name.
 
+### Connections to outside services
+
+Where this server connects outside and how it signs in there never comes
+from the backup on its own. `outboundBundles` (`internal/backup/settings_outbound.go`)
+groups those settings into units: each endpoint and secret route of
+`settingRoutes` (SMTP, AI providers, speech, subtitle AI, embeddings), the
+AI provider list, the ChatGPT credentials, the push relay, the search
+engine's address and key, the Discord application, and the API keys and
+client secrets of metadata, request, and watch-sync services. On a full
+restore of this deployment's backup each unit the live server has is taken
+from it whole, so an SMTP host and password changed since the backup stay
+changed. A unit the live server lacks, and every unit of another
+deployment's backup or a separate restore, keeps the backup's other values
+with its secrets cleared and its switch off, and the command lists it for
+re-entry. `TestEveryCredentialSettingIsDecided` fails on an encrypted
+setting that is neither in a unit nor this server's own (signing keys,
+storage, Redis, the web push key pair).
+
+A full restore also keeps every server-specific setting (`SettingKindServerSpecific`:
+the server's identity and public URL, storage, Redis, search, AI
+providers, the push relay, and the rest of `serverSpecificSettings`) as the
+live server has it, deleting one the live server lacks so its default
+applies, whichever deployment the backup came from: they describe this
+server, as a selective restore never writes them
+(`CarryServerSpecificSettings`). The signing keys a restore rotates keep
+their new values. `TestServerSpecificSettingsComeFromTheLiveServerDB`
+checks every classified one.
+
 ### Interrupted work
 
 Nothing the backup had queued or running runs by itself after a full
@@ -1459,6 +1493,12 @@ changes, one this PostgreSQL server does not have, or one only a superuser
 may create (`vector` is not trusted) when the role is not a superuser
 (`ErrExtensionNeedsSuperuser`), pointing to a superuser role or separate
 mode into a database where a superuser created them.
+
+The control connection uses the first of `postgres` and `template1` that is
+not the live database and that the role can connect to (a live database
+named `postgres` gets `template1`); a swap renames the live database, which
+PostgreSQL refuses while a session is on it. With neither, the command
+refuses before anything changes.
 
 A swap reaches the maintenance database and the databases it creates through
 URLs derived from `DATABASE_URL` with only the database changed. The

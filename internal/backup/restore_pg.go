@@ -306,22 +306,45 @@ type PGControl struct {
 	Like string
 }
 
-// ConnectControl opens the control connection to the maintenance database
-// ("postgres") of the server databaseURL points at.
+// maintenanceDatabases are the databases the control connection may use,
+// in order: never the live one, which the swap renames and closes.
+var maintenanceDatabases = []string{maintenancePostgres, "template1"}
+
+// maintenancePostgres is the default maintenance database.
+const maintenancePostgres = "postgres"
+
+// ConnectControl opens the control connection to a maintenance database of
+// the server databaseURL points at: the first of maintenanceDatabases that
+// is not the live database and that the role can connect to. A swap renames
+// the live database, which PostgreSQL refuses while this session is on it.
 func ConnectControl(ctx context.Context, databaseURL string) (*PGControl, error) {
 	live, err := databaseName(databaseURL)
 	if err != nil {
 		return nil, err
 	}
-	maintenance, err := WithDatabase(databaseURL, "postgres")
-	if err != nil {
-		return nil, err
+	var failures []error
+	for _, name := range maintenanceDatabases {
+		if name == live {
+			continue
+		}
+		maintenance, err := WithDatabase(databaseURL, name)
+		if err != nil {
+			return nil, err
+		}
+		conn, err := pgx.Connect(ctx, maintenance)
+		if err != nil {
+			failures = append(failures, fmt.Errorf("%s: %w", name, err))
+			continue
+		}
+		var on string
+		if err := conn.QueryRow(ctx, `SELECT current_database()`).Scan(&on); err != nil || on == live {
+			_ = conn.Close(context.WithoutCancel(ctx))
+			return nil, fmt.Errorf("the control connection reached %q, the live database: %w", on, err)
+		}
+		return &PGControl{Conn: conn, Like: live}, nil
 	}
-	conn, err := pgx.Connect(ctx, maintenance)
-	if err != nil {
-		return nil, fmt.Errorf("connecting to the maintenance database: %w", err)
-	}
-	return &PGControl{Conn: conn, Like: live}, nil
+	return nil, fmt.Errorf("a replace needs a maintenance database other than the live one (%s) that the role can connect to; "+
+		"grant it CONNECT on one, or use separate mode (--into): %w", strings.Join(maintenanceDatabases, " or "), errors.Join(failures...))
 }
 
 func ident(name string) string { return pgx.Identifier{name}.Sanitize() }

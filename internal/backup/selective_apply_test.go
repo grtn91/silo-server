@@ -443,3 +443,40 @@ func TestCollectionMetadataBudget(t *testing.T) {
 		t.Fatal("the restore's total budget is spent")
 	}
 }
+
+// busyLocker answers ErrBusy until free is closed, and signals tries on
+// each answer when set.
+type busyLocker struct {
+	Locker
+	free, tries chan struct{}
+}
+
+func (l busyLocker) TryLock(context.Context) (Held, error) {
+	select {
+	case <-l.free:
+		return nil, nil
+	default:
+	}
+	if l.tries != nil {
+		select {
+		case l.tries <- struct{}{}:
+		default:
+		}
+	}
+	return nil, ErrBusy
+}
+
+// TestRestoreJobWaitsForTheRequestThatQueuedIt: a restore job claimed while
+// the request that queued it still holds the lock takes the lock once that
+// request lets go, and gives up only after enqueueHandoff.
+func TestRestoreJobWaitsForTheRequestThatQueuedIt(t *testing.T) {
+	l := busyLocker{free: make(chan struct{}), tries: make(chan struct{}, 1)}
+	// The request lets go once the job has asked once and found it held.
+	go func() { <-l.tries; close(l.free) }()
+	if _, err := lockWithin(t.Context(), l, enqueueHandoff); err != nil {
+		t.Fatalf("lock released after the handoff: %v", err)
+	}
+	if _, err := lockWithin(t.Context(), busyLocker{free: make(chan struct{})}, 0); !errors.Is(err, ErrBusy) {
+		t.Fatalf("lock held past the wait: %v, want ErrBusy", err)
+	}
+}
