@@ -184,7 +184,7 @@ func (h *memHeld) Exec(context.Context, string, ...any) (pgconn.CommandTag, erro
 // putPlainBackup stores a complete unencrypted backup with a restore set,
 // its manifest signed with testManifestKey, and returns the restore set's
 // digest.
-func putPlainBackup(t *testing.T, store blobstore.Store, serverID, id string) string {
+func putPlainBackup(t *testing.T, store blobstore.Store, serverID, id string, change ...func(*Manifest)) string {
 	t.Helper()
 	ctx := t.Context()
 	m := validTestManifest()
@@ -206,6 +206,9 @@ func putPlainBackup(t *testing.T, store blobstore.Store, serverID, id string) st
 	}
 	m.RestoreSet = &RestoreSetSummary{FormatVersion: restoreSetVersion, Sections: map[string]int{}, IndexSHA256: hex.EncodeToString(indexSum[:])}
 	m.KeyCheck = testKeyCheck
+	for _, c := range change {
+		c(&m)
+	}
 	if err := m.sign(testManifestKey); err != nil {
 		t.Fatal(err)
 	}

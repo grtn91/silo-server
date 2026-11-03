@@ -211,8 +211,16 @@ func (s *Service) list(ctx context.Context) (Listing, error) {
 		switch {
 		case f.manifest != nil:
 			s.fromManifest(&summary, f.manifest)
-			hereSuccess = true
+			// Only a manifest this server authenticated says when a backup
+			// succeeded: anyone who can write the destination could set an
+			// unverified one's completion time in the future and silence the
+			// no-recent-backup warning, or the one for a destination
+			// without backups.
 			completed := f.manifest.CompletedAt
+			if !f.verified {
+				break
+			}
+			hereSuccess = true
 			if listing.LastSuccessAt == nil || completed.After(*listing.LastSuccessAt) {
 				listing.LastSuccessAt = &completed
 			}
