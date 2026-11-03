@@ -32,7 +32,9 @@ const (
 )
 
 // serverSpecificSettings are the server-specific keys and prefixes (ending
-// in "." or "_").
+// in "." or "_"). The AI sign-in mode and models are this server's choice
+// among what its own AI providers and ChatGPT account offer, which only
+// they can validate.
 var serverSpecificSettings = strings.Fields(`
 	server.identity_id server.public_url server.local_url
 	database. redis. userdb. storage. artwork. s3. backup. setup.
@@ -43,6 +45,7 @@ var serverSpecificSettings = strings.Fields(`
 	playback.ffmpeg_path playback.transcode_dir playback.hw_accel playback.hw_device
 	download.artifact_dir
 	ai.providers ai.chatgpt. ai.text_provider_id ai.speech_provider_id
+	ai.auth_mode ai.chat_model ai.reasoning_effort subtitle_ai.chat_model
 	notifications.push_relay_ notifications.web_push.vapid_keypair
 	jellyfin_compat.public_url jellyfin_compat.web_install_dir
 	recommendations.embedding_provider_id recommendations.embedding_lock recommendations.policy_marked_generation

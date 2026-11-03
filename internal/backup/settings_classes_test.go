@@ -35,7 +35,9 @@ func settingRegistry() []string {
 		config.MediaImageSweepCheckpointKey, config.ChapterThumbnailOriginalsCleanupKey, config.DashboardHiddenAttentionSettingKey,
 		mail.SettingSMTPHost, mail.SettingSMTPPassword,
 		"playback.hw_device", "download.artifact_dir", "recommendations.embedding_lock",
-		"recommendations.policy_marked_generation", "ui.admin_theme_vars", "defaults.card_overlays")
+		"recommendations.policy_marked_generation", "ui.admin_theme_vars", "defaults.card_overlays",
+		// The legacy subtitle model the AI settings still read.
+		"subtitle_ai.chat_model")
 	slices.Sort(keys)
 	return slices.Compact(keys)
 }
