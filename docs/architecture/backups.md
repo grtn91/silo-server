@@ -573,7 +573,9 @@ neither list.
   any field (`access.WiderThan`: libraries, quality, stream and transcode
   caps, profiles, downloads, requests, permissions, with access groups
   applied), a household manager (a primary profile) without a PIN where
-  every live one has a PIN, or, for a profile both sides have, a
+  every live one has a PIN, a profile only the backup has (deleted
+  since, which the credential's holder could select), or, for a profile
+  both sides have, a
   protection or restriction lifted or loosened (its PIN, becoming the
   primary profile, child profile, rating or advisory-age ceiling, library
   restriction, playback-quality ceiling), or a looser request policy

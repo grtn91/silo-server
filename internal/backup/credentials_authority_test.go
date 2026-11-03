@@ -153,4 +153,9 @@ func TestProfileComparisonCoversEveryField(t *testing.T) {
 	if !restored.widerThan(live) {
 		t.Error("widerThan misses a primary profile that lost its PIN")
 	}
+	// A profile deleted here since the backup, however restricted.
+	revived := accountAuthority{profiles: map[string]profileLimits{"a": {primary: true, pin: true}, "b": strict}}
+	if !revived.widerThan(live) {
+		t.Error("widerThan misses a profile only the restored data has")
+	}
 }
