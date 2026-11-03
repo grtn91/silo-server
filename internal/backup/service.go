@@ -88,6 +88,9 @@ type Options struct {
 	// FindTools overrides tool discovery for tests.
 	FindTools func(context.Context) (Tools, error)
 	Now       func() time.Time
+	// Location is the zone nightly slots are on (nightlySlot): the daily
+	// trigger's, time.Local unless set.
+	Location *time.Location
 }
 
 // Service owns taking, listing, and deleting backups.
@@ -112,6 +115,9 @@ type pendingRun struct {
 
 // New builds a Service.
 func New(opts Options) *Service {
+	if opts.Location == nil {
+		opts.Location = time.Local
+	}
 	if opts.Now == nil {
 		opts.Now = time.Now
 	}
@@ -250,7 +256,7 @@ func (s *Service) lockScheduled(ctx context.Context) (*pendingRun, RunResult, er
 	if kind == KindNightly {
 		// Every API server fires the trigger; under the lock, the first to
 		// finish the slot's backup leaves the others nothing to do.
-		done, err := s.slotBackedUp(ctx, nightlySlot(s.opts.Now(), s.backupTime(ctx)))
+		done, err := s.slotBackedUp(ctx, nightlySlot(s.opts.Now(), s.backupTime(ctx), s.opts.Location))
 		if err != nil || done {
 			held.Release(context.WithoutCancel(ctx))
 			if err != nil {
@@ -288,7 +294,7 @@ func (s *Service) Backup(ctx context.Context, held Held, kind Kind, id string, p
 	}
 	last := &LastRun{ID: id, Kind: kind, StartedAt: started, FinishedAt: s.opts.Now(), Status: string(result.Status)}
 	if kind == KindNightly {
-		last.NightlySlot = nightlySlot(started, s.backupTime(ctx))
+		last.NightlySlot = nightlySlot(started, s.backupTime(ctx), s.opts.Location)
 	}
 	if err != nil {
 		last.Status, last.Error = RunFailed, err.Error()
