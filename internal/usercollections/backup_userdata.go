@@ -44,18 +44,18 @@ type collectionsDocument struct {
 type personalCollection struct {
 	ID          string   `json:"id"`
 	Name        string   `json:"name"`
-	Description string   `json:"description"`
+	Description string   `json:"description" bound:"8192"`
 	Type        string   `json:"type"`
 	IsShared    bool     `json:"is_shared"`
 	SharedWith  []string `json:"shared_with"`
 	// Group is the account's shelf group the collection sits in, or nil.
 	Group                      *collectionGroup `json:"group"`
 	IncludeInServerCollections bool             `json:"include_in_server_collections"`
-	QueryDefinition            json.RawMessage  `json:"query_definition"`
-	DisplayQueryDefinition     json.RawMessage  `json:"display_query_definition"`
-	SortConfig                 json.RawMessage  `json:"sort_config"`
-	SourceURL                  string           `json:"source_url"`
-	SourceConfig               json.RawMessage  `json:"source_config"`
+	QueryDefinition            json.RawMessage  `json:"query_definition" bound:"1048576"`
+	DisplayQueryDefinition     json.RawMessage  `json:"display_query_definition" bound:"1048576"`
+	SortConfig                 json.RawMessage  `json:"sort_config" bound:"1048576"`
+	SourceURL                  string           `json:"source_url" bound:"2048"`
+	SourceConfig               json.RawMessage  `json:"source_config" bound:"1048576"`
 	SyncSchedule               *string          `json:"sync_schedule"`
 	WatchFilter                string           `json:"watch_filter"`
 	MediaFilter                string           `json:"media_filter"`

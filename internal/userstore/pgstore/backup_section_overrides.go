@@ -45,10 +45,10 @@ type sectionOverrideEntry struct {
 	Title           string      `json:"title"`
 	Featured        *bool       `json:"featured"`
 	ItemLimit       *int        `json:"item_limit"`
-	Config          string      `json:"config"`
+	Config          string      `json:"config" bound:"65536"`
 	IsUserAdded     bool        `json:"is_user_added"`
 	UserSectionType string      `json:"user_section_type"`
-	UserConfig      string      `json:"user_config"`
+	UserConfig      string      `json:"user_config" bound:"65536"`
 	UserTitle       string      `json:"user_title"`
 }
 

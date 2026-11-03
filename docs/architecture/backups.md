@@ -1154,6 +1154,20 @@ its body is read (an operation middleware on `importProfile`), so a busy
 server buffers nothing; the import parses the document once into its
 top-level members, once strictly, and runs each data type's checks once.
 
+Every imported document, and every account document of a restore set,
+passes one bounds check after it decodes (`userdata.CheckBounds`): a
+string is at most 1 KiB, a map 64 entries, a list `userdata.MaxEntries`,
+and raw JSON 64 KiB and valid, unless a field's `bound` tag sets its
+editor's limit (a collection's description 8 KiB, source URL 2 KiB, and
+rules 1 MiB; a subtitle path 4 KiB; a section override's configuration
+64 KiB). Track signatures are decoded into their types and stored as the
+playback writer encodes them. `TestEveryImportedFieldIsBounded` makes
+each field of every importer's document, and of an account document,
+too large in turn and requires the check to refuse it. A carried
+collection reference maps to the importing profile's own copy (the one
+its import created or merged into), and on the same server to an
+uncarried collection only one that profile can see.
+
 An import writes only the profile of the session, never one the document
 names, in one transaction, with the merge rules above. It refuses a document
 that carries an account or access field (at the top level or among the

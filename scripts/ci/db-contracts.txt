@@ -835,3 +835,4 @@
 ./internal/watchstate TestProgressMergeKeepsHeartbeatDB
 ./internal/watchstate TestPluginSourcedPlaysDB
 ./internal/usercollections TestCollectionImportRemapsLibrariesDB
+./internal/usercollections TestCarriedCollectionsMapToTheImportingProfileDB

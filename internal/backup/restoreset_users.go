@@ -135,7 +135,9 @@ type ProfileEntry struct {
 	AllowedLibraryIDs          []int  `json:"allowed_library_ids"`
 	MaxPlaybackQuality         string `json:"max_playback_quality"`
 	// Data holds each data type's document by data type id.
-	Data map[string]json.RawMessage `json:"data"`
+	// Data is each type's own document, which the type bounds itself
+	// (userdata.DecodeStrict).
+	Data map[string]json.RawMessage `json:"data" bound:"-"`
 	// counts is each data type's entry count, recorded when the reader
 	// validated Data, so a preview does not decode the documents again.
 	counts map[string]int
@@ -575,7 +577,12 @@ func (p *restoreSetParser) decodeUsers(spec sectionSpec) (int, error) {
 			p.unusable(SectionUsers, KindAccount, label, "Its document names another account than its file.")
 			continue
 		}
-		blobs, err := validateUserDocument(&doc)
+		// Bounds first: validation may clear what it locks.
+		err = userdata.CheckBounds(&doc)
+		var blobs []string
+		if err == nil {
+			blobs, err = validateUserDocument(&doc)
+		}
 		if err != nil {
 			p.unusable(SectionUsers, KindAccount, label, truncateText("It cannot be restored: "+err.Error(), 500))
 			continue

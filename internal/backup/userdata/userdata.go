@@ -360,7 +360,7 @@ func DecodeStrict(data []byte, into any) error {
 	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
 		return errors.New("trailing data after the document")
 	}
-	return nil
+	return CheckBounds(into)
 }
 
 // importBatchSize is how many inserts InsertEach sends in one round trip.

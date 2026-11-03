@@ -3,6 +3,9 @@ package backup
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
+	"maps"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -123,26 +126,34 @@ func TestRestoredCredentialsAreLockedOutsideTheServersCost(t *testing.T) {
 	}
 }
 
+// sampleAt is a time in the samples.
+const sampleAt = `"2026-01-01T00:00:00Z"`
+
+// importerSample is a document as head + entry + tail.
+type importerSample struct{ head, entry, tail string }
+
+// importerSamples are one valid entry of each data type's document, as
+// head + entry + tail.
+var importerSamples = map[string]importerSample{
+	userdata.WatchHistory + " progress": {`{"progress":[`, `{"item":"m1","position_seconds":1,"duration_seconds":2,"completed":false,"updated_at":` + sampleAt + `}`, `],"history":[],"hidden":[]}`},
+	userdata.WatchHistory + " plays":    {`{"progress":[],"history":[`, `{"item":"m1","watched_at":` + sampleAt + `,"completed":true,"source":"playback"}`, `],"hidden":[]}`},
+	userdata.WatchHistory + " hidden":   {`{"progress":[],"history":[],"hidden":[`, `{"item":"m1","hidden_before":` + sampleAt + `,"updated_at":` + sampleAt + `,"removed_before":` + sampleAt + `}`, `]}`},
+	userdata.Ratings:                    {`{"ratings":[`, `{"item":"m1","rating":4,"rated_at":` + sampleAt + `}`, `]}`},
+	userdata.Favorites + " favorites":   {`{"favorites":[`, `{"item":"m1","at":` + sampleAt + `}`, `],"watchlist":[],"titles":[]}`},
+	userdata.Favorites + " watchlist":   {`{"favorites":[],"watchlist":[`, `{"item":"m1","at":` + sampleAt + `}`, `],"titles":[]}`},
+	userdata.Dismissals:                 {`{"home":[],"not_interested":[`, `{"item":"m1","at":` + sampleAt + `}`, `],"dropped_series":[]}`},
+	userdata.Notifications:              {`{"muted_series":[`, `{"series":"s1","muted_at":` + sampleAt + `}`, `]}`},
+	userdata.Collections:                {`{"collections":[`, `{"id":"c1","name":"A","type":"manual","watch_filter":"all","media_filter":"all","items":[],"shared_with":[]}`, `]}`},
+	userdata.Preferences:                {`{"settings":[`, `{"key":"playback.quality","scope":"profile","value":"\"auto\""}`, `]}`},
+}
+
 // TestEveryImporterRefusesDuplicates: each data type's document holds one
 // entry per identity, as its export writes it. A document of one entry is
 // accepted; 100,000 copies of it are refused when the document is checked,
 // quickly, before any import plans or writes them, except plays, whose
 // repeats are the same play and collapse to one.
 func TestEveryImporterRefusesDuplicates(t *testing.T) {
-	const at = `"2026-01-01T00:00:00Z"`
-	type doc struct{ head, entry, tail string }
-	docs := map[string]doc{
-		userdata.WatchHistory + " progress": {`{"progress":[`, `{"item":"m1","position_seconds":1,"duration_seconds":2,"completed":false,"updated_at":` + at + `}`, `],"history":[],"hidden":[]}`},
-		userdata.WatchHistory + " plays":    {`{"progress":[],"history":[`, `{"item":"m1","watched_at":` + at + `,"completed":true,"source":"playback"}`, `],"hidden":[]}`},
-		userdata.WatchHistory + " hidden":   {`{"progress":[],"history":[],"hidden":[`, `{"item":"m1","hidden_before":` + at + `,"updated_at":` + at + `,"removed_before":` + at + `}`, `]}`},
-		userdata.Ratings:                    {`{"ratings":[`, `{"item":"m1","rating":4,"rated_at":` + at + `}`, `]}`},
-		userdata.Favorites + " favorites":   {`{"favorites":[`, `{"item":"m1","at":` + at + `}`, `],"watchlist":[],"titles":[]}`},
-		userdata.Favorites + " watchlist":   {`{"favorites":[],"watchlist":[`, `{"item":"m1","at":` + at + `}`, `],"titles":[]}`},
-		userdata.Dismissals:                 {`{"home":[],"not_interested":[`, `{"item":"m1","at":` + at + `}`, `],"dropped_series":[]}`},
-		userdata.Notifications:              {`{"muted_series":[`, `{"series":"s1","muted_at":` + at + `}`, `]}`},
-		userdata.Collections:                {`{"collections":[`, `{"id":"c1","name":"A","type":"manual","watch_filter":"all","media_filter":"all","items":[],"shared_with":[]}`, `]}`},
-		userdata.Preferences:                {`{"settings":[`, `{"key":"playback.quality","scope":"profile","value":"\"auto\""}`, `]}`},
-	}
+	docs := importerSamples
 	for name, d := range docs {
 		t.Run(name, func(t *testing.T) {
 			id, part, _ := strings.Cut(name, " ")
@@ -168,5 +179,86 @@ func TestEveryImporterRefusesDuplicates(t *testing.T) {
 				t.Fatal("100,000 copies of one entry were accepted")
 			}
 		})
+	}
+}
+
+// jsonMutations lists, for a JSON document, copies of it with one field
+// made too large: each string replaced by 2 MiB, each object given 100
+// more members, each array of strings given 500,001.
+func jsonMutations(t *testing.T, doc []byte) map[string][]byte {
+	t.Helper()
+	var root any
+	if err := json.Unmarshal(doc, &root); err != nil {
+		t.Fatal(err)
+	}
+	out := map[string][]byte{}
+	var walk func(v any, path string, set func(any))
+	walk = func(v any, path string, set func(any)) {
+		emit := func(what string, replacement any) {
+			set(replacement)
+			data, err := json.Marshal(root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			out[path+" "+what] = data
+			set(v)
+		}
+		switch x := v.(type) {
+		case string:
+			emit("too long", strings.Repeat("x", 2<<20))
+		case map[string]any:
+			bigger := maps.Clone(x)
+			for i := range 100 {
+				bigger[fmt.Sprintf("zz%d", i)] = "v"
+			}
+			emit("too many members", bigger)
+			for k, child := range x {
+				walk(child, path+"."+k, func(r any) { x[k] = r })
+			}
+		case []any:
+			if len(x) > 0 {
+				if s, ok := x[0].(string); ok {
+					emit("too many elements", slices.Repeat([]any{s}, 500_001))
+				}
+			}
+			for i, child := range x {
+				walk(child, fmt.Sprintf("%s[%d]", path, i), func(r any) { x[i] = r })
+			}
+		}
+	}
+	walk(root, "$", func(r any) { root = r })
+	return out
+}
+
+// TestEveryImportedFieldIsBounded: in every importer's document and in a
+// restore set's account document, each field made too large on its own (a
+// 2 MiB string, 100 more members, 500,001 elements) is refused, so a field
+// added without a bound fails here.
+func TestEveryImportedFieldIsBounded(t *testing.T) {
+	for name, d := range importerSamples {
+		id, _, _ := strings.Cut(name, " ")
+		dt, ok := userDataType(id)
+		if !ok {
+			t.Fatalf("no data type %s", id)
+		}
+		for what, doc := range jsonMutations(t, []byte(d.head+d.entry+d.tail)) {
+			if _, err := dt.Validate(doc); err == nil {
+				t.Errorf("%s %s was accepted", name, what)
+			}
+		}
+	}
+	user := mustJSON(testUserDocument(5, "upload:profile-avatars/5/p1/original.webp"))
+	for what, doc := range jsonMutations(t, user) {
+		var parsed UserDocument
+		err := decodeStrict(doc, &parsed)
+		if err == nil {
+			err = userdata.CheckBounds(&parsed)
+		}
+		if err == nil {
+			_, err = validateUserDocument(&parsed)
+		}
+		if err == nil {
+			t.Errorf("account document %s was accepted", what)
+		}
 	}
 }

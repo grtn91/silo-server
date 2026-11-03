@@ -90,7 +90,7 @@ type subtitlePreference struct {
 	Series              string          `json:"series"`
 	Language            string          `json:"language"`
 	TrackIndex          int             `json:"track_index"`
-	ExternalPath        string          `json:"external_path"`
+	ExternalPath        string          `json:"external_path" bound:"4096"`
 	Mode                string          `json:"mode"`
 	ShowForcedSubtitles *bool           `json:"show_forced_subtitles"`
 	Signature           json.RawMessage `json:"signature"`
@@ -420,21 +420,31 @@ func (doc preferencesDocument) validateTracks(sum *userdata.Summary) error {
 		}
 	}
 	audio, subtitles, libraries, seriesPlayback, sorts := once("audio"), once("subtitle"), once("library playback"), once("series playback"), once("collection sort")
-	for _, a := range doc.Audio {
+	for i := range doc.Audio {
+		a := &doc.Audio[i]
 		if err := errors.Join(series(a.Series), audio(a.Series)); err != nil {
 			return err
 		}
-		if len(a.Signature) > 0 && !json.Valid(a.Signature) {
-			return errors.New("an audio preference carries invalid JSON")
+		// A signature is stored as the playback writer stores one: decoded
+		// into its type and encoded again, never as the backup's bytes.
+		var sig userstore.AudioTrackSignature
+		canonical, err := canonicalSignature(a.Signature, &sig, func() ([]byte, error) { return userstore.MarshalAudioTrackSignature(&sig) })
+		if err != nil {
+			return errors.New("an audio preference carries an invalid track signature")
 		}
+		a.Signature = canonical
 	}
-	for _, s := range doc.Subtitles {
+	for i := range doc.Subtitles {
+		s := &doc.Subtitles[i]
 		if err := errors.Join(series(s.Series), subtitles(s.Series)); err != nil {
 			return err
 		}
-		if (len(s.Signature) > 0 && !json.Valid(s.Signature)) || !userdata.ValidText(s.ExternalPath, 4096) {
+		var sig userstore.SubtitleTrackSignature
+		canonical, err := canonicalSignature(s.Signature, &sig, func() ([]byte, error) { return userstore.MarshalSubtitleTrackSignature(&sig) })
+		if err != nil || !userdata.ValidText(s.ExternalPath, 4096) {
 			return errors.New("a subtitle preference is not valid")
 		}
+		s.Signature = canonical
 	}
 	for _, l := range doc.LibraryPlayback {
 		if l.Library <= 0 {
@@ -927,4 +937,17 @@ func importCollectionSorts(ctx context.Context, tx pgx.Tx, target userdata.Targe
 		}
 	}
 	return nil
+}
+
+// canonicalSignature decodes a track signature into its type (into),
+// bounded like every imported field, and returns encode's form of it; an
+// empty one stays empty.
+func canonicalSignature(raw json.RawMessage, into any, encode func() ([]byte, error)) (json.RawMessage, error) {
+	if len(raw) == 0 {
+		return raw, nil
+	}
+	if err := userdata.DecodeStrict(raw, into); err != nil {
+		return nil, err
+	}
+	return encode()
 }
