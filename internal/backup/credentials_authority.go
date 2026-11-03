@@ -8,10 +8,12 @@ import (
 	"slices"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/Silo-Server/silo-server/internal/access"
 	"github.com/Silo-Server/silo-server/internal/auth"
 	"github.com/Silo-Server/silo-server/internal/models"
+	"github.com/Silo-Server/silo-server/internal/requests"
 )
 
 // accountAuthority is what an account may do: its rank (the Owner over
@@ -22,7 +24,10 @@ type accountAuthority struct {
 	enabled    bool
 	breakGlass bool
 	policy     access.EffectiveUserPolicy
-	profiles   map[string]profileLimits
+	// requests is its request policy (requests.LayeredPolicy): whether and
+	// how often it may request titles, and whether they auto-approve.
+	requests requests.EffectivePolicy
+	profiles map[string]profileLimits
 }
 
 // profileLimits are a profile's restrictions: a child profile, its rating
@@ -56,6 +61,9 @@ func readAuthority(ctx context.Context, tx pgx.Tx, ids []int) (map[int]accountAu
 		}
 		a := accountAuthority{rank: roleRank(user), enabled: user.Enabled, breakGlass: user.BreakGlass,
 			policy: access.ApplyGroupPolicy(user, group)}
+		if a.requests, err = requestPolicy(ctx, tx, user, a.policy.RequestsAllowed); err != nil {
+			return nil, fmt.Errorf("reading account %d's request policy: %w", id, err)
+		}
 		if a.profiles, err = readProfileLimits(ctx, tx, id); err != nil {
 			return nil, err
 		}
@@ -103,7 +111,7 @@ func readProfileLimits(ctx context.Context, tx pgx.Tx, userID int) (map[string]p
 // the account restores it whatever its credentials.
 func (restored accountAuthority) widerThan(live accountAuthority) bool {
 	if restored.rank > live.rank || restored.enabled && !live.enabled || restored.breakGlass && !live.breakGlass ||
-		len(access.WiderThan(restored.policy, live.policy)) > 0 {
+		len(access.WiderThan(restored.policy, live.policy)) > 0 || requestsWider(restored.requests, live.requests) {
 		return true
 	}
 	for id, r := range restored.profiles {
@@ -206,39 +214,63 @@ func grantOf(table string, row map[string]any) (inviteeGrant, bool) {
 	return inviteeGrant{}, false
 }
 
-// inviteePolicy is the effective policy an account created now from g
-// would get in tx's database, as account creation resolves it.
-func inviteePolicy(ctx context.Context, tx pgx.Tx, g inviteeGrant) (access.EffectiveUserPolicy, error) {
+// grantPolicy is what an account created from a grant would get: its
+// effective access policy and its request policy.
+type grantPolicy struct {
+	access   access.EffectiveUserPolicy
+	requests requests.EffectivePolicy
+}
+
+// widerThan reports whether the policy grants anything live does not.
+func (p grantPolicy) widerThan(live grantPolicy) bool {
+	return len(access.WiderThan(p.access, live.access)) > 0 || requestsWider(p.requests, live.requests)
+}
+
+// inviteePolicy is the policy an account created now from g would get in
+// tx's database, as account creation resolves it, its request policy
+// included.
+func inviteePolicy(ctx context.Context, tx pgx.Tx, g inviteeGrant) (grantPolicy, error) {
+	user, policy, err := inviteeAccess(ctx, tx, g)
+	if err != nil {
+		return grantPolicy{}, err
+	}
+	reqs, err := requestPolicy(ctx, tx, user, policy.RequestsAllowed)
+	return grantPolicy{access: policy, requests: reqs}, err
+}
+
+// inviteeAccess is the account an account created now from g would be,
+// and its effective access policy.
+func inviteeAccess(ctx context.Context, tx pgx.Tx, g inviteeGrant) (*models.User, access.EffectiveUserPolicy, error) {
 	// The permissions account creation stores (auth.NewUserPermissions), so
 	// a group's allowed permissions mask the same list here as there.
 	permissions, err := auth.NewUserPermissions(models.CreateUserInput{Role: g.role, LibraryIDs: g.libraryIDs, AccessGroupID: g.groupID})
 	if err != nil {
-		return access.EffectiveUserPolicy{}, err
+		return nil, access.EffectiveUserPolicy{}, err
 	}
 	user := &models.User{Role: g.role, LibraryIDs: g.libraryIDs, AccessGroupID: g.groupID, Permissions: permissions}
 	if user.AccessGroupID == nil && g.role != models.RoleAdmin {
 		var id int64
 		err := tx.QueryRow(ctx, `SELECT id FROM access_groups WHERE is_default`).Scan(&id)
 		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-			return access.EffectiveUserPolicy{}, fmt.Errorf("reading the default access group: %w", err)
+			return nil, access.EffectiveUserPolicy{}, fmt.Errorf("reading the default access group: %w", err)
 		}
 		if err == nil {
 			user.AccessGroupID = &id
 		}
 	}
 	if !access.GroupApplies(user) {
-		return access.ApplyGroupPolicy(user, nil), nil
+		return user, access.ApplyGroupPolicy(user, nil), nil
 	}
 	group, err := access.ReadGroupInTransaction(ctx, tx, *user.AccessGroupID)
 	if errors.Is(err, access.ErrGroupNotFound) {
 		// The carry drops an invitation whose group is gone.
-		return access.ApplyGroupPolicy(user, nil), nil
+		return user, access.ApplyGroupPolicy(user, nil), nil
 	}
 	if err != nil {
-		return access.EffectiveUserPolicy{}, fmt.Errorf("reading access group %d: %w", *user.AccessGroupID, err)
+		return nil, access.EffectiveUserPolicy{}, fmt.Errorf("reading access group %d: %w", *user.AccessGroupID, err)
 	}
 	policy := group.Policy()
-	return access.ApplyGroupPolicy(user, &policy), nil
+	return user, access.ApplyGroupPolicy(user, &policy), nil
 }
 
 // grantKey names a carried row that grants an account: its table and id.
@@ -249,8 +281,8 @@ type grantKey struct {
 
 // inviteePolicies reads, in tx's database, the policy each carried row
 // that grants an account would give it.
-func inviteePolicies(ctx context.Context, tx pgx.Tx, tables []secretTable, live []string) (map[grantKey]access.EffectiveUserPolicy, error) {
-	out := map[grantKey]access.EffectiveUserPolicy{}
+func inviteePolicies(ctx context.Context, tx pgx.Tx, tables []secretTable, live []string) (map[grantKey]grantPolicy, error) {
+	out := map[grantKey]grantPolicy{}
 	for i, t := range tables {
 		var rows []map[string]any
 		if err := json.Unmarshal([]byte(live[i]), &rows); err != nil {
@@ -270,4 +302,73 @@ func inviteePolicies(ctx context.Context, tx pgx.Tx, tables []secretTable, live 
 		}
 	}
 	return out, nil
+}
+
+// requestPolicy reads, in tx's database, the request policy of user, whose
+// requests switch is allowed: the server's request settings, its access
+// group's limits, and its own (requests.LayeredPolicy). A table an older
+// backup does not have counts as unset.
+func requestPolicy(ctx context.Context, tx pgx.Tx, user *models.User, allowed bool) (requests.EffectivePolicy, error) {
+	settings := requests.Settings{GlobalMaxRequests: 5, GlobalWindowDays: 7}
+	err := optionalRow(ctx, tx, `SELECT requests_enabled, global_max_requests, global_window_days, global_auto_approval_enabled
+		FROM request_settings WHERE id = true`, nil, &settings.RequestsEnabled, &settings.GlobalMaxRequests, &settings.GlobalWindowDays, &settings.GlobalAutoApprovalEnabled)
+	if err != nil {
+		return requests.EffectivePolicy{}, err
+	}
+	var own *requests.UserLimit
+	var limit requests.UserLimit
+	if err := optionalRow(ctx, tx, `SELECT limit_mode, max_requests, window_days, approval_mode FROM request_user_limits WHERE user_id = $1`,
+		[]any{user.ID}, &limit.LimitMode, &limit.MaxRequests, &limit.WindowDays, &limit.ApprovalMode); err != nil {
+		return requests.EffectivePolicy{}, err
+	}
+	if limit.LimitMode != "" || limit.ApprovalMode != "" {
+		own = &limit
+	}
+	var group *requests.GroupLimit
+	if access.GroupApplies(user) {
+		var g requests.GroupLimit
+		if err := optionalRow(ctx, tx, `SELECT limit_mode, max_requests, window_days, approval_mode FROM request_group_limits WHERE group_id = $1`,
+			[]any{*user.AccessGroupID}, &g.LimitMode, &g.MaxRequests, &g.WindowDays, &g.ApprovalMode); err != nil {
+			return requests.EffectivePolicy{}, err
+		}
+		if g.LimitMode != "" || g.ApprovalMode != "" {
+			group = &g
+		}
+	}
+	return requests.LayeredPolicy(settings, allowed, group, own), nil
+}
+
+// optionalRow scans one row of sql into dest in a savepoint: no row, or a
+// table or column the database does not have, leaves dest as it is.
+func optionalRow(ctx context.Context, tx pgx.Tx, sql string, args []any, dest ...any) error {
+	err := pgx.BeginFunc(ctx, tx, func(sp pgx.Tx) error {
+		return sp.QueryRow(ctx, sql, args...).Scan(dest...)
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	}
+	if pgErr, ok := errors.AsType[*pgconn.PgError](err); ok && (pgErr.Code == "42P01" || pgErr.Code == "42703") {
+		return nil
+	}
+	return err
+}
+
+// requestsWider reports whether a restored request policy lets the account
+// request more than live does: at all, without limit, more titles or over
+// a shorter window, or with automatic approval.
+func requestsWider(restored, live requests.EffectivePolicy) bool {
+	canRequest := func(p requests.EffectivePolicy) bool { return p.RequestsEnabled && !p.Blocked }
+	switch {
+	case canRequest(restored) && !canRequest(live):
+		return true
+	case !canRequest(restored):
+		return false
+	case restored.AutoApprove && !live.AutoApprove:
+		return true
+	case live.Unlimited:
+		return false
+	case restored.Unlimited:
+		return true
+	}
+	return restored.MaxRequests > live.MaxRequests || restored.WindowDays < live.WindowDays
 }
