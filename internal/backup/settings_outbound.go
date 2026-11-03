@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/Silo-Server/silo-server/internal/ai/chatgpt"
+	"github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/config"
 	"github.com/Silo-Server/silo-server/internal/mail"
 )
@@ -17,10 +18,11 @@ import (
 // settingOff is a switch setting turned off.
 const settingOff = "false"
 
-// The Simkl application's settings.
+// The Simkl application's settings, and the push relay's key.
 const (
-	settingSimklID     = "watchsync.simkl.client_id"
-	settingSimklSecret = "watchsync.simkl.client_secret"
+	settingPushRelayKey = "notifications.push_relay_api_key"
+	settingSimklID      = "watchsync.simkl.client_id"
+	settingSimklSecret  = "watchsync.simkl.client_secret"
 )
 
 // outboundBundle is a set of settings that together say where this server
@@ -52,11 +54,11 @@ var outboundBundles = func() []outboundBundle {
 	}
 	whole := func(keys ...string) outboundBundle { return outboundBundle{name: keys[0], keys: keys, secrets: keys} }
 	out = append(out,
-		outboundBundle{name: "the push relay", keys: []string{"notifications.push_relay_url", "notifications.push_relay_api_key", "notifications.push_relay_deployment_id",
+		outboundBundle{name: "the push relay", keys: []string{"notifications.push_relay_url", settingPushRelayKey, "notifications.push_relay_deployment_id",
 			"notifications.push_relay_key_prefix", "notifications.push_relay_expires_at", "notifications.push_relay_reregistration_required"},
-			secrets: []string{"notifications.push_relay_api_key"}},
-		outboundBundle{name: "the search engine", keys: []string{"catalog.search.meilisearch.url", "catalog.search.meilisearch.api_key"},
-			secrets: []string{"catalog.search.meilisearch.api_key"}},
+			secrets: []string{settingPushRelayKey}},
+		outboundBundle{name: "the search engine", keys: []string{catalog.SearchSettingMeilisearchURL, catalog.SearchSettingMeilisearchAPIKey},
+			secrets: []string{catalog.SearchSettingMeilisearchAPIKey}},
 		outboundBundle{name: "the Discord application", keys: []string{"discord.client_id", "discord.client_secret", "discord.bot_token"},
 			secrets: []string{"discord.client_secret", "discord.bot_token"}},
 		whole("tmdb.api_key"), whole("mdblist.api_key"), whole("introdb.api_key"),
