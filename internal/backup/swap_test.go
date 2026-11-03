@@ -510,7 +510,7 @@ func (f *swapFixture) restore() (err error, crashed bool) {
 		returned = true
 		done <- e
 	}()
-	err = <-done
+	err = await(f.t, done, "the restore to return or stop")
 	return err, !returned
 }
 
@@ -524,7 +524,7 @@ func (f *swapFixture) recover() (err error, crashed bool) {
 		returned = true
 		done <- e
 	}()
-	err = <-done
+	err = await(f.t, done, "the recovery to return or stop")
 	return err, !returned
 }
 
