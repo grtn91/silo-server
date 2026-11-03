@@ -1199,8 +1199,15 @@ neither list.
   installation, plugin task binding, and plugin catalog (off wins): plugins run as the server, so one
   turned off during an incident stays off, and a sign-in provider's carried
   links then sign no one in. A plugin installation or catalog the backup
-  has and the live server no longer does comes back off, never on. Nothing
-  a full restore does turns a plugin on; the admin does. A row is the live
+  has and the live server no longer does comes back off, never on, and so
+  does a library deleted since the backup (disabled, for an admin to turn
+  on deliberately: an account with every library would otherwise see it at
+  once) and a personal collection deleted since (unshared). Nothing
+  a full restore does turns a plugin on; the admin does. These switches are
+  set before the credential carry compares authority, so it compares the
+  restored server as it will start; the carry also counts an account with
+  every library as seeing each enabled library of its server, and drops a
+  credential whose account would see a library it cannot see now. A row is the live
   one when its id and username (an account), plugin id, catalog URL, or
   installation and capability (a task binding) match. The command
   lists each switch it kept. Grants through policy rather than a switch
