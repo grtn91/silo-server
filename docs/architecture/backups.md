@@ -696,7 +696,11 @@ share that page, type, and title, since the title then identifies neither.
 So two such sections restore as two, and a re-run finds each by its id. A matched section that differs lists what a restore replaces
 (title, position, featured, item limit, enabled, configuration, and missing
 items of its managed collection), and a restore replaces its configuration
-as an admin save would. A missing one is created, with its backup id when
+as an admin save would. Only a collection the section manages stands for the
+carried one: a managed section pointed at an ordinary collection since the
+backup lists "collection replaced", whatever that collection holds, and the
+restore points it back at its managed collection (the one still here with
+its management key, or a new one). A missing one is created, with its backup id when
 no section here has it. The
 section editor's checks (`SectionHandler.CheckRestoredSection`: type,
 scope, configuration, recipe) run first, the write locks the collections it
