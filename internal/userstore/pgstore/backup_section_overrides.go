@@ -26,7 +26,10 @@ import (
 
 // scopeLibrary is a library page's section scope and a library's
 // collection-sort kind.
-const scopeLibrary = "library"
+const (
+	scopeLibrary = "library"
+	scopeHome    = "home"
+)
 
 type sectionOverrideEntry struct {
 	Scope string `json:"scope"`
@@ -95,9 +98,32 @@ func exportSectionOverrides(ctx context.Context, tx pgx.Tx, owner userdata.Owner
 	return out, nil
 }
 
+// Bounds on imported section overrides. The editor saves one page's
+// overrides per request, under the API's request body cap, so a page's
+// stored value is never larger; a page has a few dozen sections.
+const (
+	maxOverridesPerPage   = 200
+	maxOverrides          = 5000
+	maxPageOverridesBytes = 1 << 20
+	// maxOverrideItemLimit is maxOverrideItemLimit, the most rows the
+	// editor lets a section show; pgstore cannot import sections, whose
+	// tests import this package.
+	maxOverrideItemLimit = 500
+)
+
 func validateSectionOverrides(entries []sectionOverrideEntry) error {
+	if len(entries) > maxOverrides {
+		return fmt.Errorf("more than %d section overrides", maxOverrides)
+	}
+	perPage := map[sectionPage]int{}
 	for _, e := range entries {
-		if (e.Scope != "home" || e.Library != 0) && (e.Scope != scopeLibrary || e.Library <= 0) {
+		if perPage[sectionPage{e.Scope, e.Library}]++; perPage[sectionPage{e.Scope, e.Library}] > maxOverridesPerPage {
+			return fmt.Errorf("more than %d section overrides on one page", maxOverridesPerPage)
+		}
+		if e.ItemLimit != nil && (*e.ItemLimit < 0 || *e.ItemLimit > maxOverrideItemLimit) {
+			return fmt.Errorf("a section override's item limit is not between 0 and %d", maxOverrideItemLimit)
+		}
+		if (e.Scope != scopeHome || e.Library != 0) && (e.Scope != scopeLibrary || e.Library <= 0) {
 			return errors.New("a section override names no valid page")
 		}
 		for _, s := range []string{e.SectionType, e.Title, e.UserSectionType, e.UserTitle} {
@@ -423,6 +449,11 @@ func replacePageOverrides(ctx context.Context, tx pgx.Tx, target userdata.Target
 		next[i].ID, next[i].CreatedAt, next[i].UpdatedAt = generateUUID(), now, now
 	}
 	data, _ := json.Marshal(append(others, next...)) // plain structs
+	if len(data) > maxPageOverridesBytes {
+		res.LeftOut++
+		res.Notes = append(res.Notes, "The section layout of one page was left out: it is larger than the layout editor saves.")
+		return nil
+	}
 	if _, err := tx.Exec(ctx, `INSERT INTO user_settings (user_id, key, value) VALUES ($1, $2, $3)
 		ON CONFLICT (user_id, key) DO UPDATE SET value = excluded.value`, target.UserID, page.key(), string(data)); err != nil {
 		return fmt.Errorf("writing section overrides %s: %w", page.key(), err)
