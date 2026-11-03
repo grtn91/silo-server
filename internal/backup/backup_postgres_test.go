@@ -1093,6 +1093,29 @@ func checkCarryAuthority(t *testing.T, loader PGLoader, pool *pgxpool.Pool, dsn,
 	if slices.Contains(carried.Dropped, demoted) || carried.Kept["api_keys"] != liveKeys-1 {
 		t.Fatalf("carried %+v, want the key of an account with the same policy kept", carried)
 	}
+	// Blocked from requesting here, and unlimited with automatic approval
+	// in the backup: its key could request titles that approve
+	// themselves, so it is dropped.
+	exec := func(db *pgxpool.Pool, sql string, args ...any) {
+		t.Helper()
+		if _, err := db.Exec(ctx, sql, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	exec(pool, `INSERT INTO request_user_limits (user_id, limit_mode, approval_mode) VALUES ($1, 'blocked', 'inherit')
+		ON CONFLICT (user_id) DO UPDATE SET limit_mode = 'blocked', approval_mode = 'inherit'`, userID)
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), `DELETE FROM request_user_limits WHERE user_id = $1`, userID)
+	})
+	exec(restored, `INSERT INTO request_settings (id, requests_enabled) VALUES (true, true) ON CONFLICT (id) DO UPDATE SET requests_enabled = true`)
+	exec(restored, `INSERT INTO request_user_limits (user_id, limit_mode, approval_mode) VALUES ($1, 'unlimited', 'auto')
+		ON CONFLICT (user_id) DO UPDATE SET limit_mode = 'unlimited', approval_mode = 'auto'`, userID)
+	if carried, err = loader.CarryCredentials(ctx, into, dsn); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(carried.Dropped, demoted) {
+		t.Fatalf("carried %+v, want the key of an account the backup lets request more dropped", carried)
+	}
 }
 
 // checkAnotherKey: a backup taken with another SECRET_KEY restores only

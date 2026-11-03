@@ -576,7 +576,7 @@ func writeBlobsFromTar(ctx context.Context, path string, stores blobStores, befo
 		return 0, err
 	}
 	defer func() { _ = f.Close() }()
-	tr := tar.NewReader(f)
+	tr := tar.NewReader(newTarGuard(f))
 	count := 0
 	for {
 		if err := ctx.Err(); err != nil {

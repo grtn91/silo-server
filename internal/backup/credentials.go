@@ -9,8 +9,6 @@ import (
 	"strings"
 
 	"github.com/jackc/pgx/v5"
-
-	"github.com/Silo-Server/silo-server/internal/access"
 )
 
 // secretHandling is what a backup and a restore do with a table holding a
@@ -520,7 +518,7 @@ func carriedOwners(ctx context.Context, tx pgx.Tx, live map[int]accountAuthority
 
 // carriedGrants writes carried_grants, the carried rows that grant an
 // account no wider a policy under the restored data than live.
-func carriedGrants(ctx context.Context, tx pgx.Tx, tables []secretTable, live []string, livePolicies map[grantKey]access.EffectiveUserPolicy) error {
+func carriedGrants(ctx context.Context, tx pgx.Tx, tables []secretTable, live []string, livePolicies map[grantKey]grantPolicy) error {
 	restored, err := inviteePolicies(ctx, tx, tables, live)
 	if err != nil {
 		return err
@@ -528,7 +526,7 @@ func carriedGrants(ctx context.Context, tx pgx.Tx, tables []secretTable, live []
 	var names []string
 	var ids []int64
 	for key, policy := range restored {
-		if l, ok := livePolicies[key]; ok && len(access.WiderThan(policy, l)) == 0 {
+		if l, ok := livePolicies[key]; ok && !policy.widerThan(l) {
 			names, ids = append(names, key.table), append(ids, key.id)
 		}
 	}
@@ -542,7 +540,7 @@ func carriedGrants(ctx context.Context, tx pgx.Tx, tables []secretTable, live []
 // grants an account would give it.
 type liveCredentials struct {
 	authority map[int]accountAuthority
-	grants    map[grantKey]access.EffectiveUserPolicy
+	grants    map[grantKey]grantPolicy
 	// stricter is each stricterFlags entry's live rows.
 	stricter []liveFlags
 	// scrubbed is each secretScrubbed table's live rows, as JSON.

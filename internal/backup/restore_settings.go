@@ -39,7 +39,7 @@ type SettingsPage struct {
 var settingsPages = []SettingsPage{
 	{"general", "General"}, {pageAppearance, "Appearance"}, {"storage", "Storage"}, {"logging", "Logging"},
 	{pageSignIn, "Sign-in"}, {"security", "Security"}, {pageLibrary, "Library & Metadata"}, {"search", "Search"},
-	{"playback", "Playback"}, {"downloads", "Downloads"}, {"requests", "Requests"}, {"providers", "Providers"},
+	{"playback", "Playback"}, {"downloads", "Downloads"}, {pageRequests, "Requests"}, {"providers", "Providers"},
 	{"ai", "AI Services"}, {pageEmail, "Email"}, {"notifications", "Notifications"}, {"compatibility", "Compatibility"},
 	{"recommendations", "Recommendations"}, {"nodes", "Nodes"}, {pageBackups, "Backups"}, {pageOther, "Other settings"},
 }
@@ -61,6 +61,7 @@ const (
 	pageLibrary    = "library"
 	pageSignIn     = "sign-in"
 	pageEmail      = "email"
+	pageRequests   = "requests"
 )
 
 // settingRateLimitOn is the switch that throttles sign-in.
@@ -160,7 +161,7 @@ var settingRulesByPage = []struct {
 		"download.artifact_dir": SettingServerSpecific,
 		"download.":             SettingPortable,
 	}},
-	{"requests", map[string]SettingClass{
+	{pageRequests, map[string]SettingClass{
 		"requests.": SettingExternalService,
 	}},
 	{"providers", map[string]SettingClass{

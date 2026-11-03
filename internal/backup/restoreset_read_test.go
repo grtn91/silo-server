@@ -1075,3 +1075,32 @@ func TestOmittedAccountsStayReadable(t *testing.T) {
 		})
 	}
 }
+
+// TestReadRestoreSetRefusesExpandingHeaders: a restore set whose first
+// header is an old-GNU sparse entry with 50,000 extension blocks is
+// refused at that header, without expanding them.
+func TestReadRestoreSetRefusesExpandingHeaders(t *testing.T) {
+	var b bytes.Buffer
+	tw := tar.NewWriter(&b)
+	_ = tw.WriteHeader(&tar.Header{Name: restoreSetIndexName, Mode: 0o644, Size: 0, Typeflag: tar.TypeReg})
+	raw := b.Bytes()[:512]
+	raw[156] = 'S'
+	copy(raw[148:156], "        ")
+	sum := 0
+	for _, c := range raw {
+		sum += int(c)
+	}
+	copy(raw[148:156], fmt.Sprintf("%06o\x00 ", sum))
+	archive := append(slices.Clone(raw), bytes.Repeat(append(make([]byte, 511), 1), 50_000)...)
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	_, err := ReadRestoreSet(context.Background(), bytes.NewReader(archive), ReadOptions{})
+	runtime.ReadMemStats(&after)
+	if !errors.Is(err, errTarShape) {
+		t.Fatalf("a sparse header: %v, want errTarShape", err)
+	}
+	if allocated := after.TotalAlloc - before.TotalAlloc; allocated > 4<<20 {
+		t.Fatalf("refusing allocated %d bytes", allocated)
+	}
+}
