@@ -162,7 +162,7 @@ type ReadOptions struct {
 func ReadRestoreSet(ctx context.Context, r io.Reader, opts ReadOptions) (_ *RestoreSet, err error) {
 	digest := sha256.New()
 	counted := &countingReader{r: io.TeeReader(r, digest)}
-	tr := tar.NewReader(counted)
+	tr := tar.NewReader(newTarGuard(counted))
 	rs := &RestoreSet{blobs: map[string]string{}, blobSizes: map[string]int64{}}
 	if opts.ExtractDir != "" {
 		if rs.dir, err = os.MkdirTemp(opts.ExtractDir, "restore-set-"); err != nil {
