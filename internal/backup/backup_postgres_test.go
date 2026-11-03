@@ -599,8 +599,8 @@ func checkStricterSettings(t *testing.T, loader PGLoader, pool *pgxpool.Pool, ds
 // checkStricterFlags: an account an admin disabled since the backup stays
 // disabled after a full restore, with its required password change; every
 // plugin turned off since stays off, a sign-in provider included; a plugin
-// removed since comes back off; each is reported. A plugin on here and in
-// the backup stays on.
+// removed since comes back off, and so does a library deleted since; each
+// is reported. A plugin on here and in the backup stays on.
 func checkStricterFlags(t *testing.T, loader PGLoader, pool *pgxpool.Pool, dsn, into string, restored *pgxpool.Pool, userID int64) {
 	t.Helper()
 	ctx := t.Context()
@@ -646,9 +646,18 @@ func checkStricterFlags(t *testing.T, loader PGLoader, pool *pgxpool.Pool, dsn, 
 	if _, err := restored.Exec(ctx, `INSERT INTO autoscan_settings (id, enabled) VALUES (true, true) ON CONFLICT (id) DO UPDATE SET enabled = true`); err != nil {
 		t.Fatal(err)
 	}
+	// A library deleted here since the backup: it comes back disabled.
+	var library int64
+	if err := restored.QueryRow(ctx, `INSERT INTO media_folders (name, type, enabled) VALUES ('Removed since', 'movies', true) RETURNING id`).Scan(&library); err != nil {
+		t.Fatal(err)
+	}
 	carried, err := loader.CarryCredentials(ctx, into, dsn)
 	if err != nil {
 		t.Fatal(err)
+	}
+	var libraryOn bool
+	if err := restored.QueryRow(ctx, `SELECT enabled FROM media_folders WHERE id = $1`, library).Scan(&libraryOn); err != nil || libraryOn {
+		t.Fatalf("restored library removed since on %v (%v), want it disabled", libraryOn, err)
 	}
 	var autoscanOn bool
 	if err := restored.QueryRow(ctx, `SELECT enabled FROM autoscan_settings`).Scan(&autoscanOn); err != nil || autoscanOn {
@@ -666,7 +675,8 @@ func checkStricterFlags(t *testing.T, loader PGLoader, pool *pgxpool.Pool, dsn, 
 			enabled, mustChange, providerOn, otherOn, removedOn, runningOn)
 	}
 	for _, want := range []string{"account " + username + " kept disabled", "account " + username + " still must change its password",
-		"plugin sso-provider kept off", "plugin other-plugin kept off", "plugin removed-plugin restored off: removed after the backup"} {
+		"plugin sso-provider kept off", "plugin other-plugin kept off", "plugin removed-plugin restored off: removed after the backup",
+		"library Removed since restored disabled: removed after the backup"} {
 		if !slices.Contains(carried.Stricter, want) {
 			t.Fatalf("reported %v, want %q", carried.Stricter, want)
 		}
@@ -943,15 +953,18 @@ func checkCarryAutoProvision(t *testing.T, loader PGLoader, pool *pgxpool.Pool, 
 	if err := pool.QueryRow(ctx, `INSERT INTO plugin_auth_bindings (plugin_installation_id, capability_id, auto_provision) VALUES ($1, 'oidc', true) RETURNING id`, installation).Scan(&binding); err != nil {
 		t.Fatal(err)
 	}
-	var allowed bool
-	if err := pool.QueryRow(ctx, `SELECT download_allowed FROM access_groups WHERE is_default`).Scan(&allowed); err != nil {
+	// The default group's stream cap: unlimited (0) in the backup, one
+	// here. A cap is no on/off switch, so the restore does not keep the
+	// live one, and the restored group is wider.
+	var streams int
+	if err := pool.QueryRow(ctx, `SELECT max_streams FROM access_groups WHERE is_default`).Scan(&streams); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		_, _ = pool.Exec(context.Background(), `UPDATE access_groups SET download_allowed = $1 WHERE is_default`, allowed)
+		_, _ = pool.Exec(context.Background(), `UPDATE access_groups SET max_streams = $1 WHERE is_default`, streams)
 	})
-	for db, allow := range map[*pgxpool.Pool]bool{pool: false, restored: true} {
-		if _, err := db.Exec(ctx, `UPDATE access_groups SET download_allowed = $1 WHERE is_default`, allow); err != nil {
+	for db, limit := range map[*pgxpool.Pool]int{pool: 1, restored: 0} {
+		if _, err := db.Exec(ctx, `UPDATE access_groups SET max_streams = $1 WHERE is_default`, limit); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -970,7 +983,7 @@ func checkCarryAutoProvision(t *testing.T, loader PGLoader, pool *pgxpool.Pool, 
 	if err != nil || !limited(carried) || provisions() {
 		t.Fatalf("carried %+v (%v), provisions %v; want the provider kept with account creation off", carried, err, provisions())
 	}
-	if _, err := restored.Exec(ctx, `UPDATE access_groups SET download_allowed = false WHERE is_default`); err != nil {
+	if _, err := restored.Exec(ctx, `UPDATE access_groups SET max_streams = 1 WHERE is_default`); err != nil {
 		t.Fatal(err)
 	}
 	if carried, err = loader.CarryCredentials(ctx, into, dsn); err != nil || limited(carried) || !provisions() {
@@ -980,22 +993,22 @@ func checkCarryAutoProvision(t *testing.T, loader PGLoader, pool *pgxpool.Pool, 
 
 // checkCarryInvitation: a pending invitation is dropped when the account it
 // would create gets more under the restored data than live (its default
-// group allowed downloads in the backup and does not now), and kept when
-// the policies match.
+// group had no stream cap in the backup and has one now), and kept when the
+// policies match.
 func checkCarryInvitation(t *testing.T, loader PGLoader, pool *pgxpool.Pool, dsn, into string, restored *pgxpool.Pool, tokenHash string) {
 	t.Helper()
 	ctx := t.Context()
 	var id int64
-	var allowed bool
-	if err := pool.QueryRow(ctx, `SELECT i.id, g.download_allowed FROM invitations i, access_groups g WHERE i.token_hash = $1 AND g.is_default`, tokenHash).Scan(&id, &allowed); err != nil {
+	var streams int
+	if err := pool.QueryRow(ctx, `SELECT i.id, g.max_streams FROM invitations i, access_groups g WHERE i.token_hash = $1 AND g.is_default`, tokenHash).Scan(&id, &streams); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		_, _ = pool.Exec(context.Background(), `UPDATE access_groups SET download_allowed = $1 WHERE is_default`, allowed)
+		_, _ = pool.Exec(context.Background(), `UPDATE access_groups SET max_streams = $1 WHERE is_default`, streams)
 	})
-	setDownloads := func(db *pgxpool.Pool, allow bool) {
+	setStreams := func(db *pgxpool.Pool, limit int) {
 		t.Helper()
-		if _, err := db.Exec(ctx, `UPDATE access_groups SET download_allowed = $1 WHERE is_default`, allow); err != nil {
+		if _, err := db.Exec(ctx, `UPDATE access_groups SET max_streams = $1 WHERE is_default`, limit); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1007,14 +1020,14 @@ func checkCarryInvitation(t *testing.T, loader PGLoader, pool *pgxpool.Pool, dsn
 		}
 		return n
 	}
-	setDownloads(pool, false)
-	setDownloads(restored, true)
+	setStreams(pool, 1)
+	setStreams(restored, 0)
 	carried, err := loader.CarryCredentials(ctx, into, dsn)
 	want := fmt.Sprintf("invitation %d", id)
 	if err != nil || !slices.Contains(carried.Dropped, want) || invited() != 0 {
-		t.Fatalf("carried %+v (%v), want %q dropped: its group allowed downloads in the backup", carried, err, want)
+		t.Fatalf("carried %+v (%v), want %q dropped: its group had no stream cap in the backup", carried, err, want)
 	}
-	setDownloads(restored, false)
+	setStreams(restored, 1)
 	if carried, err = loader.CarryCredentials(ctx, into, dsn); err != nil || slices.Contains(carried.Dropped, want) || invited() != 1 {
 		t.Fatalf("carried %+v (%v), want the invitation kept under the same policy", carried, err)
 	}
@@ -1107,7 +1120,18 @@ func checkCarryAuthority(t *testing.T, loader PGLoader, pool *pgxpool.Pool, dsn,
 	t.Cleanup(func() {
 		_, _ = pool.Exec(context.Background(), `DELETE FROM request_user_limits WHERE user_id = $1`, userID)
 	})
-	exec(restored, `INSERT INTO request_settings (id, requests_enabled) VALUES (true, true) ON CONFLICT (id) DO UPDATE SET requests_enabled = true`)
+	// Requests on here too: the restore keeps the stricter of the two
+	// servers' switches before it compares authority.
+	var requestsOn bool
+	if err := pool.QueryRow(ctx, `SELECT coalesce((SELECT requests_enabled FROM request_settings WHERE id), false)`).Scan(&requestsOn); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), `UPDATE request_settings SET requests_enabled = $1 WHERE id`, requestsOn)
+	})
+	for _, db := range []*pgxpool.Pool{pool, restored} {
+		exec(db, `INSERT INTO request_settings (id, requests_enabled) VALUES (true, true) ON CONFLICT (id) DO UPDATE SET requests_enabled = true`)
+	}
 	exec(restored, `INSERT INTO request_user_limits (user_id, limit_mode, approval_mode) VALUES ($1, 'unlimited', 'auto')
 		ON CONFLICT (user_id) DO UPDATE SET limit_mode = 'unlimited', approval_mode = 'auto'`, userID)
 	if carried, err = loader.CarryCredentials(ctx, into, dsn); err != nil {

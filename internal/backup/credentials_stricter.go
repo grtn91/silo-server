@@ -38,6 +38,12 @@ type stricterFlag struct {
 // columnEnabled is the switch column most flagged tables name.
 const columnEnabled = "enabled"
 
+// Tables more than one flag names.
+const (
+	tableLibraries           = "media_folders"
+	tablePersonalCollections = "user_personal_collections"
+)
+
 // The keys a row is matched by.
 const (
 	accountKey = `lower(coalesce(t.username, t.email, ''))`
@@ -79,8 +85,12 @@ var stricterFlags = func() []stricterFlag {
 			describe: `format('plugin task %s kept off', t.capability_id)`},
 		// A plugin catalog an admin turned off stays off, and one removed
 		// since comes back off, so nothing installs or updates from it.
-		// A library an admin turned off since stays hidden.
-		flag("media_folders", columnEnabled, false, "library"),
+		// A library an admin turned off since stays hidden, and one deleted
+		// since comes back disabled, for an admin to turn on deliberately:
+		// an account with every library would otherwise see it at once.
+		{table: tableLibraries, column: columnEnabled, stricter: false, key: noKey, scope: everyRow,
+			describe: `format('library %s kept disabled', t.name)`, absentOff: true,
+			describeAbsent: `format('library %s restored disabled: removed after the backup', t.name)`},
 		// Autoscan accepts webhooks with a carried token: off, globally or
 		// for one source, stays off.
 		{table: "autoscan_settings", column: columnEnabled, stricter: false, key: noKey, scope: everyRow,
@@ -107,9 +117,14 @@ var stricterFlags = func() []stricterFlag {
 			describe: `format('profile %s kept its library restriction', t.name)`},
 		{table: tableUserProfiles, column: "require_advisory_age", stricter: true, key: profileKey, scope: everyRow,
 			describe: `format('profile %s kept its advisory-age requirement', t.name)`},
-		// A collection its owner stopped sharing stays private.
-		flag("user_personal_collections", "is_shared", false, "personal collection"),
-		flag("user_personal_collections", "include_in_server_collections", false, "personal collection"),
+		// A collection its owner stopped sharing stays private, and one
+		// deleted since comes back unshared.
+		{table: tablePersonalCollections, column: "is_shared", stricter: false, key: noKey, scope: everyRow,
+			describe: `format('personal collection %s kept unshared', t.id)`, absentOff: true,
+			describeAbsent: `format('personal collection %s restored unshared: removed after the backup', t.id)`},
+		{table: tablePersonalCollections, column: "include_in_server_collections", stricter: false, key: noKey, scope: everyRow,
+			describe: `format('personal collection %s kept out of server collections', t.id)`, absentOff: true,
+			describeAbsent: `format('personal collection %s restored out of server collections: removed after the backup', t.id)`},
 	}
 	// Per-account and per-group permissions never widen.
 	for _, column := range []string{"download_allowed", "download_transcode_allowed", "transcode_allowed", "audio_transcode_allowed", "requests_allowed"} {
