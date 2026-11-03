@@ -284,10 +284,12 @@ job.
   its slot skips too ("skipped: tonight's backup already ran on another
   server"): a successful nightly records its slot, the latest `backup.time`
   at or before it started in its server's local time zone, in
-  `backup_status.last_nightly_slot`, and a scheduled run skips when a
-  recorded slot falls within the 24 hours before its own. Servers in
-  different time zones, or a changed `backup.time`, can cost one night's
-  run, never a second copy. A failed nightly records no slot; manual and
+  `backup_status.last_nightly_slot`, and a scheduled run skips when the
+  recorded slot is later than its own previous slot (the same wall-clock
+  time a calendar day earlier, so each night across a daylight saving
+  change backs up once). Servers in different time zones, or a
+  `backup.time` moved earlier, can cost one night's run, never a second
+  copy. A failed nightly records no slot; manual and
   before-upgrade backups neither record nor check one.
 - A held lock's session is checked every 10 seconds. If it ends, the work
   holding the lock is canceled (`pg_dump`, a restore), and the
