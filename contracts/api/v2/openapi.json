@@ -4238,7 +4238,8 @@
               "needs_install",
               "kept_stricter",
               "unverified_backup",
-              "over_restore_budget"
+              "over_restore_budget",
+              "needs_primary_profile"
             ],
             "type": "string"
           },
@@ -4753,7 +4754,8 @@
               "needs_install",
               "kept_stricter",
               "unverified_backup",
-              "over_restore_budget"
+              "over_restore_budget",
+              "needs_primary_profile"
             ],
             "type": "string"
           },

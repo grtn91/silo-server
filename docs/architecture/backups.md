@@ -1089,7 +1089,13 @@ fields. A restore adds missing profiles and merges the chosen data types. A
 profile is created only within the account's profile limit here, counted
 under the same account lock ordinary profile creation counts under
 (`pgstore.LockProfilesInTx`), so a restore and a concurrent creation cannot
-both take the last place.
+both take the last place. A restored profile is primary only when the
+account here has no primary profile, and a restore never makes another
+profile primary; so an account with none here (a new one, always) that
+restores any profile must restore the backup's primary profile with it,
+or it is left out (`needs_primary_profile`): without one, nothing could
+manage the household. The admin page selects the primary profile, locked,
+with any other profile of a new account.
 
 **What a matched account would change.** A preview counts, for each data
 type of each matched profile, what a restore would add or change, by the

@@ -1099,6 +1099,50 @@ func TestEmailLessAccountRestoreDB(t *testing.T) {
 	}
 }
 
+// TestNewAccountNeedsItsPrimaryProfileDB: a new account restored with only
+// its non-primary profiles would have no profile to manage its household,
+// so the restore leaves it out until its primary profile comes with them.
+func TestNewAccountNeedsItsPrimaryProfileDB(t *testing.T) {
+	f := newSelectiveFixture(t)
+	ctx := t.Context()
+	sfx := randomHex(t, 4)
+	t.Cleanup(func() {
+		_, _ = f.pool.Exec(context.Background(), `DELETE FROM users WHERE username::text LIKE $1`, "%-"+sfx)
+	})
+	movie := "bknp-" + sfx
+	testMovie(t, f.pool, movie, "Primary "+sfx, "", 0)
+	account := emailLessAccount(t, f.pool, "np-"+sfx, "pnp-main-"+sfx, movie)
+	testProfile(t, f.pool, account, "pnp-kid-"+sfx, "Kid", false, "")
+	source, err := backupUnderLock(t, f.svc, KindManual)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dbExec(t, f.pool, `DELETE FROM users WHERE id = $1`, account)
+	f.moveToAnotherServer(t, source.ID)
+	preview, err := f.svc.Preview(ctx, source.ID, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := strconv.Itoa(account)
+	kid := ProfileSelection{Profile: "pnp-kid-" + sfx, Target: TargetNew, DataTypes: []string{}}
+	report := f.restoreUsers(t, source.ID, preview.Digest, []UserSelection{{Account: id, Target: TargetNew, Profiles: []ProfileSelection{kid}}})
+	if got := reportItem(t, report, SectionUsers, id); got.Outcome != OutcomeLeftOut || got.Reason != ReasonNeedsPrimary {
+		t.Fatalf("a new account without its primary profile = %+v", got)
+	}
+	if n := countRows(t, f.pool, `SELECT count(*) FROM users WHERE username::text = $1`, "np-"+sfx); n != 0 {
+		t.Fatalf("%d accounts created without a primary profile", n)
+	}
+	main := ProfileSelection{Profile: "pnp-main-" + sfx, Target: TargetNew, DataTypes: []string{}}
+	report = f.restoreUsers(t, source.ID, preview.Digest, []UserSelection{{Account: id, Target: TargetNew, Profiles: []ProfileSelection{kid, main}}})
+	if got := reportItem(t, report, SectionUsers, id); got.Outcome != OutcomeRestored {
+		t.Fatalf("a new account with its primary profile = %+v", got)
+	}
+	if n := countRows(t, f.pool, `SELECT count(*) FROM user_profiles p JOIN users u ON u.id = p.user_id
+		WHERE u.username::text = $1 AND p.is_primary`, "np-"+sfx); n != 1 {
+		t.Fatalf("restored account has %d primary profiles, want 1", n)
+	}
+}
+
 // TestItemMatchingInATransactionWithOnePoolConnectionDB: an account restore
 // and a profile import resolve items inside a transaction that holds a
 // connection. An item absent by content id is matched by its provider ids,

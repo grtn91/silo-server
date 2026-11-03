@@ -845,3 +845,4 @@
 ./internal/backup TestImportsReadInBatchesDB
 ./internal/historyimport TestMatchAllAgreesWithMatchDB
 ./internal/backup TestCollectionImportKeepsTheProfileQuotaDB
+./internal/backup TestNewAccountNeedsItsPrimaryProfileDB

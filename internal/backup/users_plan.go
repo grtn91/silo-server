@@ -47,6 +47,9 @@ const (
 	ReasonLoginTaken           = "login_taken"
 	ReasonProfileLimit         = "profile_limit"
 	ReasonUserStore            = "user_store_unsupported"
+	// ReasonNeedsPrimary: an account without a primary profile here whose
+	// selection leaves out the backup's primary profile.
+	ReasonNeedsPrimary = "needs_primary_profile"
 )
 
 // KindAccount is the users section's item kind.

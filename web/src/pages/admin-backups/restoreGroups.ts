@@ -107,6 +107,7 @@ const BLOCKED_PHRASES: Record<RestoreReason, string> = {
   kept_stricter: "they would widen access, so this server keeps its stricter values",
   unverified_backup: "they connect to outside services and this server can't verify the backup",
   over_restore_budget: "this restore already wrote as much collection detail as one restore may",
+  needs_primary_profile: "their primary profile has to be restored with them",
 };
 
 /** For an item the server gave a status but no reason. */
