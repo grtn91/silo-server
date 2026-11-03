@@ -22,6 +22,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/Silo-Server/silo-server/internal/access"
+	"github.com/Silo-Server/silo-server/internal/backup/jsonsize"
 )
 
 // Data type ids. They name a profile's data in a restore set, a profile
@@ -334,12 +335,23 @@ func PrepareAll(ctx context.Context, tx pgx.Tx, types []Type, docs map[string][]
 	return nil
 }
 
+// DecodedPerByte bounds what a document decodes to against its size
+// (DecodeStrict); a document Silo writes decodes to about its size.
+const DecodedPerByte = 8
+
 // MaxEntries bounds one data type's document.
 const MaxEntries = 500_000
 
 // DecodeStrict decodes one JSON value, refusing unknown fields and trailing
-// data: documents come from backups and uploads, which are untrusted.
+// data: documents come from backups and uploads, which are untrusted. A
+// document that would decode to more than DecodedPerByte times its size
+// plus 64 KiB, nest deeper than 32, or hold over a million elements in one
+// array or object is refused before it is decoded (jsonsize).
 func DecodeStrict(data []byte, into any) error {
+	limits := jsonsize.Limits{Depth: 32, Elements: 1_000_000, Bytes: DecodedPerByte*int64(len(data)) + 64<<10}
+	if _, err := jsonsize.Check(data, into, limits); err != nil {
+		return err
+	}
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(into); err != nil {

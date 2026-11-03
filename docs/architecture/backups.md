@@ -1124,8 +1124,10 @@ An import writes only the profile of the session, never one the document
 names, in one transaction, with the merge rules above. It refuses a document
 that carries an account or access field (at the top level or among the
 profile preferences), unknown fields or data types, a newer version, nesting
-deeper than 32, or more than 64 MiB; each data type then applies its own
-strict checks. Items the profile may not see are left out and listed: outside
+deeper than 32, more than 64 MiB, or one that would decode to more than 8
+times its size plus 64 KiB (`jsonsize`, checked before it is decoded); each
+data type then applies its own strict checks, and `userdata.DecodeStrict`
+bounds each type's document the same way, in restore sets too. Items the profile may not see are left out and listed: outside
 its allowed libraries (libraries it hid itself still count as visible), or
 above its content-rating or advisory limits, through the same canonical
 filter; so are preferences of libraries it cannot see. They are listed with

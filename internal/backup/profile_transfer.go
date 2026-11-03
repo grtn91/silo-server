@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/Silo-Server/silo-server/internal/access"
+	"github.com/Silo-Server/silo-server/internal/backup/jsonsize"
 	"github.com/Silo-Server/silo-server/internal/backup/userdata"
 	"github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/usercollections"
@@ -312,10 +313,12 @@ func ParseProfileExport(data []byte) (*ProfileExport, error) {
 	if len(data) > MaxProfileImportBytes {
 		return nil, ErrProfileImportTooLarge
 	}
-	if err := checkJSONDepth(data); err != nil {
+	// Both decodes are bounded before they run (jsonsize): the document's
+	// members as a map, then the document strictly.
+	var top map[string]json.RawMessage
+	if _, err := jsonsize.Check(data, &top, decodeLimits(len(data))); err != nil {
 		return nil, &InvalidProfileExportError{Err: err}
 	}
-	var top map[string]json.RawMessage
 	if err := json.Unmarshal(data, &top); err != nil {
 		return nil, &InvalidProfileExportError{Err: err}
 	}
@@ -339,6 +342,9 @@ func ParseProfileExport(data []byte) (*ProfileExport, error) {
 		return nil, err
 	}
 	var doc ProfileExport
+	if _, err := jsonsize.Check(data, &doc, decodeLimits(len(data))); err != nil {
+		return nil, &InvalidProfileExportError{Err: err}
+	}
 	if err := decodeStrict(data, &doc); err != nil {
 		return nil, &InvalidProfileExportError{Err: err}
 	}

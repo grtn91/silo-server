@@ -4,6 +4,8 @@ import (
 	"errors"
 	"strings"
 	"testing"
+
+	"github.com/Silo-Server/silo-server/internal/backup/jsonsize"
 )
 
 // TestParseProfileExportRefusesHostileDocuments: a profile import reads an
@@ -32,6 +34,10 @@ func TestParseProfileExportRefusesHostileDocuments(t *testing.T) {
 		{"too deep", `{` + head + `,"data":{"ratings":` + strings.Repeat("[", 64) + strings.Repeat("]", 64) + `},"items":[]}`, nil},
 		{"too large", `{` + head + `,"profile_name":"` + strings.Repeat("x", MaxProfileImportBytes) + `"}`, ErrProfileImportTooLarge},
 		{"repeated items", `{` + head + `,"data":{},"items":[{"content_id":"m1"},{"content_id":"m1"}]}`, nil},
+		// Each would decode to far more than the document holds.
+		{"empty items", `{` + head + `,"data":{},"items":[` + strings.Repeat(`{},`, 99_999) + `{}]}`, jsonsize.ErrTooLarge},
+		{"empty ratings", `{` + head + `,"data":{"ratings":{"ratings":[` + strings.Repeat(`{},`, 99_999) + `{}]}},"items":[]}`, jsonsize.ErrTooLarge},
+		{"many members", `{` + head + `,` + strings.Repeat(`"x":0,`, 99_999) + `"x":0}`, jsonsize.ErrTooLarge},
 		// A repeat would multiply the import's writes; no export has one.
 		{"a repeated rating", `{` + head + `,"data":{"ratings":{"ratings":[{"item":"m1","rating":4,"rated_at":"2026-01-01T00:00:00Z"},{"item":"m1","rating":5,"rated_at":"2026-01-02T00:00:00Z"}]}},"items":[]}`, nil},
 		{"a repeated favorite", `{` + head + `,"data":{"favorites":{"favorites":[{"item":"m1"},{"item":"m1"}],"watchlist":[],"titles":[]}},"items":[]}`, nil},

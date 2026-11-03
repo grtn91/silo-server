@@ -100,20 +100,10 @@ func (s *Service) ExecuteRestore(ctx context.Context, run RestoreRun) (any, erro
 		return fail(ErrDigestMismatch)
 	}
 
-	// Items write files inside their transactions; a store recording its
-	// identity on that first write would need a second pool connection.
-	for _, store := range s.stores {
-		if err := blobstore.RecordIdentity(work, store); err != nil {
-			return fail(fmt.Errorf("recording the storage: %w", err))
-		}
+	if err := s.recordStoreIdentities(work); err != nil {
+		return fail(err)
 	}
-	a := &applier{s: s, rs: rs, run: run, report: report, total: 1 + len(req.Users), users: map[string]UserSelection{}, staged: map[string]error{}, filesWritten: map[string]bool{}}
-	for _, ids := range req.Selection {
-		a.total += len(ids)
-	}
-	for _, u := range req.Users {
-		a.users[u.Account] = u
-	}
+	a := newApplier(s, rs, run, report, req)
 	if len(req.Users) > 0 || len(req.Selection[SectionHomeSections]) > 0 {
 		if a.serverID, err = s.serverID(work); err != nil {
 			return fail(err)
@@ -140,14 +130,7 @@ func (s *Service) ExecuteRestore(ctx context.Context, run RestoreRun) (any, erro
 	defer op.end(work, nil)
 
 	for _, spec := range restoreSections {
-		ids := req.Selection[spec.id]
-		if spec.id == SectionUsers {
-			ids = nil
-			for _, u := range req.Users {
-				ids = append(ids, u.Account)
-			}
-		}
-		for _, id := range ids {
+		for _, id := range req.selectedIDs(spec.id) {
 			if err := ctx.Err(); err != nil {
 				return report, err
 			}
@@ -168,6 +151,44 @@ func (s *Service) ExecuteRestore(ctx context.Context, run RestoreRun) (any, erro
 	finished := s.opts.Now().UTC()
 	report.FinishedAt = &finished
 	return report, nil
+}
+
+// newApplier is the applier of req, counting its items and the backup
+// taken before them.
+func newApplier(s *Service, rs *RestoreSet, run RestoreRun, report *SelectiveReport, req RestoreRequest) *applier {
+	a := &applier{s: s, rs: rs, run: run, report: report, total: 1, users: map[string]UserSelection{}, staged: map[string]error{}, filesWritten: map[string]bool{}}
+	for _, spec := range restoreSections {
+		a.total += len(req.selectedIDs(spec.id))
+	}
+	for _, u := range req.Users {
+		a.users[u.Account] = u
+	}
+	return a
+}
+
+// recordStoreIdentities records each store's identity before any item
+// runs: items write files inside their transactions, and a store recording
+// its identity on that first write would need a second pool connection.
+func (s *Service) recordStoreIdentities(ctx context.Context) error {
+	for _, store := range s.stores {
+		if err := blobstore.RecordIdentity(ctx, store); err != nil {
+			return fmt.Errorf("recording the storage: %w", err)
+		}
+	}
+	return nil
+}
+
+// selectedIDs lists the items of section the request selects: for
+// accounts, the ones its Users name.
+func (req RestoreRequest) selectedIDs(section string) []string {
+	if section != SectionUsers {
+		return req.Selection[section]
+	}
+	ids := make([]string, 0, len(req.Users))
+	for _, u := range req.Users {
+		ids = append(ids, u.Account)
+	}
+	return ids
 }
 
 // applier applies items, one fenced transaction each.

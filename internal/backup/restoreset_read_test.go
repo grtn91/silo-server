@@ -272,38 +272,50 @@ func TestSelectedBlobsIsLinear(t *testing.T) {
 	}
 }
 
-// TestReadRestoreSetBoundsWhatDocumentsDecodeTo: a short collections
-// document of empty entries is refused before it is decoded, without
-// allocating what it would decode to.
+// TestReadRestoreSetBoundsWhatDocumentsDecodeTo: a short document of
+// empty entries, here 100,000 empty collections or account profiles, is
+// refused before it is decoded, without allocating what it would decode to.
 func TestReadRestoreSetBoundsWhatDocumentsDecodeTo(t *testing.T) {
-	index, entries := testRestoreSet()
-	bomb := []byte(`{"collections":[` + strings.Repeat(`{},`, 99_999) + `{}],"item_artwork":[],"branding":[]}`)
-	for i := range entries {
-		if entries[i].name == collectionsDocumentName {
-			entries[i].data = bomb
-		}
-	}
-	for i := range index.Sections {
-		for j, f := range index.Sections[i].Files {
-			if f.Path == collectionsDocumentName {
-				sum := sha256.Sum256(bomb)
-				index.Sections[i].Files[j] = FileDigest{Path: f.Path, Size: int64(len(bomb)), SHA256: hex.EncodeToString(sum[:])}
+	empties := strings.Repeat(`{},`, 99_999) + `{}`
+	for name, bomb := range map[string][]byte{
+		collectionsDocumentName: []byte(`{"collections":[` + empties + `],"item_artwork":[],"branding":[]}`),
+		"users/5.json":          []byte(`{"account":{"id":5},"profiles":[` + empties + `],"items":[]}`),
+	} {
+		t.Run(name, func(t *testing.T) {
+			index, entries := testRestoreSet()
+			for i := range entries {
+				if entries[i].name == name {
+					entries[i].data = bomb
+				}
 			}
-		}
-	}
-	data := buildTar(t, index, entries)
-	var before, after runtime.MemStats
-	runtime.GC()
-	runtime.ReadMemStats(&before)
-	_, err := ReadRestoreSet(context.Background(), bytes.NewReader(data), ReadOptions{})
-	runtime.ReadMemStats(&after)
-	if !errors.Is(err, jsonsize.ErrTooLarge) {
-		t.Fatalf("100,000 empty collections in %d bytes: %v, want jsonsize.ErrTooLarge", len(bomb), err)
-	}
-	// What reading the archive itself takes, a few times its size, and far
-	// below the ~30 MB the collections would decode to.
-	if allocated := after.TotalAlloc - before.TotalAlloc; allocated > 8<<20 {
-		t.Fatalf("reading allocated %d bytes", allocated)
+			for i := range index.Sections {
+				for j, f := range index.Sections[i].Files {
+					if f.Path == name {
+						sum := sha256.Sum256(bomb)
+						index.Sections[i].Files[j] = FileDigest{Path: f.Path, Size: int64(len(bomb)), SHA256: hex.EncodeToString(sum[:])}
+					}
+				}
+			}
+			data := buildTar(t, index, entries)
+			var before, after runtime.MemStats
+			runtime.GC()
+			runtime.ReadMemStats(&before)
+			started := time.Now()
+			_, err := ReadRestoreSet(context.Background(), bytes.NewReader(data), ReadOptions{})
+			elapsed := time.Since(started)
+			runtime.ReadMemStats(&after)
+			if !errors.Is(err, jsonsize.ErrTooLarge) {
+				t.Fatalf("%d bytes of empty entries: %v, want jsonsize.ErrTooLarge", len(bomb), err)
+			}
+			// What reading the archive itself takes, a few times its size,
+			// far below the tens of megabytes the entries would decode to.
+			if allocated := after.TotalAlloc - before.TotalAlloc; allocated > 8<<20 {
+				t.Fatalf("reading allocated %d bytes", allocated)
+			}
+			if elapsed > 5*time.Second {
+				t.Fatalf("refusing took %v", elapsed)
+			}
+		})
 	}
 }
 
