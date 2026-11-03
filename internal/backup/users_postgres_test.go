@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path"
@@ -14,11 +15,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/Silo-Server/silo-server/internal/access"
 	"github.com/Silo-Server/silo-server/internal/backup/userdata"
 	"github.com/Silo-Server/silo-server/internal/catalog"
+	"github.com/Silo-Server/silo-server/internal/historyimport"
 	"github.com/Silo-Server/silo-server/internal/userstore"
 	"github.com/Silo-Server/silo-server/internal/userstore/pgstore"
 	"github.com/Silo-Server/silo-server/internal/watchlist"
@@ -1095,6 +1099,50 @@ func TestEmailLessAccountRestoreDB(t *testing.T) {
 	}
 }
 
+// TestNewAccountNeedsItsPrimaryProfileDB: a new account restored with only
+// its non-primary profiles would have no profile to manage its household,
+// so the restore leaves it out until its primary profile comes with them.
+func TestNewAccountNeedsItsPrimaryProfileDB(t *testing.T) {
+	f := newSelectiveFixture(t)
+	ctx := t.Context()
+	sfx := randomHex(t, 4)
+	t.Cleanup(func() {
+		_, _ = f.pool.Exec(context.Background(), `DELETE FROM users WHERE username::text LIKE $1`, "%-"+sfx)
+	})
+	movie := "bknp-" + sfx
+	testMovie(t, f.pool, movie, "Primary "+sfx, "", 0)
+	account := emailLessAccount(t, f.pool, "np-"+sfx, "pnp-main-"+sfx, movie)
+	testProfile(t, f.pool, account, "pnp-kid-"+sfx, "Kid", false, "")
+	source, err := backupUnderLock(t, f.svc, KindManual)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dbExec(t, f.pool, `DELETE FROM users WHERE id = $1`, account)
+	f.moveToAnotherServer(t, source.ID)
+	preview, err := f.svc.Preview(ctx, source.ID, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := strconv.Itoa(account)
+	kid := ProfileSelection{Profile: "pnp-kid-" + sfx, Target: TargetNew, DataTypes: []string{}}
+	report := f.restoreUsers(t, source.ID, preview.Digest, []UserSelection{{Account: id, Target: TargetNew, Profiles: []ProfileSelection{kid}}})
+	if got := reportItem(t, report, SectionUsers, id); got.Outcome != OutcomeLeftOut || got.Reason != ReasonNeedsPrimary {
+		t.Fatalf("a new account without its primary profile = %+v", got)
+	}
+	if n := countRows(t, f.pool, `SELECT count(*) FROM users WHERE username::text = $1`, "np-"+sfx); n != 0 {
+		t.Fatalf("%d accounts created without a primary profile", n)
+	}
+	main := ProfileSelection{Profile: "pnp-main-" + sfx, Target: TargetNew, DataTypes: []string{}}
+	report = f.restoreUsers(t, source.ID, preview.Digest, []UserSelection{{Account: id, Target: TargetNew, Profiles: []ProfileSelection{kid, main}}})
+	if got := reportItem(t, report, SectionUsers, id); got.Outcome != OutcomeRestored {
+		t.Fatalf("a new account with its primary profile = %+v", got)
+	}
+	if n := countRows(t, f.pool, `SELECT count(*) FROM user_profiles p JOIN users u ON u.id = p.user_id
+		WHERE u.username::text = $1 AND p.is_primary`, "np-"+sfx); n != 1 {
+		t.Fatalf("restored account has %d primary profiles, want 1", n)
+	}
+}
+
 // TestItemMatchingInATransactionWithOnePoolConnectionDB: an account restore
 // and a profile import resolve items inside a transaction that holds a
 // connection. An item absent by content id is matched by its provider ids,
@@ -1346,5 +1394,306 @@ func TestFreshBackupComparesSameDB(t *testing.T) {
 	}
 	if compared != len(userDataTypes) {
 		t.Fatalf("compared %d data types, want %d", compared, len(userDataTypes))
+	}
+}
+
+// TestAccountsAndImportOnOneConnectionDB: an account restore of every data
+// type and a profile import run on a pool of one connection, the item's or
+// import's transaction holding it, with a fresh service; any pool use
+// inside either would hang until the deadline.
+func TestAccountsAndImportOnOneConnectionDB(t *testing.T) {
+	_, dsn := testDB(t)
+	cfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.MaxConns = 1
+	pool, err := pgxpool.NewWithConfig(t.Context(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	f := newSelectiveFixtureOn(t, pool, dsn)
+	s := seedUsers(t, f)
+	source, err := backupUnderLock(t, f.svc, KindManual)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.loseUsers(t, &s, source.ID)
+	targets := f.svc.targets
+	f.svc = New(f.svc.opts)
+	f.svc.SetRestoreTargets(targets)
+	preview, err := f.svc.Preview(t.Context(), source.ID, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	main := "pa-main-" + s.suffix
+	selection := []UserSelection{{Account: strconv.Itoa(s.alice), Target: TargetNew,
+		Profiles: []ProfileSelection{{Profile: main, Target: TargetNew, DataTypes: allTypes()}}}}
+	within := func(what string, fn func() error) {
+		t.Helper()
+		done := make(chan error, 1)
+		go func() { done <- fn() }()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("%s: %v", what, err)
+			}
+		case <-time.After(2 * time.Minute):
+			t.Fatalf("%s waited on the pool its own transaction holds", what)
+		}
+	}
+	within("an account restore", func() error {
+		report := f.restoreUsers(t, source.ID, preview.Digest, selection)
+		if got := reportItem(t, report, SectionUsers, strconv.Itoa(s.alice)); got.Outcome != OutcomeRestored {
+			return fmt.Errorf("alice = %+v", got)
+		}
+		return nil
+	})
+	transfer := NewProfileTransfer(pool, func(context.Context) (string, error) { return f.serverID, nil })
+	user := testAccount(t, pool, "onec-"+s.suffix, "h", nil, nil)
+	src, dst := "onec-src-"+s.suffix, "onec-dst-"+s.suffix
+	testProfile(t, pool, user, src, "Src", true, "")
+	testProfile(t, pool, user, dst, "Dst", false, "")
+	dbExec(t, pool, `INSERT INTO user_watch_progress (user_id, profile_id, media_item_id, position_seconds, duration_seconds, updated_at) VALUES ($1, $2, $3, 1, 10, now())`,
+		user, src, s.movies[0])
+	within("a profile import", func() error {
+		data, err := transfer.Export(t.Context(), ProfileImportScope{UserID: user, ProfileID: src})
+		if err != nil {
+			return err
+		}
+		_, err = transfer.Import(t.Context(), ProfileImportScope{UserID: user, ProfileID: dst}, data)
+		return err
+	})
+}
+
+// countingTx counts the statements an import sends.
+type countingTx struct {
+	pgx.Tx
+	n int
+}
+
+func (c *countingTx) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+	c.n++
+	return c.Tx.Exec(ctx, sql, args...)
+}
+
+func (c *countingTx) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
+	c.n++
+	return c.Tx.Query(ctx, sql, args...) //nolint:rowserrcheck // passes the rows to the caller, which checks them
+}
+
+func (c *countingTx) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
+	c.n++
+	return c.Tx.QueryRow(ctx, sql, args...)
+}
+
+func (c *countingTx) SendBatch(ctx context.Context, b *pgx.Batch) pgx.BatchResults {
+	c.n += b.Len()
+	return c.Tx.SendBatch(ctx, b)
+}
+
+// unknownItems matches no item, so an import plans and reads but writes no
+// item rows.
+type unknownItems struct{}
+
+func (unknownItems) Resolve(context.Context, string) (string, bool, error) { return "", false, nil }
+
+// TestCollectionImportKeepsTheProfileQuotaDB: an import counts the personal
+// collections the profile has: it creates none past maxProfileCollections,
+// and none with a sync schedule past maxScheduledCollections, so repeated
+// imports cannot grow either, nor past the bytes their definitions hold
+// together; a backup this server cannot verify restores no schedule at all.
+func TestCollectionImportKeepsTheProfileQuotaDB(t *testing.T) {
+	pool, _ := testDB(t)
+	ctx := t.Context()
+	sfx := randomHex(t, 4)
+	user := testAccount(t, pool, "quota-"+sfx, "h", nil, nil)
+	profile := "quota-" + sfx
+	testProfile(t, pool, user, profile, "Quota", true, "")
+	// One short of each quota.
+	dbExec(t, pool, `INSERT INTO user_personal_collections (id, user_id, profile_id, creator_profile_id, name, native, sync_schedule)
+		SELECT 'q-' || $3 || '-' || n, $1, $2, $2, 'Have ' || n, true, CASE WHEN n <= 49 THEN '30 4 * * *' END FROM generate_series(1, 999) AS n`,
+		user, profile, sfx)
+	entry := func(name string) string {
+		return `{"id":"` + name + `","name":"` + name + `","type":"mdblist","source_url":"https://mdblist.com/lists/a/b","sync_schedule":"30 4 * * *",` +
+			`"watch_filter":"all","media_filter":"all","items":[],"shared_with":[]}`
+	}
+	doc := json.RawMessage(`{"collections":[` + entry("New-1") + "," + entry("New-2") + "," + entry("New-3") + `]}`)
+	dt, _ := userDataType(userdata.Collections)
+	scheduled := func(tx pgx.Tx) int {
+		t.Helper()
+		var n int
+		if err := tx.QueryRow(ctx, `SELECT count(*) FROM user_personal_collections WHERE user_id = $1 AND sync_schedule IS NOT NULL`, user).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	for _, unverified := range []bool{false, true} {
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		target := userdata.Target{Owner: userdata.Owner{UserID: user, ProfileID: profile}, Items: unknownItems{}, Now: time.Now(), SameServer: true,
+			Unverified: unverified, Library: func(id int) (int, bool) { return id, true }, Profile: func(string) (string, bool) { return "", false }}
+		res, err := dt.Import(ctx, tx, target, doc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		wantScheduled := 50
+		if unverified {
+			wantScheduled = 49
+		}
+		if res.Added != 1 || res.LeftOut != 2 || scheduled(tx) != wantScheduled {
+			t.Fatalf("unverified %v: imported %+v with %d scheduled, want 1 added, 2 left out, %d scheduled", unverified, res, scheduled(tx), wantScheduled)
+		}
+		_ = tx.Rollback(ctx)
+	}
+	// The profile's collection rules already fill their bytes: nothing
+	// more fits.
+	dbExec(t, pool, `UPDATE user_personal_collections SET query_definition = jsonb_build_object('x', repeat('a', 16 << 20))
+		WHERE id = 'q-' || $1 || '-1'`, sfx)
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+	target := userdata.Target{Owner: userdata.Owner{UserID: user, ProfileID: profile}, Items: unknownItems{}, Now: time.Now(), SameServer: true,
+		Library: func(id int) (int, bool) { return id, true }, Profile: func(string) (string, bool) { return "", false }}
+	if res, err := dt.Import(ctx, tx, target, doc); err != nil || res.Added != 0 || res.LeftOut != 3 {
+		t.Fatalf("imported %+v (%v) over the definition bytes, want nothing added", res, err)
+	}
+}
+
+// unknownRefs are refs for the items m0…m(n-1) and s0…s(n-1) the
+// samples name, with provider ids this catalog lacks, of every kind the
+// matcher reads: movies, episodes with series ids, and series.
+func unknownRefs(n int) []ItemRef {
+	refs := make([]ItemRef, 0, 2*n)
+	for i := range n {
+		item := ItemRef{ContentID: fmt.Sprintf("m%d", i), Kind: historyimport.KindMovie, TMDBID: fmt.Sprintf("t%d", i)}
+		if i%2 == 1 {
+			item = ItemRef{ContentID: item.ContentID, Kind: historyimport.KindEpisode, TVDBID: fmt.Sprintf("e%d", i), Season: 1, Episode: i,
+				Series: &SeriesRef{TVDBID: fmt.Sprintf("v%d", i)}}
+		}
+		refs = append(refs, item, ItemRef{ContentID: fmt.Sprintf("s%d", i), Kind: historyimport.KindSeries, TVDBID: fmt.Sprintf("v%d", i)})
+	}
+	return refs
+}
+
+// sameItems matches every item to itself, so an import writes every entry.
+type sameItems struct{}
+
+func (sameItems) Resolve(_ context.Context, id string) (string, bool, error) { return id, true, nil }
+
+// TestImportsReadInBatchesDB: an import of any data type's entries sends a
+// bounded number of statements, not one per entry: reads and writes are
+// set-based. Each branch of each importer (importerSamples, one per list
+// and per sort kind) is driven with 100,000 distinct entries and with
+// 1,000, once with every reference mapping, so every entry is planned and
+// written, and once with every item a ref whose provider ids this catalog
+// lacks, so every one misses through the import's resolver (its reads
+// counted too); a document over a type's cap must be refused before the
+// import.
+func TestImportsReadInBatchesDB(t *testing.T) {
+	pool, _ := testDB(t)
+	ctx := t.Context()
+	sfx := randomHex(t, 4)
+	user := testAccount(t, pool, "batch-"+sfx, "h", nil, nil)
+	profile := "batch-" + sfx
+	testProfile(t, pool, user, profile, "Batch", true, "")
+	for name, d := range importerSamples {
+		for _, run := range []struct {
+			n       int
+			unknown bool
+		}{{100_000, false}, {1000, false}, {100_000, true}, {1000, true}} {
+			n := run.n
+			mode := "mapped"
+			if run.unknown {
+				mode = "unknown"
+			}
+			t.Run(fmt.Sprintf("%s %d %s", name, n, mode), func(t *testing.T) {
+				id, _, _ := strings.Cut(name, " ")
+				dt, _ := userDataType(id)
+				entries := make([]string, n)
+				for i := range entries {
+					e := strings.ReplaceAll(d.entry, `"m1"`, fmt.Sprintf(`"m%d"`, i))
+					e = strings.ReplaceAll(e, `"s1"`, fmt.Sprintf(`"s%d"`, i))
+					e = strings.ReplaceAll(e, `"c1"`, fmt.Sprintf(`"c%d"`, i))
+					e = strings.ReplaceAll(e, `"name":"A"`, fmt.Sprintf(`"name":"A%d"`, i))
+					e = strings.ReplaceAll(e, `"library":1,`, fmt.Sprintf(`"library":%d,`, i+1))
+					entries[i] = e
+				}
+				doc := json.RawMessage(d.head + strings.Join(entries, ",") + d.tail)
+				tx, err := pool.Begin(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() { _ = tx.Rollback(context.Background()) }()
+				counted := &countingTx{Tx: tx}
+				var items userdata.Items = sameItems{}
+				if run.unknown {
+					resolver, err := newItemResolver(ctx, counted, unknownRefs(n), nil)
+					if err != nil {
+						t.Fatal(err)
+					}
+					items = resolver
+				}
+				target := userdata.Target{Owner: userdata.Owner{UserID: user, ProfileID: profile}, Items: items, Now: time.Now(), Untrusted: true,
+					SameServer: true, Library: func(id int) (int, bool) { return id, true }, Profile: func(string) (string, bool) { return "", false },
+					Collections: func(_ context.Context, _ string, ids []string) (map[string]string, error) {
+						out := map[string]string{}
+						for _, id := range ids {
+							out[id] = id
+						}
+						return out, nil
+					}}
+				// A personal list has one sort, whatever collection id an
+				// entry names, so distinct entries are repeats.
+				personal := strings.HasSuffix(name, "watchlist sort") || strings.HasSuffix(name, "favorites sort")
+				if _, err := dt.Validate(doc); err != nil {
+					if n == 100_000 || personal {
+						return // over the type's cap, or repeats: refused before an import plans anything
+					}
+					t.Fatalf("%d entries: %v", n, err)
+				} else if personal {
+					t.Fatalf("%d sorts of one personal list were accepted", n)
+				}
+				res, err := dt.Import(ctx, counted, target, doc)
+				if err != nil {
+					t.Fatal(err)
+				}
+				// Collections are created or merged one at a time, by name,
+				// in a few statements each, up to the import's cap of 1,000.
+				limit := 64
+				if id == userdata.Collections {
+					limit += 4 * min(n, 1000)
+				}
+				if counted.n > limit {
+					t.Fatalf("%d entries sent %d statements (%+v)", n, counted.n, res)
+				}
+			})
+		}
+	}
+	// Watchlist titles outside the library, at their cap, in a profile's own
+	// export: the profile's titles are read once.
+	titles := make([]string, 10_000)
+	for i := range titles {
+		titles[i] = fmt.Sprintf(`{"media_type":"movie","tmdb_id":%d,"imdb_id":"","tvdb_id":0,"title":"T","year":2001,"poster_path":"","certification":"","added_at":%s}`, i+1, sampleAt)
+	}
+	doc := json.RawMessage(`{"favorites":[],"watchlist":[],"titles":[` + strings.Join(titles, ",") + `]}`)
+	dt, _ := userDataType(userdata.Favorites)
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+	counted := &countingTx{Tx: tx}
+	target := userdata.Target{Owner: userdata.Owner{UserID: user, ProfileID: profile}, Items: unknownItems{}, Now: time.Now(), Untrusted: true}
+	if _, err := dt.Import(ctx, counted, target, doc); err != nil {
+		t.Fatal(err)
+	}
+	if counted.n > 10 {
+		t.Fatalf("10,000 watchlist titles sent %d statements", counted.n)
 	}
 }

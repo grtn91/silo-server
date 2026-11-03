@@ -153,6 +153,12 @@ func (a *applier) applyAccount(ctx context.Context, tx pgx.Tx, sel UserSelection
 	if !sameTarget(sel.Target, plan.target(), plan.item.Account.Match) {
 		return leftOut(item, ReasonChanged, "The account this backup account maps to changed since the preview. Open the backup again."), nil
 	}
+	if message, err := missingPrimary(ctx, tx, doc, plan, sel); err != nil || message != "" {
+		if err != nil {
+			return applied{}, err
+		}
+		return leftOut(item, ReasonNeedsPrimary, message), nil
+	}
 	report := &ReportAccount{Profiles: []ReportProfile{}}
 	item.Account = report
 	if plan.localID == 0 {
@@ -205,6 +211,36 @@ func (a *applier) applyAccount(ctx context.Context, tx pgx.Tx, sel UserSelection
 		item.Notes = append(item.Notes, fmt.Sprintf("%d items are not in this server's catalog and were left out.", len(r.items.unmatched)))
 	}
 	return applied{item: accountOutcome(item, report, r.changed), after: r.itemsChanged()}, nil
+}
+
+// missingPrimary says why sel cannot restore the account, or "": an
+// account with no primary profile here, a new one included, needs the
+// backup's primary profile restored with any of its others, since only a
+// primary profile manages a household (adds, edits, and removes its
+// profiles) and a restore never makes another profile primary.
+func missingPrimary(ctx context.Context, q queryer, doc *UserDocument, plan accountPlan, sel UserSelection) (string, error) {
+	if len(sel.Profiles) == 0 {
+		return "", nil
+	}
+	var primary *ProfileEntry
+	for i := range doc.Profiles {
+		if doc.Profiles[i].IsPrimary {
+			primary = &doc.Profiles[i]
+		}
+	}
+	if primary == nil || slices.ContainsFunc(sel.Profiles, func(p ProfileSelection) bool { return p.Profile == primary.ID }) {
+		return "", nil
+	}
+	if plan.localID > 0 {
+		var has bool
+		if err := q.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM user_profiles WHERE user_id = $1 AND is_primary)`, plan.localID).Scan(&has); err != nil {
+			return "", fmt.Errorf("checking the account's primary profile: %w", err)
+		}
+		if has {
+			return "", nil
+		}
+	}
+	return fmt.Sprintf("Restore its primary profile, %q, with it: the account has none here, and only a primary profile manages the household.", primary.Name), nil
 }
 
 // itemsChanged tells the server, after the item commits, which items each
@@ -438,11 +474,12 @@ func (r *accountRestore) importTarget(ctx context.Context, c chosenProfile) (use
 		},
 		HasBlob:            a.rs.HasBlob,
 		PluginInstallation: a.pluginInstallation(ctx, r.tx),
+		Unverified:         a.rs.unverified,
 	}
 	if a.adminCollections == nil {
 		a.adminCollections = map[string]string{}
 	}
-	target.Collection = newCollectionMap(a.planner(r.tx), r.tx, a.libraryMap(), r.sameServer, a.adminCollections, r.doc).lookup(target)
+	target.Collections = newCollectionMap(a.planner(r.tx), r.tx, a.libraryMap(), r.sameServer, a.adminCollections, r.doc).lookup(target)
 	return target, nil
 }
 

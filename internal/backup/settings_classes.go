@@ -32,7 +32,9 @@ const (
 )
 
 // serverSpecificSettings are the server-specific keys and prefixes (ending
-// in "." or "_").
+// in "." or "_"). The AI sign-in mode and models are this server's choice
+// among what its own AI providers and ChatGPT account offer, which only
+// they can validate.
 var serverSpecificSettings = strings.Fields(`
 	server.identity_id server.public_url server.local_url
 	database. redis. userdb. storage. artwork. s3. backup. setup.
@@ -43,6 +45,7 @@ var serverSpecificSettings = strings.Fields(`
 	playback.ffmpeg_path playback.transcode_dir playback.hw_accel playback.hw_device
 	download.artifact_dir
 	ai.providers ai.chatgpt. ai.text_provider_id ai.speech_provider_id
+	ai.auth_mode ai.chat_model ai.reasoning_effort subtitle_ai.chat_model
 	notifications.push_relay_ notifications.web_push.vapid_keypair
 	jellyfin_compat.public_url jellyfin_compat.web_install_dir
 	recommendations.embedding_provider_id recommendations.embedding_lock recommendations.policy_marked_generation
@@ -137,6 +140,14 @@ func isSettingPrefix(entry string) bool {
 	return strings.HasSuffix(entry, ".") || strings.HasSuffix(entry, "_")
 }
 
+// Secret settings of the routes, named once for this package.
+const (
+	settingASRKey             = "ai.asr_api_key"
+	settingSubtitleAIKey      = "subtitle_ai.api_key"
+	settingEmbeddingToken     = "recommendations.embedding_auth_token"
+	settingOpenAIEmbeddingKey = "recommendations.openai_api_key"
+)
+
 // settingRoute is an outside service's address with the secrets this server
 // sends there. A restore never pairs a backup's address with this server's
 // secret: the backup's address could be anyone's.
@@ -156,11 +167,11 @@ type settingRoute struct {
 // Discord, TMDB, MDBList, IntroDB, and the watch providers connect to fixed
 // hosts; a plugin's configuration is restored whole or not at all.
 var settingRoutes = []settingRoute{
-	{endpoint: "email.smtp_host", secrets: []string{"email.smtp_password"}, enabled: "email.enabled", transport: settingSMTPSecurity},
-	{endpoint: "ai.base_url", secrets: []string{"ai.api_key"}},
-	{endpoint: "ai.asr_base_url", secrets: []string{"ai.asr_api_key"}},
-	{endpoint: "subtitle_ai.base_url", secrets: []string{"subtitle_ai.api_key"}},
-	{endpoint: "recommendations.embedding_base_url", secrets: []string{"recommendations.embedding_auth_token", "recommendations.openai_api_key"}},
+	{endpoint: settingSMTPHost, secrets: []string{settingSMTPPassword}, enabled: settingEmailEnabled, transport: settingSMTPSecurity},
+	{endpoint: settingAIBaseURL, secrets: []string{settingAIKey}},
+	{endpoint: "ai.asr_base_url", secrets: []string{settingASRKey}},
+	{endpoint: "subtitle_ai.base_url", secrets: []string{settingSubtitleAIKey}},
+	{endpoint: "recommendations.embedding_base_url", secrets: []string{settingEmbeddingToken, settingOpenAIEmbeddingKey}},
 }
 
 // keys are every setting of the route.

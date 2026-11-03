@@ -2,6 +2,12 @@ package api
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -12,6 +18,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/notifications"
+	"github.com/Silo-Server/silo-server/internal/recommendations"
 )
 
 // wireBackupRestore gives selective restore the write paths it applies
@@ -21,14 +28,10 @@ import (
 // for template collections, and the section editor's checks. A missing
 // handler leaves its section unavailable rather than half wired.
 func wireBackupRestore(deps Dependencies, admin *handlers.AdminHandler, libraries *handlers.LibraryHandler, images *handlers.AdminImageHandler, pluginHandler *handlers.PluginHandler,
-	collections *handlers.LibraryCollectionHandler, pageSections *handlers.SectionHandler) {
+	collections *handlers.LibraryCollectionHandler, pageSections *handlers.SectionHandler, rateLimits *handlers.RateLimitHandler) {
 	jobs := adminjob.NewRepository(deps.DB)
-	filesystem := handlers.NewFilesystemHandler()
 	targets := backup.RestoreTargets{
-		CheckFolder: func(ctx context.Context, path string) error {
-			_, err := filesystem.BrowseDirectoryPage(ctx, path, "", "", 1)
-			return err
-		},
+		CheckFolder: func(_ context.Context, path string) error { return checkLibraryFolder(path) },
 		CreateJob: func(ctx context.Context, userID int, req backup.RestoreRequest) (*models.AdminJob, error) {
 			return jobs.Create(ctx, adminjob.CreateJobInput{JobType: adminjob.JobTypeBackupRestore, CreatedByUserID: userID, RequestPayload: req, Message: "Queued restore"})
 		},
@@ -39,15 +42,7 @@ func wireBackupRestore(deps Dependencies, admin *handlers.AdminHandler, librarie
 	}
 	if admin != nil {
 		targets.ApplySettings = func(ctx context.Context, tx pgx.Tx, values map[string]string, check func(map[string]string) error) ([]string, func(context.Context), error) {
-			var guard func(handlers.AdminSettingsSnapshot) error
-			if check != nil {
-				guard = func(s handlers.AdminSettingsSnapshot) error { return check(s.Stored) }
-			}
-			result, publish, err := admin.ApplyAdminSettingsInTx(ctx, tx, values, guard)
-			if err != nil {
-				return nil, nil, err
-			}
-			return result.RestartRequiredKeys, publish, nil
+			return applyRestoredSettings(ctx, tx, admin, rateLimits, values, check)
 		}
 	}
 	if pluginHandler != nil {
@@ -84,20 +79,93 @@ func wireBackupRestore(deps Dependencies, admin *handlers.AdminHandler, librarie
 	if pageSections != nil {
 		targets.CheckSection = pageSections.CheckRestoredSection
 	}
-	targets.ItemsChanged = interestChanges(deps.Notifications)
+	targets.ItemsChanged = importedChanges(deps.Notifications, deps.RecWorker)
 	deps.Backups.SetRestoreTargets(targets)
 }
 
-// interestChanges queues a notification interest recompute for each item a
-// profile's restored or imported data names, as the user store's own writes
-// do (notifications.WrapUserStoreProvider); nil without notifications.
-func interestChanges(system *notifications.System) backup.ItemsChanged {
-	if system == nil || system.Interest == nil {
-		return nil
+// importedChanges is what a profile's restored or imported data sets off
+// after it commits: one rebuild of the profile's notification interest,
+// coalesced with any already queued (notifications.InterestUpdater
+// .QueueProfileRebuild), rather than a recompute per item it names, and one
+// recommendations refresh, since its ratings, favorites, and history are
+// taste signals. Neither grows with the data imported.
+func importedChanges(system *notifications.System, rec *recommendations.Worker) backup.ItemsChanged {
+	return func(userID int, profileID string, _ []string) {
+		if system != nil && system.Interest != nil {
+			system.Interest.QueueProfileRebuild(userID, profileID)
+		}
+		rec.NotifySignalsChanged(context.Background(), userID, profileID)
 	}
-	return func(userID int, profileID string, itemIDs []string) {
-		for _, id := range itemIDs {
-			system.Interest.QueueItemMutation(userID, profileID, id)
+}
+
+// applyRestoredSettings writes restored settings in tx, each family through
+// its editor's write path: rate limits through the rate-limit
+// configuration's (/admin/rate-limits/config), the rest through the admin
+// settings batch. Both check that the settings are as planned.
+func applyRestoredSettings(ctx context.Context, tx pgx.Tx, admin *handlers.AdminHandler, rateLimits *handlers.RateLimitHandler,
+	values map[string]string, check func(map[string]string) error) ([]string, func(context.Context), error) {
+	limits, rest := map[string]string{}, map[string]string{}
+	for key, value := range values {
+		if strings.HasPrefix(key, "ratelimit.") {
+			limits[key] = value
+		} else {
+			rest[key] = value
 		}
 	}
+	var restart []string
+	var after []func(context.Context)
+	if len(rest) > 0 {
+		var guard func(handlers.AdminSettingsSnapshot) error
+		if check != nil {
+			guard = func(s handlers.AdminSettingsSnapshot) error { return check(s.Stored) }
+		}
+		result, publish, err := admin.ApplyAdminSettingsInTx(ctx, tx, rest, guard)
+		if err != nil {
+			return nil, nil, err
+		}
+		restart, after = result.RestartRequiredKeys, append(after, publish)
+	}
+	if len(limits) > 0 {
+		if rateLimits == nil {
+			return nil, nil, errors.New("this server cannot restore rate limits")
+		}
+		publish, err := rateLimits.ApplyRateLimitSettingsInTx(ctx, tx, limits, check)
+		if err != nil {
+			return nil, nil, err
+		}
+		after = append(after, publish)
+	}
+	return restart, func(ctx context.Context) {
+		for _, f := range after {
+			if f != nil {
+				f(ctx)
+			}
+		}
+	}, nil
+}
+
+// checkLibraryFolder reports whether this server can open path as a library
+// folder: an absolute directory it can read. It reads at most one entry,
+// never the whole directory, so a preview's checks cost a few system calls
+// a folder.
+func checkLibraryFolder(path string) error {
+	if !filepath.IsAbs(path) {
+		return errors.New("path must be absolute")
+	}
+	dir, err := os.Open(filepath.Clean(path))
+	if err != nil {
+		return err
+	}
+	defer func() { _ = dir.Close() }()
+	info, err := dir.Stat()
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("%s is not a folder", path)
+	}
+	if _, err := dir.Readdirnames(1); err != nil && !errors.Is(err, io.EOF) {
+		return err
+	}
+	return nil
 }

@@ -43,6 +43,8 @@ export const REASON_SENTENCES: Record<RestoreReason, string> = {
     "Its access group isn't on this server. Create a group with the same name, then open the restore again.",
   login_taken: "Another account here signs in with its username or email.",
   profile_limit: "The account here has no room for another profile.",
+  needs_primary_profile:
+    "Its primary profile has to be restored with it: only a primary profile manages the household.",
   user_store_unsupported: "Accounts can be restored only on the PostgreSQL user store.",
   template_not_available:
     "This server's starter packs don't have its template, or the template doesn't suit the library.",
@@ -56,6 +58,8 @@ export const REASON_SENTENCES: Record<RestoreReason, string> = {
     "Its settings that differ would widen access, so this server keeps its stricter current values.",
   unverified_backup:
     "It connects to outside services, so it isn't restored from a backup this server can't verify.",
+  over_restore_budget:
+    "This restore already wrote as much collection detail as one restore may. Restore it on its own.",
 };
 
 export const SECTION_TITLES: Record<RestoreSectionId, string> = {
@@ -388,11 +392,27 @@ export function chosenItems(set: RestoreSet, selection: SelectionKeys): IndexedI
   );
 }
 
-/** An account's chosen profiles. */
+/**
+ * The profile a new account must restore with any of its others: the
+ * backup's primary profile. Only a primary profile manages a household, and a
+ * restore never makes another profile primary, so the server refuses a new
+ * account whose chosen profiles leave it out.
+ */
+export function requiredPrimary(account: RestoreItem): RestoreProfile | undefined {
+  if (account.account?.target !== "new") return undefined;
+  return account.account.profiles.find((profile) => profile.is_primary && profile.selectable);
+}
+
+/** An account's chosen profiles, its required primary profile with any others. */
 export function chosenProfiles(account: RestoreItem, selection: SelectionKeys): RestoreProfile[] {
-  return (account.account?.profiles ?? []).filter(
+  const primary = requiredPrimary(account);
+  const chosen = (account.account?.profiles ?? []).filter(
     (profile) => profile.selectable && selection.has(profileKey(account.id, profile.id)),
   );
+  if (primary && chosen.length > 0 && !chosen.includes(primary)) {
+    return [primary, ...chosen];
+  }
+  return chosen;
 }
 
 /** Whether any chosen profile carries at least one of the chosen data types. */

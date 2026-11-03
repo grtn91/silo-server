@@ -20,6 +20,7 @@ import (
 
 	"github.com/Silo-Server/silo-server/internal/backup/userdata"
 	"github.com/Silo-Server/silo-server/internal/catalog"
+	"github.com/Silo-Server/silo-server/internal/collectionutil"
 	"github.com/Silo-Server/silo-server/internal/idgen"
 )
 
@@ -59,6 +60,18 @@ type templateCustomization struct {
 	changes          []string
 	update           catalog.UpdateLibraryCollectionInput
 	poster, backdrop string
+	// withheld are changes a backup this server cannot verify does not
+	// restore: a source or sync schedule, which make the collection fetch
+	// from outside services.
+	withheld []string
+}
+
+// withheldNote says which changes were not restored, or "".
+func (c templateCustomization) withheldNote() string {
+	if len(c.withheld) == 0 {
+		return ""
+	}
+	return " Its " + joinLabels(c.withheld) + " are not restored from a backup this server cannot verify."
 }
 
 func (c templateCustomization) empty() bool { return len(c.changes) == 0 }
@@ -72,10 +85,8 @@ func (p *planner) templateLabel(t TemplateCollectionEntry) string {
 			title = name
 		}
 	}
-	for _, l := range p.rs.Libraries.Libraries {
-		if l.ID == t.LibraryID {
-			return title + " in " + l.Name
-		}
+	if name, ok := p.rs.lookup().libraryNames[t.LibraryID]; ok {
+		return title + " in " + name
 	}
 	return title
 }
@@ -145,17 +156,18 @@ func (p *planner) planTemplateCollection(ctx context.Context, t TemplateCollecti
 	}
 	asCollection := CollectionEntry{ID: t.ID, LibraryID: t.LibraryID, Libraries: t.Libraries}
 	if plan.local == nil {
-		plan.custom = customizeTemplate(t, defaults.Input, nil, libMap)
+		plan.custom = customizeTemplate(t, defaults.Input, nil, libMap, p.authenticated)
 		plan.item.Status, plan.item.Selectable = ItemNotOnThisServer, true
 		plan.item.Message = "Created from its template, then synced."
 		if !plan.custom.empty() {
 			plan.item.Message = "Created from its template with the changes made to it (" + strings.Join(plan.custom.changes, ", ") + "), then synced."
 		}
+		plan.item.Message += plan.custom.withheldNote()
 		plan.item.Collection.Changes = plan.custom.changes
 		return plan, nil
 	}
 	plan.item.Collection.LocalID = plan.local.id
-	plan.custom = customizeTemplate(t, defaults.Input, plan.local, libMap)
+	plan.custom = customizeTemplate(t, defaults.Input, plan.local, libMap, p.authenticated)
 	if plan.groups, err = ungroupedMemberships(ctx, p.q, plan.local.id, asCollection, libMap); err != nil {
 		return plan, err
 	}
@@ -181,7 +193,7 @@ func (p *planner) planTemplateCollection(ctx context.Context, t TemplateCollecti
 	if len(plan.addLibraries) > 0 {
 		parts = append(parts, fmt.Sprintf("adds it to %d more libraries", len(plan.addLibraries)))
 	}
-	plan.item.Message = "The collection here " + strings.Join(parts, " and ") + "."
+	plan.item.Message = "The collection here " + strings.Join(parts, " and ") + "." + plan.custom.withheldNote()
 	return plan, nil
 }
 
@@ -211,7 +223,12 @@ func readTemplateCollection(ctx context.Context, q queryer, bundleID, key string
 // here; it is written only where this server's collection (local, or the
 // defaults when it is missing) differs from the backup. A source whose
 // libraries are not all here is left as it is.
-func customizeTemplate(t TemplateCollectionEntry, def catalog.CreateLibraryCollectionInput, local *localTemplateCollection, libMap map[int]int) templateCustomization {
+//
+// From a backup this server cannot verify (trusted false), a changed source
+// or sync schedule is withheld: either would make the collection fetch from
+// outside services the backup chose.
+func customizeTemplate(t TemplateCollectionEntry, def catalog.CreateLibraryCollectionInput, local *localTemplateCollection, libMap map[int]int,
+	trusted bool) templateCustomization {
 	defVisibility := cmp.Or(def.Visibility, catalog.LibraryCollectionVisibilityVisible)
 	if local == nil {
 		local = &localTemplateCollection{title: def.Title, description: def.Description, visibility: defVisibility,
@@ -240,11 +257,23 @@ func customizeTemplate(t TemplateCollectionEntry, def catalog.CreateLibraryColle
 	}
 	if source, ok := userdata.RemapQueryLibraries(t.SourceConfig, mapIn(libMap)); ok &&
 		!jsonEqual(source, def.SourceConfig) && !jsonEqual(source, local.sourceConfig) {
-		url := t.SourceURL
-		u.SourceConfig, u.SourceURL, c.changes = source, &url, append(c.changes, "source")
+		// As the editors store a source; the plan refused one that does
+		// not canonicalize (planner.checkCollection).
+		url, canonical, err := collectionutil.CanonicalCollectionSource(def.CollectionType, t.SourceURL, source)
+		switch {
+		case err != nil:
+		case trusted:
+			u.SourceConfig, u.SourceURL, c.changes = canonical, &url, append(c.changes, "source")
+		default:
+			c.withheld = append(c.withheld, "source")
+		}
 	}
 	if schedule := scheduleOf(t.SyncSchedule); schedule != scheduleOf(def.SyncSchedule) && schedule != scheduleOf(local.syncSchedule) {
-		u.SyncSchedule, c.changes = &schedule, append(c.changes, "sync schedule")
+		if trusted {
+			u.SyncSchedule, c.changes = &schedule, append(c.changes, "sync schedule")
+		} else {
+			c.withheld = append(c.withheld, "sync schedule")
+		}
 	}
 	// An image the admin set: an upload travels as a blob, a URL as is.
 	if t.Poster != "" && !t.PosterFromTemplate && !t.PosterAutoGenerated && !sameImage(t.ID, t.Poster, local.id, local.poster) {
@@ -293,13 +322,12 @@ func jsonEqual(a, b json.RawMessage) bool {
 }
 
 func (a *applier) applyTemplateCollection(ctx context.Context, tx pgx.Tx, id string) (applied, error) {
+	return a.withCollectionBudget(id, a.writeTemplateCollection)(ctx, tx)
+}
+
+func (a *applier) writeTemplateCollection(ctx context.Context, tx pgx.Tx, id string) (applied, error) {
 	item := ReportItem{Kind: KindTemplateCollection, Label: id}
-	var t *TemplateCollectionEntry
-	for i := range a.rs.Collections.TemplateCollections {
-		if a.rs.Collections.TemplateCollections[i].itemID() == id {
-			t = &a.rs.Collections.TemplateCollections[i]
-		}
-	}
+	t := indexed(a.rs.Collections.TemplateCollections, a.rs.lookup().templates, id)
 	if t == nil {
 		return leftOut(item, ReasonNotInBackup, "The backup has no such collection."), nil
 	}
@@ -347,7 +375,7 @@ func (a *applier) applyTemplateCollection(ctx context.Context, tx pgx.Tx, id str
 	if images.BackdropURL != nil {
 		input.BackdropURL, input.BackdropThumbhash = *images.BackdropURL, *images.BackdropThumbhash
 	}
-	if _, err := catalog.CreateLibraryCollectionInTx(ctx, tx, input); err != nil {
+	if err := a.createCollection(ctx, tx, input, false, &item.Notes); err != nil {
 		return applied{}, err
 	}
 	if _, err := restoreGroups(ctx, tx, newID, asCollection, libMap); err != nil {
@@ -469,9 +497,13 @@ func missingScope(ctx context.Context, q queryer, collectionID string, scope []i
 }
 
 func missingFrom(scope, have []int) []int {
+	had := make(map[int]bool, len(have))
+	for _, id := range have {
+		had[id] = true
+	}
 	var missing []int
 	for _, id := range scope {
-		if !slices.Contains(have, id) {
+		if !had[id] {
 			missing = append(missing, id)
 		}
 	}
@@ -482,9 +514,11 @@ func missingFrom(scope, have []int) []int {
 // it, its library first: every library must be here or restored with it, as
 // for any collection (planCollection). ok is false when one can be neither.
 func templateScope(t TemplateCollectionEntry, libMap map[int]int, restorable map[int]bool) (scope []int, requires []string, ok bool) {
+	inScope, required := map[int]bool{}, map[int]bool{}
 	for _, id := range append([]int{t.LibraryID}, libraryIDsOf(t.Libraries)...) {
 		if local, mapped := libMap[id]; mapped {
-			if !slices.Contains(scope, local) {
+			if !inScope[local] {
+				inScope[local] = true
 				scope = append(scope, local)
 			}
 			continue
@@ -492,8 +526,9 @@ func templateScope(t TemplateCollectionEntry, libMap map[int]int, restorable map
 		if !restorable[id] {
 			return nil, nil, false
 		}
-		if ref := libraryRef(id); !slices.Contains(requires, ref) {
-			requires = append(requires, ref)
+		if !required[id] {
+			required[id] = true
+			requires = append(requires, libraryRef(id))
 		}
 	}
 	return scope, requires, true

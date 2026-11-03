@@ -79,9 +79,6 @@ var stricterFlags = func() []stricterFlag {
 			describe: `format('plugin task %s kept off', t.capability_id)`},
 		// A plugin catalog an admin turned off stays off, and one removed
 		// since comes back off, so nothing installs or updates from it.
-		{table: "plugin_repositories", column: columnEnabled, stricter: false, key: `t.url`, scope: everyRow,
-			describe: `format('plugin catalog %s kept off', t.url)`, absentOff: true,
-			describeAbsent: `format('plugin catalog %s restored off: removed after the backup', t.url)`},
 		// A library an admin turned off since stays hidden.
 		flag("media_folders", columnEnabled, false, "library"),
 		// Autoscan accepts webhooks with a carried token: off, globally or
@@ -128,13 +125,6 @@ var stricterFlags = func() []stricterFlag {
 		flags = append(flags, stricterFlag{table: "notification_preferences", column: column, stricter: false,
 			id: `t.user_id::text || ':' || t.profile_id`, key: noKey, scope: everyRow,
 			describe: fmt.Sprintf(`format('notifications of profile %%s kept off (%s)', t.profile_id)`, column)})
-	}
-	// What a watch-provider connection sends to or takes from the provider.
-	for _, column := range []string{"export_favorites_enabled", "export_ratings_enabled", "export_unwatched_enabled", "export_watched_enabled",
-		"export_watchlist_enabled", "import_favorites_enabled", "import_progress_enabled", "import_ratings_enabled", "import_watched_enabled",
-		"import_watchlist_enabled", "scrobble_enabled", "sync_dropped_enabled", "sync_favorite_removals_enabled",
-		"sync_watchlist_order_enabled", "sync_watchlist_removals_enabled"} {
-		flags = append(flags, flag("watch_provider_connections", column, false, "watch-provider connection"))
 	}
 	return flags
 }()
@@ -202,8 +192,6 @@ var restoredFlagColumns = map[string]string{
 	"movie_match_queue.rerun_requested":                       whyQueue,
 	"page_sections.enabled":                                   whyShown,
 	"page_sections.featured":                                  whyShown,
-	"policy_document_versions.compiled_ok":                    "a policy version's compile result",
-	"policy_documents.enabled":                                "a policy can allow or deny, so neither value of its switch is the stricter one",
 	"profile_series_interest.continue_watching":               whyDerived,
 	"profile_series_interest.favorite":                        whyDerived,
 	"profile_series_interest.next_up_candidate":               whyDerived,

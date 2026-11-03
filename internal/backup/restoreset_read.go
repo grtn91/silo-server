@@ -14,9 +14,11 @@ import (
 	"path"
 	"sort"
 	"strings"
+	"sync"
 	"unicode/utf8"
 
 	"github.com/Silo-Server/silo-server/internal/artworkkey"
+	"github.com/Silo-Server/silo-server/internal/backup/jsonsize"
 	"github.com/Silo-Server/silo-server/internal/blobstore"
 )
 
@@ -31,14 +33,20 @@ var ErrNoRestoreSet = errors.New("this backup has no restore set")
 // destination can be written by something other than this server. These
 // limits bound what reading one can cost.
 const (
-	maxRestoreSetEntries  = 200_000
-	maxRestoreSetPath     = 1024
+	maxRestoreSetEntries = 200_000
+	maxRestoreSetPath    = 1024
+	// maxRestoreSetDocument bounds the documents that grow with a library:
+	// collections (item lists and item artwork) and accounts (a profile's
+	// watch history).
 	maxRestoreSetDocument = 64 << 20
-	// maxRestoreSetIndex, maxSettingsDocument, and maxPluginDocument bound
-	// the documents that never need more than a few megabytes.
+	// maxRestoreSetIndex bounds the index, which lists every file. The
+	// other limits bound documents that hold a few kilobytes a server
+	// (settings, libraries, page sections) or a plugin's configuration,
+	// with a wide margin.
 	maxRestoreSetIndex  = 32 << 20
-	maxSettingsDocument = 16 << 20
-	maxPluginDocument   = 16 << 20
+	maxSettingsDocument = 4 << 20
+	maxPluginDocument   = 4 << 20
+	maxSmallDocument    = 8 << 20
 	// maxRestoreSetMetadata bounds the index and documents one read holds
 	// in memory together, as the preview cache bounds what it keeps
 	// (maxCachedRestoreSetBytes). The index lists every document's size, so
@@ -48,6 +56,22 @@ const (
 	maxRestoreSetBlob      = 256 << 20
 	maxRestoreSetTotal     = 32 << 30
 	maxRestoreSetJSONDepth = 32
+	// A document is refused before decoding when what it decodes to
+	// (jsonsize) would be over decodedPerByte times its size plus
+	// decodedSlack, or would take a set's decoded documents over
+	// maxRestoreSetDecoded: a short document of empty elements decodes to
+	// whole structs. A document Silo writes decodes to about its size.
+	decodedPerByte       = 8
+	decodedSlack         = 64 << 10
+	maxRestoreSetDecoded = maxRestoreSetMetadata
+	// maxJSONElements bounds one array or object of a document.
+	maxJSONElements = 1_000_000
+	// maxCollectionItems bounds the item lists of a set's collections
+	// together: a large library's collections list a few hundred thousand.
+	maxCollectionItems = 1_000_000
+	// blobIndexCost is about what one blob costs the set's maps and
+	// lookups: its key in blobs, blobSizes, and the index's directories.
+	blobIndexCost = 256
 	// maxRestoreSetTrailer bounds the bytes after the tar end marker.
 	maxRestoreSetTrailer = 1 << 20
 )
@@ -88,6 +112,11 @@ type RestoreSet struct {
 	// metadataBytes estimates what the set holds in memory: its documents
 	// and blob keys, for the preview cache's bound.
 	metadataBytes int64
+	indexOnce     sync.Once
+	index         *restoreSetIndex
+	// fromUnverified marks a cached set of a backup this server cannot
+	// verify; the cache keeps one at a time.
+	fromUnverified bool
 }
 
 // HasBlob reports whether the archive carries key.
@@ -137,7 +166,8 @@ type ReadOptions struct {
 func ReadRestoreSet(ctx context.Context, r io.Reader, opts ReadOptions) (_ *RestoreSet, err error) {
 	digest := sha256.New()
 	counted := &countingReader{r: io.TeeReader(r, digest)}
-	tr := tar.NewReader(counted)
+	guard := newTarGuard(counted)
+	tr := tar.NewReader(guard)
 	rs := &RestoreSet{blobs: map[string]string{}, blobSizes: map[string]int64{}}
 	if opts.ExtractDir != "" {
 		if rs.dir, err = os.MkdirTemp(opts.ExtractDir, "restore-set-"); err != nil {
@@ -160,6 +190,9 @@ func ReadRestoreSet(ctx context.Context, r io.Reader, opts ReadOptions) (_ *Rest
 			break
 		}
 		if err != nil {
+			return nil, fmt.Errorf("restore set: %w", err)
+		}
+		if err := guard.checkEntry(h.Size); err != nil {
 			return nil, fmt.Errorf("restore set: %w", err)
 		}
 		if entries >= maxRestoreSetEntries {
@@ -214,12 +247,20 @@ type restoreSetParser struct {
 	// with the section that references them.
 	files map[string]FileDigest
 	blobs map[string]sectionSpec
-	// ladderDirs are the image directories of referenced artwork originals;
-	// the variants stored beside an original may ride along with it.
-	ladderDirs map[string]sectionSpec
-	opts       ReadOptions
-	seen       map[string]bool
-	documents  map[string][]byte
+	// originals are the referenced artwork originals by key, and
+	// legacyOriginals those without a revision by directory; the variants
+	// stored beside one (ladderSibling) may ride along with it, at most
+	// maxLadderVariants of them, counted in variants.
+	originals       map[string]bool
+	legacyOriginals map[string][]string
+	variants        map[string]int
+	opts            ReadOptions
+	seen            map[string]bool
+	documents       map[string][]byte
+	// decoded is what the documents decoded so far take (jsonsize).
+	decoded int64
+	// unusableCount counts each section's entries left out (unusable).
+	unusableCount map[string]int
 	// logical sums the entries' sizes as their headers state them.
 	logical int64
 }
@@ -304,6 +345,8 @@ func documentLimit(name string) int64 {
 		return maxSettingsDocument
 	case path.Base(name) == pluginDocumentName:
 		return maxPluginDocument
+	case name == librariesDocumentName || name == homeSectionsDocumentName:
+		return maxSmallDocument
 	}
 	return maxRestoreSetDocument
 }
@@ -329,7 +372,7 @@ func (p *restoreSetParser) readIndex(data []byte) error {
 		Format  string `json:"format"`
 		Version int    `json:"version"`
 	}
-	if err := checkJSONDepth(data); err != nil {
+	if _, err := jsonsize.Check(data, &head, decodeLimits(len(data))); err != nil {
 		return fmt.Errorf("%s: %w", restoreSetIndexName, err)
 	}
 	if err := json.Unmarshal(data, &head); err != nil {
@@ -345,7 +388,7 @@ func (p *restoreSetParser) readIndex(data []byte) error {
 		return fmt.Errorf("%s: version %d is not valid", restoreSetIndexName, head.Version)
 	}
 	var index RestoreSetIndex
-	if err := decodeStrict(data, &index); err != nil {
+	if err := p.decode(data, &index); err != nil {
 		return fmt.Errorf("%s: %w", restoreSetIndexName, err)
 	}
 	if !validServerID(index.ServerID) {
@@ -358,7 +401,9 @@ func (p *restoreSetParser) readIndex(data []byte) error {
 	p.rs.Index = index
 	p.files = map[string]FileDigest{}
 	p.blobs = map[string]sectionSpec{}
-	p.ladderDirs = map[string]sectionSpec{}
+	p.originals = map[string]bool{}
+	p.legacyOriginals = map[string][]string{}
+	p.variants = map[string]int{}
 	sectionsSeen := map[string]bool{}
 	// documents sums the listed documents' sizes.
 	var documents int64
@@ -408,11 +453,7 @@ func (p *restoreSetParser) readIndex(data []byte) error {
 				return fmt.Errorf("%s: blob %q is listed twice", restoreSetIndexName, key)
 			}
 			p.blobs[key] = spec
-			if strings.HasPrefix(path.Base(key), artworkkey.OriginalVariant+".") {
-				if dir := artworkkey.Directory(key); dir != "" {
-					p.ladderDirs[dir] = spec
-				}
-			}
+			p.noteOriginal(key)
 		}
 	}
 	return nil
@@ -431,13 +472,55 @@ func validateOmitted(list []OmittedItem) error {
 	return nil
 }
 
-// blob accepts a referenced key, or a variant stored in a referenced
-// original's directory, under its section's prefixes.
+// noteOriginal records a referenced key that is an artwork original, whose
+// variants may ride along with it.
+func (p *restoreSetParser) noteOriginal(key string) {
+	dir := artworkkey.Directory(key)
+	if !strings.HasPrefix(path.Base(key), artworkkey.OriginalVariant+".") || dir == "" {
+		return
+	}
+	p.originals[key] = true
+	if artworkkey.Revision(key) == "" && legacyOriginalName(key) {
+		p.legacyOriginals[dir] = append(p.legacyOriginals[dir], key)
+	}
+}
+
+// variant finds the referenced original key is a variant of
+// (ladderSibling), and counts it against maxLadderVariants.
+func (p *restoreSetParser) variant(key string) (sectionSpec, bool, error) {
+	// A variant of a revision names its original (artworkkey.OriginalOf);
+	// one without a revision may belong to any legacy original beside it,
+	// of which a directory holds one per image format.
+	var candidates []string
+	if legacyVariantName(key) {
+		candidates = p.legacyOriginals[artworkkey.Directory(key)]
+	}
+	if artworkkey.Revision(key) != "" {
+		candidates = nil
+		if original := artworkkey.OriginalOf(key); p.originals[original] {
+			candidates = []string{original}
+		}
+	}
+	for _, original := range candidates {
+		if !ladderSibling(original, key) {
+			continue
+		}
+		if p.variants[original]++; p.variants[original] > maxLadderVariants {
+			return sectionSpec{}, false, fmt.Errorf("blob %q: more than %d variants of %q", key, maxLadderVariants, original)
+		}
+		return p.blobs[original], true, nil
+	}
+	return sectionSpec{}, false, nil
+}
+
+// blob accepts a referenced key, or a variant stored beside a referenced
+// original (ladderSibling), under its section's prefixes.
 func (p *restoreSetParser) blob(key string, h *tar.Header, tr io.Reader) error {
 	spec, ok := p.blobs[key]
 	if !ok {
-		if dir := artworkkey.Directory(key); dir != "" && path.Dir(key)+"/" == dir {
-			spec, ok = p.ladderDirs[dir]
+		var err error
+		if spec, ok, err = p.variant(key); err != nil {
+			return err
 		}
 	}
 	if !ok {
@@ -530,11 +613,19 @@ func (p *restoreSetParser) finish() error {
 		}
 	}
 	sort.Strings(p.rs.MissingBlobs)
+	defer func() {
+		// What the set holds once read: its documents decoded (jsonsize's
+		// estimate) and its lookup index, built here so its cost is known
+		// before the set is cached, besides the bytes counted as read.
+		p.rs.lookup()
+		p.rs.metadataBytes += p.decoded + int64(len(p.rs.blobs))*blobIndexCost
+	}()
 	for _, si := range p.index.Sections {
 		count, err := p.decodeSection(si)
 		if err != nil {
 			return fmt.Errorf("section %q: %w", si.ID, err)
 		}
+		p.summarizeUnusable(si.ID)
 		if count != si.Count {
 			return fmt.Errorf("section %q holds %d items; the index says %d", si.ID, count, si.Count)
 		}
@@ -565,8 +656,28 @@ func allowedRestoreSetKey(key string) bool {
 	return canonicalArchivePath(key) && blobstore.ValidateKey(key) == nil && !strings.HasPrefix(key, RootPrefix)
 }
 
+// decodeLimits bound decoding a document of n bytes on its own.
+func decodeLimits(n int) jsonsize.Limits {
+	return jsonsize.Limits{Depth: maxRestoreSetJSONDepth, Elements: maxJSONElements, Bytes: decodedPerByte*int64(n) + decodedSlack}
+}
+
+// decode decodes one of the set's documents strictly (decodeStrict), first
+// checking what it decodes to against its own bound and what the set's
+// documents decoded so far leave of maxRestoreSetDecoded.
+func (p *restoreSetParser) decode(data []byte, into any) error {
+	limits := decodeLimits(len(data))
+	limits.Bytes = min(limits.Bytes, maxRestoreSetDecoded-p.decoded)
+	size, err := jsonsize.Check(data, into, limits)
+	if err != nil {
+		return err
+	}
+	p.decoded += size
+	return decodeStrict(data, into)
+}
+
 // decodeStrict decodes one JSON value, refusing unknown fields and trailing
-// data: within a format version every field is known.
+// data: within a format version every field is known. Data from an
+// untrusted source is checked with jsonsize first (restoreSetParser.decode).
 func decodeStrict(data []byte, into any) error {
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields()
@@ -578,36 +689,6 @@ func decodeStrict(data []byte, into any) error {
 	}
 	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
 		return errors.New("trailing data after the document")
-	}
-	return nil
-}
-
-// checkJSONDepth refuses JSON nested deeper than maxRestoreSetJSONDepth
-// before it is decoded.
-func checkJSONDepth(data []byte) error {
-	depth := 0
-	inString, escaped := false, false
-	for _, c := range data {
-		switch {
-		case inString:
-			switch {
-			case escaped:
-				escaped = false
-			case c == '\\':
-				escaped = true
-			case c == '"':
-				inString = false
-			}
-		case c == '"':
-			inString = true
-		case c == '{' || c == '[':
-			depth++
-			if depth > maxRestoreSetJSONDepth {
-				return fmt.Errorf("JSON nested deeper than %d", maxRestoreSetJSONDepth)
-			}
-		case c == '}' || c == ']':
-			depth--
-		}
 	}
 	return nil
 }
@@ -644,11 +725,5 @@ func (rs *RestoreSet) blobFamily(key string) []string {
 	if dir == "" {
 		return out
 	}
-	for other := range rs.blobs {
-		if other != key && path.Dir(other)+"/" == dir {
-			out = append(out, other)
-		}
-	}
-	sort.Strings(out[1:])
-	return out
+	return append(out, rs.lookup().variants[key]...)
 }

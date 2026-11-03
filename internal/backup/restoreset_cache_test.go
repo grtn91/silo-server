@@ -1,13 +1,18 @@
 package backup
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"maps"
 	"runtime"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -146,5 +151,55 @@ func TestRestoreSetReadStopsWithItsLastPreview(t *testing.T) {
 	case <-stopped:
 	case <-time.After(10 * time.Second):
 		t.Fatal("the read went on after its last preview left")
+	}
+}
+
+// TestCachedSetIsChargedWhatItHolds: a set is charged what it holds once
+// read, its decoded documents included, so a set of short item ids that
+// decode to far more than their bytes cannot fill memory past the cache's
+// bound; and the cache keeps one set of an unverifiable backup at a time.
+func TestCachedSetIsChargedWhatItHolds(t *testing.T) {
+	index, entries := testRestoreSet()
+	ids := make([]string, 100_000)
+	for i := range ids {
+		ids[i] = strconv.Itoa(i % 100)
+	}
+	doc := CollectionsDocument{ItemArtwork: []ItemArtworkEntry{}, Branding: []BrandingEntry{}}
+	for i := range 7 {
+		doc.Collections = append(doc.Collections, CollectionEntry{ID: fmt.Sprintf("c%d", i), LibraryID: 3, Libraries: []CollectionLib{{LibraryID: 3}},
+			Title: "Heavy", Items: ids})
+	}
+	setDocument(&index, entries, homeSectionsDocumentName, mustJSON(HomeSectionsDocument{Sections: []HomeSectionEntry{}}), 0)
+	for i := range index.Sections {
+		if index.Sections[i].ID == SectionCollections {
+			index.Sections[i].Blobs = []string{}
+		}
+	}
+	entries = slices.DeleteFunc(entries, func(e testEntry) bool { return strings.HasPrefix(e.name, "blobs/collection-images/") })
+	setDocument(&index, entries, collectionsDocumentName, mustJSON(doc), len(doc.Collections))
+	data := buildTar(t, index, entries)
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	rs, err := ReadRestoreSet(context.Background(), bytes.NewReader(data), ReadOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime.GC()
+	runtime.ReadMemStats(&after)
+	held := int64(after.HeapAlloc) - int64(before.HeapAlloc)
+	if rs.metadataBytes < held {
+		t.Fatalf("charged %d bytes for a set that holds %d", rs.metadataBytes, held)
+	}
+	runtime.KeepAlive(rs)
+
+	var c restoreSetCache
+	c.mu.Lock()
+	c.storeLocked("a", &RestoreSet{fromUnverified: true, metadataBytes: 1})
+	c.storeLocked("b", &RestoreSet{metadataBytes: 1})
+	c.storeLocked("c", &RestoreSet{fromUnverified: true, metadataBytes: 1})
+	c.mu.Unlock()
+	if _, ok := c.entries["a"]; ok || len(c.entries) != 2 || c.bytes != 2 {
+		t.Fatalf("cache %v (%d bytes), want the newer unverified set and the verified one", slices.Collect(maps.Keys(c.entries)), c.bytes)
 	}
 }

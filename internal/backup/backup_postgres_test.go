@@ -10,9 +10,11 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -20,11 +22,13 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/Silo-Server/silo-server/internal/adminjob"
 	"github.com/Silo-Server/silo-server/internal/auth"
 	"github.com/Silo-Server/silo-server/internal/backup/backuptest"
 	"github.com/Silo-Server/silo-server/internal/blobstore"
 	"github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/config"
+	"github.com/Silo-Server/silo-server/internal/mail"
 	"github.com/Silo-Server/silo-server/internal/secret"
 	"github.com/Silo-Server/silo-server/internal/serveridentity"
 )
@@ -299,10 +303,68 @@ func TestBackupRestoreRoundTripDB(t *testing.T) {
 		t.Fatalf("restored encrypted setting = %q, %v; want %q", got, err, seed.secretValue)
 	}
 
-	if err := VerifyBackup(ctx, src, loader, into, ValidateOptions{KeyCheck: keyCheck}, io.Discard); err == nil || !strings.Contains(err.Error(), "not empty") {
+	if err := VerifyBackup(ctx, src, loader, into, ValidateOptions{KeyCheck: keyCheck, ManifestKey: manifestKey}, io.Discard); err == nil || !strings.Contains(err.Error(), "not empty") {
 		t.Fatalf("verify into a used database = %v, want refusal", err)
 	}
 	checkAnotherKey(t, src, loader, pool, dsn, seed.secretKey)
+	checkDrillAsOrdinaryRole(t, src, loader, pool, dsn, ValidateOptions{KeyCheck: keyCheck, ManifestKey: manifestKey})
+}
+
+// checkDrillAsOrdinaryRole: a restore drill runs as the role the docs
+// recommend, one that is not a superuser and owns only its scratch
+// database, where a superuser created the extensions.
+func checkDrillAsOrdinaryRole(t *testing.T, src *Source, loader PGLoader, pool *pgxpool.Pool, dsn string, validate ValidateOptions) {
+	t.Helper()
+	ctx := t.Context()
+	exec := func(db *pgxpool.Pool, sql string) {
+		t.Helper()
+		if _, err := db.Exec(ctx, sql); err != nil {
+			t.Fatal(err)
+		}
+	}
+	role := "silo_drill_" + randomHex(t, 4)
+	password := randomHex(t, 16)
+	exec(pool, "CREATE ROLE "+ident(role)+" LOGIN PASSWORD '"+password+"'")
+	t.Cleanup(func() { _, _ = pool.Exec(context.Background(), "DROP ROLE IF EXISTS "+ident(role)) })
+	scratch := createDatabase(t, pool, dsn)
+	name, err := databaseName(scratch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exec(pool, "ALTER DATABASE "+ident(name)+" OWNER TO "+ident(role))
+	super, err := pgxpool.New(ctx, scratch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, ext := range []string{"vector", "citext", "pg_trgm"} {
+		exec(super, "CREATE EXTENSION IF NOT EXISTS "+ext)
+	}
+	super.Close()
+	asRole, err := url.Parse(scratch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	asRole.User = url.UserPassword(role, password)
+	if err := VerifyBackup(ctx, src, loader, asRole.String(), validate, io.Discard); err != nil {
+		t.Fatalf("verify as a role that owns only the scratch database: %v", err)
+	}
+	// A swap as that role would create the restored database itself, where
+	// it cannot create vector.
+	extensions, err := loader.Extensions(ctx, src.path(DumpName))
+	if err != nil || !slices.Contains(extensions, "vector") {
+		t.Fatalf("the dump's extensions = %v (%v), want vector among them", extensions, err)
+	}
+	ctl, err := ConnectControl(ctx, asRole.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = ctl.Close(context.Background()) }()
+	if err := ctl.CheckExtensions(ctx, extensions); !errors.Is(err, ErrExtensionNeedsSuperuser) {
+		t.Fatalf("extensions as an ordinary role = %v, want ErrExtensionNeedsSuperuser", err)
+	}
+	if err := ctl.CheckExtensions(ctx, []string{"citext", "pg_trgm"}); err != nil {
+		t.Fatalf("trusted extensions as an ordinary role = %v", err)
+	}
 }
 
 // checkManifestTampering: a backup whose manifest was changed after it was
@@ -432,9 +494,44 @@ func checkCredentials(t *testing.T, loader PGLoader, pool *pgxpool.Pool, dsn, in
 	}
 	checkCarryAuthority(t, loader, pool, dsn, into, restored, userID, keptID, liveKeys)
 	checkCarryInvitation(t, loader, pool, dsn, into, restored, "invite-"+suffix)
+	checkCarryAutoProvision(t, loader, pool, dsn, into, restored)
+	checkOutboundConnections(t, loader, pool, dsn, into, restored, userID)
+	checkInterruptedWork(t, loader, pool, dsn, into, restored, userID)
+	checkOutboundSettings(t, loader, pool, dsn, into, restored)
+	checkLiveReleasesAndNodes(t, loader, pool, dsn, into, restored)
+	checkAccountRollback(t, loader, pool, dsn, into, userID, newUser)
 	checkStricterFlags(t, loader, pool, dsn, into, restored, userID)
 	checkStricterSettings(t, loader, pool, dsn, into, restored)
 	checkOtherDeployment(t, loader, pool, dsn, into, restored)
+}
+
+// checkAccountRollback: the restore names the accounts it rolls back, an
+// admin role and a password changed since the backup and an account created
+// since among them. Other tests share the database, so it checks only these.
+func checkAccountRollback(t *testing.T, loader PGLoader, pool *pgxpool.Pool, dsn, into string, userID, newUser int64) {
+	t.Helper()
+	ctx := t.Context()
+	var name, role, hash, created string
+	if err := pool.QueryRow(ctx, `SELECT username, role, COALESCE(password_hash, '') FROM users WHERE id = $1`, userID).Scan(&name, &role, &hash); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_, _ = pool.Exec(context.Background(), `UPDATE users SET role = $2, password_hash = NULLIF($3, '') WHERE id = $1`, userID, role, hash)
+	}()
+	if _, err := pool.Exec(ctx, `UPDATE users SET role = 'admin', password_hash = 'changed-since' WHERE id = $1`, userID); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT username FROM users WHERE id = $1`, newUser).Scan(&created); err != nil {
+		t.Fatal(err)
+	}
+	r, err := loader.AccountRollback(ctx, into, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(r.Authority, name) || !slices.Contains(r.Password, name) || !slices.Contains(r.Lost, created) ||
+		slices.Contains(r.Returned, name) || r.LiveChangedAt.IsZero() {
+		t.Fatalf("rollback %+v, want %s's role and password and %s lost", r, name, created)
+	}
 }
 
 // checkOtherDeployment: the restore reads this server's identity to tell its
@@ -576,6 +673,311 @@ func checkStricterFlags(t *testing.T, loader PGLoader, pool *pgxpool.Pool, dsn, 
 	}
 }
 
+// checkLiveReleasesAndNodes: what the server launches or routes clients
+// through is the live server's. A plugin both have runs the live release,
+// archive and capabilities included; one whose id is another plugin here
+// comes back off and is reported; a stream node removed since the backup
+// stays removed.
+func checkLiveReleasesAndNodes(t *testing.T, loader PGLoader, pool *pgxpool.Pool, dsn, into string, restored *pgxpool.Pool) {
+	t.Helper()
+	ctx := t.Context()
+	exec := func(db *pgxpool.Pool, sql string, args ...any) {
+		t.Helper()
+		if _, err := db.Exec(ctx, sql, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	base, err := strconv.ParseInt(randomHex(t, 3), 16, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	same, other := 700_000_000+base, 710_000_000+base
+	install := func(db *pgxpool.Pool, id int64, plugin, version, checksum string) {
+		t.Helper()
+		exec(db, `INSERT INTO plugin_installations (id, plugin_id, version, install_path, enabled) VALUES ($1, $2, $3, '/plugins/'||$3, true)`, id, plugin, version)
+		exec(db, `INSERT INTO plugin_archives (plugin_installation_id, manifest_json, checksum, archive_bytes) VALUES ($1, '\x7b7d', $2, '\x00')`, id, checksum)
+		exec(db, `INSERT INTO plugin_capabilities (plugin_installation_id, capability_type, capability_id, metadata) VALUES ($1, 'metadata', $2, '{}')`, id, version)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), `DELETE FROM plugin_installations WHERE id = ANY($1)`, []int64{same, other})
+		_, _ = pool.Exec(context.Background(), `DELETE FROM stream_nodes WHERE name = ANY($1)`, []string{"live-node", "removed-node"})
+	})
+	install(pool, same, "release-plugin", "2.0.0", "live")
+	install(restored, same, "release-plugin", "1.0.0", "backup")
+	install(pool, other, "live-plugin", "1.0.0", "live")
+	install(restored, other, "backup-plugin", "1.0.0", "backup")
+	off, err := loader.CarryPluginReleases(ctx, into, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var version, checksum, capability string
+	var enabled bool
+	if err := restored.QueryRow(ctx, `SELECT i.version, a.checksum, c.capability_id FROM plugin_installations i
+		JOIN plugin_archives a ON a.plugin_installation_id = i.id JOIN plugin_capabilities c ON c.plugin_installation_id = i.id
+		WHERE i.id = $1`, same).Scan(&version, &checksum, &capability); err != nil || version != "2.0.0" || checksum != "live" || capability != "2.0.0" {
+		t.Fatalf("a plugin both have runs %s %s %s (%v), want the live release", version, checksum, capability, err)
+	}
+	if err := restored.QueryRow(ctx, `SELECT enabled FROM plugin_installations WHERE id = $1`, other).Scan(&enabled); err != nil || enabled ||
+		!slices.ContainsFunc(off, func(s string) bool { return strings.Contains(s, "backup-plugin") }) {
+		t.Fatalf("an installation of another plugin here: enabled %v (%v), reported %v; want it off and reported", enabled, err, off)
+	}
+	// Reinstalled since the backup from a catalog added since: the live
+	// release names a catalog the backup does not have.
+	var catalogID int64
+	if err := pool.QueryRow(ctx, `INSERT INTO plugin_repositories (url, enabled, display_name) VALUES ($1, true, 'New catalog') RETURNING id`,
+		fmt.Sprintf("https://catalog-%d.invalid/index.json", base)).Scan(&catalogID); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), `DELETE FROM plugin_repositories WHERE id = $1`, catalogID)
+	})
+	exec(pool, `UPDATE plugin_installations SET repository_id = $2, version = '3.0.0' WHERE id = $1`, same, catalogID)
+	if _, err := loader.CarryCredentials(ctx, into, dsn); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loader.CarryPluginReleases(ctx, into, dsn); err != nil {
+		t.Fatalf("a release from a catalog added since: %v", err)
+	}
+	var repository *int64
+	if err := restored.QueryRow(ctx, `SELECT version, repository_id FROM plugin_installations WHERE id = $1`, same).Scan(&version, &repository); err != nil ||
+		version != "3.0.0" || repository == nil || *repository != catalogID {
+		t.Fatalf("reinstalled plugin = %s from %v (%v), want the live release and catalog", version, repository, err)
+	}
+	exec(pool, `INSERT INTO stream_nodes (name, type, url, enabled) VALUES ('live-node', 'transcode', 'http://live.invalid', true)`)
+	exec(restored, `INSERT INTO stream_nodes (name, type, url, enabled) VALUES ('removed-node', 'transcode', 'http://removed.invalid', true)`)
+	if _, err := loader.CarryCredentials(ctx, into, dsn); err != nil {
+		t.Fatal(err)
+	}
+	var removed, liveNodes int
+	if err := restored.QueryRow(ctx, `SELECT count(*) FILTER (WHERE name = 'removed-node'), count(*) FILTER (WHERE name = 'live-node') FROM stream_nodes`).Scan(&removed, &liveNodes); err != nil ||
+		removed != 0 || liveNodes != 1 {
+		t.Fatalf("stream nodes: %d removed since, %d live (%v); want the live set", removed, liveNodes, err)
+	}
+}
+
+// checkOutboundSettings: a full restore keeps the live mail route as a
+// unit, an SMTP host and password changed since the backup included; a
+// route the live server does not have comes back with its secret cleared
+// and turned off, and so does every route of a restore that carries none.
+func checkOutboundSettings(t *testing.T, loader PGLoader, pool *pgxpool.Pool, dsn, into string, restored *pgxpool.Pool) {
+	t.Helper()
+	ctx := t.Context()
+	set := func(db *pgxpool.Pool, values map[string]string) {
+		t.Helper()
+		for key, value := range values {
+			if _, err := db.Exec(ctx, `INSERT INTO server_settings (key, value) VALUES ($1, $2)
+				ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`, key, value); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	read := func(key string) string {
+		t.Helper()
+		var v string
+		if err := restored.QueryRow(ctx, `SELECT coalesce((SELECT value FROM server_settings WHERE key = $1), '')`, key).Scan(&v); err != nil {
+			t.Fatal(err)
+		}
+		return v
+	}
+	keys := []string{settingSMTPHost, settingSMTPPassword, mail.SettingSMTPUsername, settingEmailEnabled, settingAIBaseURL, settingAIKey}
+	var saved []string
+	for _, key := range keys {
+		var v *string
+		_ = pool.QueryRow(ctx, `SELECT value FROM server_settings WHERE key = $1`, key).Scan(&v)
+		if v != nil {
+			saved = append(saved, key, *v)
+		}
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), `DELETE FROM server_settings WHERE key = ANY($1)`, keys)
+		for i := 0; i+1 < len(saved); i += 2 {
+			_, _ = pool.Exec(context.Background(), `INSERT INTO server_settings (key, value) VALUES ($1, $2)`, saved[i], saved[i+1])
+		}
+	})
+	set(restored, map[string]string{settingSMTPHost: "smtp.then.invalid", settingSMTPPassword: "then", mail.SettingSMTPUsername: "then-user", settingEmailEnabled: "true",
+		settingAIBaseURL: "https://ai.then.invalid", settingAIKey: "then-key"})
+	set(pool, map[string]string{settingSMTPHost: "smtp.now.invalid", settingSMTPPassword: "now", mail.SettingSMTPUsername: "now-user", settingEmailEnabled: "true"})
+	if _, err := pool.Exec(ctx, `DELETE FROM server_settings WHERE key = ANY($1)`, []string{settingAIBaseURL, settingAIKey}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := loader.CarryOutboundSettings(ctx, into, dsn); err != nil {
+		t.Fatal(err)
+	}
+	if read(settingSMTPHost) != "smtp.now.invalid" || read(settingSMTPPassword) != "now" || read(mail.SettingSMTPUsername) != "now-user" {
+		t.Fatalf("mail route %s / %s, want the live one", read(settingSMTPHost), read(settingSMTPPassword))
+	}
+	if read(settingAIBaseURL) != "https://ai.then.invalid" || read(settingAIKey) != "" {
+		t.Fatalf("a route the live server lacks: %s / %q, want the address kept and the key cleared", read(settingAIBaseURL), read(settingAIKey))
+	}
+	if _, cleared, err := loader.CarryOutboundSettings(ctx, into, ""); err != nil || read(settingSMTPPassword) != "" || read(settingEmailEnabled) != settingOff ||
+		!slices.Contains(cleared, "mail (SMTP)") {
+		t.Fatalf("carrying none (%v): password %q, enabled %q, cleared %v; want it cleared and off", err, read(settingSMTPPassword), read(settingEmailEnabled), cleared)
+	}
+}
+
+// checkInterruptedWork: after a full restore nothing the backup had queued
+// or running runs by itself. A storage transition queued when the backup
+// was taken, and canceled on the live server since, ends canceled, its
+// staged target is not revived, and a finished job stays as it was.
+func checkInterruptedWork(t *testing.T, loader PGLoader, pool *pgxpool.Pool, dsn, into string, restored *pgxpool.Pool, userID int64) {
+	t.Helper()
+	ctx := t.Context()
+	var queued, done string
+	for status, id := range map[string]*string{"queued": &queued, "completed": &done} {
+		if err := restored.QueryRow(ctx, `INSERT INTO admin_jobs (id, job_type, status, created_by_user_id, requested_at, updated_at)
+			VALUES (gen_random_uuid()::text, 'storage_transition', $1, $2, now(), now()) RETURNING id`, status, userID).Scan(id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := restored.Exec(ctx, `INSERT INTO server_settings (key, value) VALUES ($1, 'staged-elsewhere')
+		ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`, config.StorageTransitionTargetKey); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `DELETE FROM server_settings WHERE key = $1`, config.StorageTransitionTargetKey); err != nil {
+		t.Fatal(err)
+	}
+	// The search engine's index as the backup knew it.
+	if _, err := restored.Exec(ctx, `INSERT INTO catalog_search_index_state (provider, active_index_uid, schema_version, updated_at)
+		VALUES ('meilisearch', 'silo_catalog_then', 1, now()) ON CONFLICT (provider) DO UPDATE SET active_index_uid = EXCLUDED.active_index_uid`); err != nil {
+		t.Fatal(err)
+	}
+	changed, err := loader.InterruptWork(ctx, into, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	status := func(id string) (s string) {
+		t.Helper()
+		if err := restored.QueryRow(ctx, `SELECT status FROM admin_jobs WHERE id = $1`, id).Scan(&s); err != nil {
+			t.Fatal(err)
+		}
+		return s
+	}
+	var staged, indexes int
+	if err := restored.QueryRow(ctx, `SELECT count(*) FROM server_settings WHERE key = $1`, config.StorageTransitionTargetKey).Scan(&staged); err != nil {
+		t.Fatal(err)
+	}
+	if err := restored.QueryRow(ctx, `SELECT count(*) FROM catalog_search_index_state`).Scan(&indexes); err != nil || indexes != 0 {
+		t.Fatalf("search index state %d (%v), want none so the index is rebuilt", indexes, err)
+	}
+	if status(queued) != adminjob.StatusCancelled || status(done) != adminjob.StatusCompleted || staged != 0 || len(changed) == 0 {
+		t.Fatalf("queued job %s, finished job %s, staged targets %d, changed %v; want it ended, history kept, no target",
+			status(queued), status(done), staged, changed)
+	}
+}
+
+// checkOutboundConnections: what this server presents to outside services
+// never comes back from the backup. A watch-provider connection removed
+// since the backup stays removed; a history import source keeps the
+// backup's row but takes the live address and token, and one the live
+// server no longer has comes back with its token cleared and turned off.
+func checkOutboundConnections(t *testing.T, loader PGLoader, pool *pgxpool.Pool, dsn, into string, restored *pgxpool.Pool, userID int64) {
+	t.Helper()
+	ctx := t.Context()
+	var profile string
+	if err := restored.QueryRow(ctx, `SELECT id FROM user_profiles WHERE user_id = $1 LIMIT 1`, userID).Scan(&profile); err != nil {
+		t.Fatal(err)
+	}
+	var connection string
+	if err := restored.QueryRow(ctx, `INSERT INTO watch_provider_connections (provider, user_id, profile_id, access_token, scrobble_enabled)
+		VALUES ('trakt', $1, $2, 'removed-since', true) RETURNING id::text`, userID, profile).Scan(&connection); err != nil {
+		t.Fatal(err)
+	}
+	base, err := strconv.ParseUint(randomHex(t, 2), 16, 32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	kept, gone := 900_000_000+int(base), 900_100_000+int(base)
+	source := func(db *pgxpool.Pool, id int, url, token string) {
+		t.Helper()
+		if _, err := db.Exec(ctx, `INSERT INTO history_import_sources (id, name, source_type, base_url, admin_token, enabled)
+			VALUES ($1, 'Source', 'jellyfin', $2, $3, true)`, id, url, token); err != nil {
+			t.Fatal(err)
+		}
+	}
+	source(pool, kept, "https://now.invalid", "live-token")
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), `DELETE FROM history_import_sources WHERE id = $1`, kept)
+	})
+	source(restored, kept, "https://then.invalid", "backup-token")
+	source(restored, gone, "https://gone.invalid", "gone-token")
+	carried, err := loader.CarryCredentials(ctx, into, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var left int
+	if err := restored.QueryRow(ctx, `SELECT count(*) FROM watch_provider_connections WHERE id::text = $1`, connection).Scan(&left); err != nil || left != 0 {
+		t.Fatalf("a watch-provider connection removed since the backup: %d rows (%v), want none", left, err)
+	}
+	read := func(id int) (url, token string, enabled bool) {
+		t.Helper()
+		if err := restored.QueryRow(ctx, `SELECT base_url, coalesce(admin_token, ''), enabled FROM history_import_sources WHERE id = $1`, id).Scan(&url, &token, &enabled); err != nil {
+			t.Fatal(err)
+		}
+		return url, token, enabled
+	}
+	if url, token, enabled := read(kept); url != "https://now.invalid" || token != "live-token" || !enabled {
+		t.Fatalf("a source both have = %s %s %v, want the live address and token", url, token, enabled)
+	}
+	if _, token, enabled := read(gone); token != "" || enabled || !slices.ContainsFunc(carried.Cleared, func(s string) bool { return strings.HasPrefix(s, fmt.Sprintf("history import source %d", gone)) }) {
+		t.Fatalf("a source only the backup has: token %q, enabled %v, cleared %v; want it cleared, off, and reported", token, enabled, carried.Cleared)
+	}
+}
+
+// checkCarryAutoProvision: a sign-in provider that creates accounts is
+// carried with account creation off, and reported, when an account it
+// creates would get more under the backup's default group than here; it
+// keeps creating them under the same policy.
+func checkCarryAutoProvision(t *testing.T, loader PGLoader, pool *pgxpool.Pool, dsn, into string, restored *pgxpool.Pool) {
+	t.Helper()
+	ctx := t.Context()
+	var installation, binding int64
+	if err := pool.QueryRow(ctx, `INSERT INTO plugin_installations (plugin_id, version, install_path, enabled) VALUES ('provisioning-sso', '1.0.0', '/plugins/x', true) RETURNING id`).Scan(&installation); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), `DELETE FROM plugin_installations WHERE id = $1`, installation)
+	})
+	if _, err := restored.Exec(ctx, `INSERT INTO plugin_installations (id, plugin_id, version, install_path, enabled) VALUES ($1, 'provisioning-sso', '1.0.0', '/plugins/x', true)`, installation); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `INSERT INTO plugin_auth_bindings (plugin_installation_id, capability_id, auto_provision) VALUES ($1, 'oidc', true) RETURNING id`, installation).Scan(&binding); err != nil {
+		t.Fatal(err)
+	}
+	var allowed bool
+	if err := pool.QueryRow(ctx, `SELECT download_allowed FROM access_groups WHERE is_default`).Scan(&allowed); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), `UPDATE access_groups SET download_allowed = $1 WHERE is_default`, allowed)
+	})
+	for db, allow := range map[*pgxpool.Pool]bool{pool: false, restored: true} {
+		if _, err := db.Exec(ctx, `UPDATE access_groups SET download_allowed = $1 WHERE is_default`, allow); err != nil {
+			t.Fatal(err)
+		}
+	}
+	provisions := func() bool {
+		t.Helper()
+		var on bool
+		if err := restored.QueryRow(ctx, `SELECT auto_provision FROM plugin_auth_bindings WHERE id = $1`, binding).Scan(&on); err != nil {
+			t.Fatal(err)
+		}
+		return on
+	}
+	limited := func(c CarriedCredentials) bool {
+		return slices.ContainsFunc(c.Limited, func(s string) bool { return strings.HasPrefix(s, fmt.Sprintf("sign-in provider %d (oidc)", binding)) })
+	}
+	carried, err := loader.CarryCredentials(ctx, into, dsn)
+	if err != nil || !limited(carried) || provisions() {
+		t.Fatalf("carried %+v (%v), provisions %v; want the provider kept with account creation off", carried, err, provisions())
+	}
+	if _, err := restored.Exec(ctx, `UPDATE access_groups SET download_allowed = false WHERE is_default`); err != nil {
+		t.Fatal(err)
+	}
+	if carried, err = loader.CarryCredentials(ctx, into, dsn); err != nil || limited(carried) || !provisions() {
+		t.Fatalf("carried %+v (%v), provisions %v; want account creation kept under the same policy", carried, err, provisions())
+	}
+}
+
 // checkCarryInvitation: a pending invitation is dropped when the account it
 // would create gets more under the restored data than live (its default
 // group allowed downloads in the backup and does not now), and kept when
@@ -691,6 +1093,58 @@ func checkCarryAuthority(t *testing.T, loader PGLoader, pool *pgxpool.Pool, dsn,
 	if slices.Contains(carried.Dropped, demoted) || carried.Kept["api_keys"] != liveKeys-1 {
 		t.Fatalf("carried %+v, want the key of an account with the same policy kept", carried)
 	}
+	// Blocked from requesting here, and unlimited with automatic approval
+	// in the backup: its key could request titles that approve
+	// themselves, so it is dropped.
+	exec := func(db *pgxpool.Pool, sql string, args ...any) {
+		t.Helper()
+		if _, err := db.Exec(ctx, sql, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	exec(pool, `INSERT INTO request_user_limits (user_id, limit_mode, approval_mode) VALUES ($1, 'blocked', 'inherit')
+		ON CONFLICT (user_id) DO UPDATE SET limit_mode = 'blocked', approval_mode = 'inherit'`, userID)
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), `DELETE FROM request_user_limits WHERE user_id = $1`, userID)
+	})
+	exec(restored, `INSERT INTO request_settings (id, requests_enabled) VALUES (true, true) ON CONFLICT (id) DO UPDATE SET requests_enabled = true`)
+	exec(restored, `INSERT INTO request_user_limits (user_id, limit_mode, approval_mode) VALUES ($1, 'unlimited', 'auto')
+		ON CONFLICT (user_id) DO UPDATE SET limit_mode = 'unlimited', approval_mode = 'auto'`, userID)
+	if carried, err = loader.CarryCredentials(ctx, into, dsn); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Contains(carried.Dropped, demoted) {
+		t.Fatalf("carried %+v, want the key of an account the backup lets request more dropped", carried)
+	}
+	// The same request limits on both sides again keep the key; then its
+	// primary profile has a PIN here and none in the backup, so whoever
+	// holds the key could manage the household without the PIN: dropped,
+	// until the backup's profile has a PIN too.
+	exec(restored, `UPDATE request_user_limits SET limit_mode = 'blocked', approval_mode = 'inherit' WHERE user_id = $1`, userID)
+	keptAs := func(want bool, why string) {
+		t.Helper()
+		if carried, err = loader.CarryCredentials(ctx, into, dsn); err != nil {
+			t.Fatal(err)
+		}
+		if slices.Contains(carried.Dropped, demoted) == want {
+			t.Fatalf("carried %+v: %s", carried, why)
+		}
+	}
+	keptAs(true, "want the key kept under the same request limits")
+	var profile string
+	var pin string
+	var primary bool
+	if err := pool.QueryRow(ctx, `SELECT id, pin_hash, is_primary FROM user_profiles WHERE user_id = $1 ORDER BY id LIMIT 1`, userID).Scan(&profile, &pin, &primary); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), `UPDATE user_profiles SET pin_hash = $2, is_primary = $3 WHERE id = $1`, profile, pin, primary)
+	})
+	exec(pool, `UPDATE user_profiles SET pin_hash = 'live-pin', is_primary = true WHERE id = $1`, profile)
+	exec(restored, `UPDATE user_profiles SET pin_hash = '', is_primary = true WHERE id = $1`, profile)
+	keptAs(false, "want the key dropped: the backup's primary profile has no PIN")
+	exec(restored, `UPDATE user_profiles SET pin_hash = 'backup-pin' WHERE id = $1`, profile)
+	keptAs(true, "want the key kept: both primary profiles have a PIN")
 }
 
 // checkAnotherKey: a backup taken with another SECRET_KEY restores only
@@ -711,7 +1165,7 @@ func checkAnotherKey(t *testing.T, src *Source, loader PGLoader, pool *pgxpool.P
 	into := createDatabase(t, pool, dsn)
 	var out strings.Builder
 	if _, err := RestoreSeparate(ctx, src, loader, SeparateOptions{
-		Validate: ValidateOptions{KeyCheck: "0000-0000-0000-0000", AcceptLostCredentials: true}, Cipher: other,
+		Validate: ValidateOptions{KeyCheck: "0000-0000-0000-0000", AcceptLostCredentials: true, AcceptSuperuser: true}, Cipher: other,
 		Into: into, DatabaseOnly: true, Out: &out,
 	}); err != nil {
 		t.Fatal(err)
@@ -766,6 +1220,9 @@ func TestEveryTableIsClassifiedDB(t *testing.T) {
 	for _, name := range loggedTables {
 		add("loggedTables", name)
 	}
+	for _, name := range liveTables {
+		add("liveTables", name)
+	}
 	for _, name := range restoredDataTables {
 		add("restoredDataTables", name)
 	}
@@ -791,8 +1248,10 @@ func TestEveryTableIsClassifiedDB(t *testing.T) {
 	for _, name := range restoredDataTables {
 		restoredAsBackedUp[name] = true
 	}
-	for _, table := range secretTablesHandled(secretRestored) {
-		restoredAsBackedUp[table.name] = true
+	for _, h := range []secretHandling{secretRestored, secretScrubbed} {
+		for _, table := range secretTablesHandled(h) {
+			restoredAsBackedUp[table.name] = true
+		}
 	}
 	for _, f := range stricterFlags {
 		var boolean bool
@@ -1054,4 +1513,167 @@ func openTestSource(t *testing.T, dir string) *Source {
 	}
 	t.Cleanup(func() { _ = src.Close() })
 	return src
+}
+
+// TestServerSpecificSettingsComeFromTheLiveServerDB: after a full restore
+// every server-specific setting is the live server's, whatever the backup
+// held, and one the live server does not have is gone so its default
+// applies; signing keys keep the values the restore rotated in. Each
+// setting of the classification is checked, on databases of their own.
+func TestServerSpecificSettingsComeFromTheLiveServerDB(t *testing.T) {
+	pool, dsn := backuptest.Database(t)
+	ctx := t.Context()
+	open := func() (*pgxpool.Pool, string) {
+		url := createDatabase(t, pool, dsn)
+		db, err := pgxpool.New(ctx, url)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(db.Close)
+		if _, err := db.Exec(ctx, `CREATE TABLE server_settings (key text PRIMARY KEY, value text NOT NULL)`); err != nil {
+			t.Fatal(err)
+		}
+		return db, url
+	}
+	live, liveURL := open()
+	restored, restoredURL := open()
+	var keys []string
+	for _, key := range settingRegistry() {
+		if kind, _ := SettingKindOf(key); kind == SettingKindServerSpecific && !slices.Contains(keys, key) {
+			keys = append(keys, key)
+		}
+	}
+	if len(keys) < 10 {
+		t.Fatalf("only %d server-specific settings registered", len(keys))
+	}
+	for i, key := range keys {
+		if _, err := restored.Exec(ctx, `INSERT INTO server_settings VALUES ($1, 'backup')`, key); err != nil {
+			t.Fatal(err)
+		}
+		if i%2 == 0 {
+			if _, err := live.Exec(ctx, `INSERT INTO server_settings VALUES ($1, 'live')`, key); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if _, err := (PGLoader{}).CarryServerSpecificSettings(ctx, restoredURL, liveURL); err != nil {
+		t.Fatal(err)
+	}
+	for i, key := range keys {
+		var got *string
+		if err := restored.QueryRow(ctx, `SELECT value FROM server_settings WHERE key = $1`, key).Scan(&got); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			t.Fatal(err)
+		}
+		_, rotated := rotatedSettings[key]
+		switch {
+		case rotated:
+			if got == nil || *got != "backup" {
+				t.Errorf("%s = %v, want the restore's own value kept", key, got)
+			}
+		case i%2 == 0 && (got == nil || *got != "live"):
+			t.Errorf("%s = %v, want the live value", key, got)
+		case i%2 == 1 && got != nil:
+			t.Errorf("%s = %q, want it gone: the live server has none", key, *got)
+		}
+	}
+}
+
+// TestControlConnectionIsNeverOnTheLiveDatabaseDB: a deployment whose live
+// database is named postgres gets its control connection on template1,
+// since a swap renames the live database.
+func TestControlConnectionIsNeverOnTheLiveDatabaseDB(t *testing.T) {
+	_, dsn := backuptest.Database(t)
+	ctx := t.Context()
+	for live, want := range map[string]string{maintenancePostgres: "template1", "silo": maintenancePostgres} {
+		url, err := WithDatabase(dsn, live)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctl, err := ConnectControl(ctx, url)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var on string
+		err = ctl.Conn.QueryRow(ctx, `SELECT current_database()`).Scan(&on)
+		_ = ctl.Close(context.Background())
+		if err != nil || on != want || ctl.Like != live {
+			t.Fatalf("live %s: control on %q (%v), like %q; want %s", live, on, err, ctl.Like, want)
+		}
+	}
+}
+
+// TestCustomPoliciesComeFromTheLiveServerDB: a full restore runs the live
+// server's custom access policies, as one unit: a newer policy and its
+// running version replace the backup's. With no live policy, the backup's
+// come back turned off and are reported. Each side is a database of its
+// own.
+func TestCustomPoliciesComeFromTheLiveServerDB(t *testing.T) {
+	pool, dsn := backuptest.Database(t)
+	ctx := t.Context()
+	open := func() (*pgxpool.Pool, string) {
+		url := createDatabase(t, pool, dsn)
+		db, err := pgxpool.New(ctx, url)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(db.Close)
+		for _, sql := range []string{
+			`CREATE TABLE users (id integer PRIMARY KEY)`,
+			`CREATE TABLE policy_documents (id bigserial PRIMARY KEY, domain text NOT NULL, name text NOT NULL, enabled boolean NOT NULL DEFAULT false,
+				active_version_id bigint, created_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now(), revision bigint NOT NULL DEFAULT 1)`,
+			`CREATE TABLE policy_document_versions (id bigserial PRIMARY KEY, document_id bigint NOT NULL REFERENCES policy_documents(id) ON DELETE CASCADE,
+				version_number integer NOT NULL, rego_source text NOT NULL, source_sha256 text NOT NULL, compiled_ok boolean NOT NULL, compile_error text,
+				created_by_user_id integer REFERENCES users(id) ON DELETE SET NULL, comment text, created_at timestamptz NOT NULL DEFAULT now())`,
+			`ALTER TABLE policy_documents ADD FOREIGN KEY (active_version_id) REFERENCES policy_document_versions(id) ON DELETE SET NULL`,
+		} {
+			if _, err := db.Exec(ctx, sql); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return db, url
+	}
+	policy := func(db *pgxpool.Pool, version int, author *int) {
+		t.Helper()
+		var doc, ver int64
+		if err := db.QueryRow(ctx, `INSERT INTO policy_documents (domain, name, enabled) VALUES ('playback', 'house rules', true) RETURNING id`).Scan(&doc); err != nil {
+			t.Fatal(err)
+		}
+		if author != nil {
+			if _, err := db.Exec(ctx, `INSERT INTO users (id) VALUES ($1) ON CONFLICT DO NOTHING`, *author); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := db.QueryRow(ctx, `INSERT INTO policy_document_versions (document_id, version_number, rego_source, source_sha256, compiled_ok, created_by_user_id)
+			VALUES ($1, $2, 'package x', 'sha', true, $3) RETURNING id`, doc, version, author).Scan(&ver); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Exec(ctx, `UPDATE policy_documents SET active_version_id = $2 WHERE id = $1`, doc, ver); err != nil {
+			t.Fatal(err)
+		}
+	}
+	live, liveURL := open()
+	restored, restoredURL := open()
+	author := 42
+	policy(restored, 1, nil)
+	policy(live, 2, &author) // the live author is not in the restored data
+	if _, err := (PGLoader{}).CarryPolicies(ctx, restoredURL, liveURL); err != nil {
+		t.Fatal(err)
+	}
+	var running int
+	var by *int
+	if err := restored.QueryRow(ctx, `SELECT v.version_number, v.created_by_user_id FROM policy_documents d JOIN policy_document_versions v ON v.id = d.active_version_id
+		WHERE d.enabled`).Scan(&running, &by); err != nil || running != 2 || by != nil {
+		t.Fatalf("the restored database runs version %d by %v (%v), want the live version 2 without its absent author", running, by, err)
+	}
+	if _, err := live.Exec(ctx, `DELETE FROM policy_documents`); err != nil {
+		t.Fatal(err)
+	}
+	off, err := (PGLoader{}).CarryPolicies(ctx, restoredURL, liveURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var enabled int
+	if err := restored.QueryRow(ctx, `SELECT count(*) FROM policy_documents WHERE enabled`).Scan(&enabled); err != nil || enabled != 0 || len(off) != 1 {
+		t.Fatalf("with no live policy: %d enabled (%v), reported %v; want the backup's off and reported", enabled, err, off)
+	}
 }

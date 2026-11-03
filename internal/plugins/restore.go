@@ -62,6 +62,29 @@ var ErrRestoreUnavailable = errors.New("plugin restore is not available on this 
 // catalog, and restoring it again then applies its settings.
 var ErrPluginNotInstalled = errors.New("the plugin is not installed on this server; install it from a plugin catalog, then restore it again")
 
+// PrepareRestore reads the installed manifest of plugin pluginID on the
+// pool, before a restore opens its transaction, so RestoreInstallation finds
+// it in the archive cache rather than reading the stored archive inside the
+// transaction. A plugin not installed here needs nothing.
+func (s *Service) PrepareRestore(ctx context.Context, pluginID string) error {
+	store, ok := s.installations.(*InstallationStore)
+	if !ok {
+		return ErrRestoreUnavailable
+	}
+	existing, err := store.ListByPluginID(ctx, pluginID)
+	if err != nil {
+		return err
+	}
+	for _, inst := range existing {
+		if !inst.IsBuiltin() {
+			if _, err := s.readInstalledManifest(ctx, inst); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 // RestoreInstallation restores one installed plugin's configuration inside
 // the caller's transaction. It never installs a plugin: one missing here is
 // ErrPluginNotInstalled. The installation keeps its enabled state. At the
@@ -98,7 +121,9 @@ func (s *Service) RestoreInstallation(ctx context.Context, tx pgx.Tx, in Restore
 		return result, nil, ErrPluginNotInstalled
 	}
 	inst := installs[0]
-	_, manifest, err := s.loadForManifestRead(ctx, inst.ID, false)
+	// The installation and its manifest are read through the transaction:
+	// it may hold the pool's last connection.
+	manifest, err := s.readInstalledManifestFrom(ctx, inst, txStore)
 	if err != nil {
 		return result, nil, err
 	}

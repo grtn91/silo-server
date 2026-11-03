@@ -48,7 +48,12 @@ func (l PGLoader) Load(ctx context.Context, dbURL, dumpPath string) error {
 		return err
 	}
 	defer conn.Close()
-	cmd := exec.CommandContext(ctx, l.Tools.PgRestore, "--exit-on-error", "--no-owner", "--no-privileges", "--no-password", "--dbname="+conn.Conn, dumpPath) //nolint:gosec // G204: the discovered pg_restore with arguments built here, no shell
+	list, err := l.restoreList(ctx, dumpPath)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = os.Remove(list) }()
+	cmd := exec.CommandContext(ctx, l.Tools.PgRestore, "--exit-on-error", "--no-owner", "--no-privileges", "--no-password", "--use-list="+list, "--dbname="+conn.Conn, dumpPath) //nolint:gosec // G204: the discovered pg_restore with arguments built here, no shell
 	cmd.Env = append(os.Environ(), conn.Env...)
 	stderr := &limitedBuffer{limit: stderrLimit}
 	cmd.Stderr = stderr
@@ -56,6 +61,130 @@ func (l PGLoader) Load(ctx context.Context, dbURL, dumpPath string) error {
 		return fmt.Errorf("pg_restore failed: %w: %s", err, strings.TrimSpace(stderr.String()))
 	}
 	return nil
+}
+
+// restoreList writes the dump's table of contents, less the comments on
+// extensions, to a new file for pg_restore --use-list, and returns its
+// path. Only an extension's owner may comment on it, so a role that is not
+// a superuser loads a dump into a database where a superuser created the
+// extensions only without them; nothing reads them.
+func (l PGLoader) restoreList(ctx context.Context, dumpPath string) (string, error) {
+	toc, err := l.toc(ctx, dumpPath)
+	if err != nil {
+		return "", err
+	}
+	f, err := os.CreateTemp("", "silo-restore-list-*")
+	if err != nil {
+		return "", err
+	}
+	var kept strings.Builder
+	for line := range strings.Lines(toc) {
+		if !strings.Contains(line, " COMMENT - EXTENSION ") {
+			kept.WriteString(line)
+		}
+	}
+	_, err = f.WriteString(kept.String())
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		_ = os.Remove(f.Name())
+		return "", err
+	}
+	return f.Name(), nil
+}
+
+// toc is the dump's table of contents (pg_restore --list).
+func (l PGLoader) toc(ctx context.Context, dumpPath string) (string, error) {
+	cmd := exec.CommandContext(ctx, l.Tools.PgRestore, "--list", dumpPath) //nolint:gosec // G204: the discovered pg_restore with arguments built here, no shell
+	stderr := &limitedBuffer{limit: stderrLimit}
+	cmd.Stderr = stderr
+	out, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("pg_restore --list failed: %w: %s", err, strings.TrimSpace(stderr.String()))
+	}
+	return string(out), nil
+}
+
+// Extensions lists the extensions the dump creates: its "EXTENSION - <name>"
+// entries.
+func (l PGLoader) Extensions(ctx context.Context, dumpPath string) ([]string, error) {
+	toc, err := l.toc(ctx, dumpPath)
+	if err != nil {
+		return nil, err
+	}
+	var names []string
+	for line := range strings.Lines(toc) {
+		if _, rest, ok := strings.Cut(line, " EXTENSION - "); ok && !strings.HasPrefix(strings.TrimSpace(line), ";") {
+			if fields := strings.Fields(rest); len(fields) > 0 {
+				names = append(names, fields[0])
+			}
+		}
+	}
+	return names, nil
+}
+
+// ErrExtensionNeedsSuperuser refuses a swap whose role cannot create an
+// extension the backup needs in the new database.
+var ErrExtensionNeedsSuperuser = errors.New("the database role cannot create an extension the backup needs")
+
+func (c *PGControl) CheckExtensions(ctx context.Context, names []string) error {
+	if len(names) == 0 {
+		return nil
+	}
+	var super bool
+	if err := c.Conn.QueryRow(ctx, `SELECT rolsuper FROM pg_roles WHERE rolname = current_user`).Scan(&super); err != nil {
+		return err
+	}
+	rows, err := c.Conn.Query(ctx, `
+		SELECT n.name, a.name IS NOT NULL, coalesce(v.trusted, false)
+		FROM unnest($1::text[]) AS n(name)
+		LEFT JOIN pg_available_extensions a ON a.name = n.name
+		LEFT JOIN pg_available_extension_versions v ON v.name = a.name AND v.version = a.default_version
+		ORDER BY n.name`, names)
+	if err != nil {
+		return err
+	}
+	type extension struct {
+		name             string
+		available, trust bool
+	}
+	found, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (extension, error) {
+		var e extension
+		return e, row.Scan(&e.name, &e.available, &e.trust)
+	})
+	if err != nil {
+		return err
+	}
+	var missing, untrusted []string
+	for _, e := range found {
+		switch {
+		case !e.available:
+			missing = append(missing, e.name)
+		case !e.trust && !super:
+			untrusted = append(untrusted, e.name)
+		}
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("the backup needs the PostgreSQL extensions %s, which this PostgreSQL server does not have; install them first", strings.Join(missing, ", "))
+	}
+	if len(untrusted) > 0 {
+		return fmt.Errorf("%w: the restored database is new, and only a superuser can create %s in it. "+
+			"Run the restore with a DATABASE_URL role that is a superuser, or use separate mode (--into) into a database where a superuser created them",
+			ErrExtensionNeedsSuperuser, strings.Join(untrusted, ", "))
+	}
+	return nil
+}
+
+func (l PGLoader) Superuser(ctx context.Context, dbURL string) (bool, error) {
+	conn, err := pgx.Connect(ctx, dbURL)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = conn.Close(context.WithoutCancel(ctx)) }()
+	var super bool
+	err = conn.QueryRow(ctx, `SELECT rolsuper FROM pg_roles WHERE rolname = current_user`).Scan(&super)
+	return super, err
 }
 
 func (l PGLoader) ServerID(ctx context.Context, dbURL string) (string, error) {
@@ -177,22 +306,45 @@ type PGControl struct {
 	Like string
 }
 
-// ConnectControl opens the control connection to the maintenance database
-// ("postgres") of the server databaseURL points at.
+// maintenanceDatabases are the databases the control connection may use,
+// in order: never the live one, which the swap renames and closes.
+var maintenanceDatabases = []string{maintenancePostgres, "template1"}
+
+// maintenancePostgres is the default maintenance database.
+const maintenancePostgres = "postgres"
+
+// ConnectControl opens the control connection to a maintenance database of
+// the server databaseURL points at: the first of maintenanceDatabases that
+// is not the live database and that the role can connect to. A swap renames
+// the live database, which PostgreSQL refuses while this session is on it.
 func ConnectControl(ctx context.Context, databaseURL string) (*PGControl, error) {
 	live, err := databaseName(databaseURL)
 	if err != nil {
 		return nil, err
 	}
-	maintenance, err := WithDatabase(databaseURL, "postgres")
-	if err != nil {
-		return nil, err
+	var failures []error
+	for _, name := range maintenanceDatabases {
+		if name == live {
+			continue
+		}
+		maintenance, err := WithDatabase(databaseURL, name)
+		if err != nil {
+			return nil, err
+		}
+		conn, err := pgx.Connect(ctx, maintenance)
+		if err != nil {
+			failures = append(failures, fmt.Errorf("%s: %w", name, err))
+			continue
+		}
+		var on string
+		if err := conn.QueryRow(ctx, `SELECT current_database()`).Scan(&on); err != nil || on == live {
+			_ = conn.Close(context.WithoutCancel(ctx))
+			return nil, fmt.Errorf("the control connection reached %q, the live database: %w", on, err)
+		}
+		return &PGControl{Conn: conn, Like: live}, nil
 	}
-	conn, err := pgx.Connect(ctx, maintenance)
-	if err != nil {
-		return nil, fmt.Errorf("connecting to the maintenance database: %w", err)
-	}
-	return &PGControl{Conn: conn, Like: live}, nil
+	return nil, fmt.Errorf("a replace needs a maintenance database other than the live one (%s) that the role can connect to; "+
+		"grant it CONNECT on one, or use separate mode (--into): %w", strings.Join(maintenanceDatabases, " or "), errors.Join(failures...))
 }
 
 func ident(name string) string { return pgx.Identifier{name}.Sanitize() }

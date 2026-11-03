@@ -37,36 +37,58 @@ func CarriedCollections(docs map[string]json.RawMessage) map[string]Carried {
 	return out
 }
 
+// MapCarriedEach is MapCarried for each of ids, by id; an id it drops is
+// missing from the result.
+func MapCarriedEach(ctx context.Context, tx pgx.Tx, target userdata.Target, carried map[string]Carried, ids []string) (map[string]string, error) {
+	out := map[string]string{}
+	for _, id := range ids {
+		local, ok, err := MapCarried(ctx, tx, target, carried, id)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			out[id] = local
+		}
+	}
+	return out, nil
+}
+
 // MapCarried finds the personal collection here that a source collection
-// id names: on the server that wrote it, the same collection when the
-// account still has it; otherwise the one native collection with its name
-// of its creator's profile here, the collection an import of it creates or
-// merges into. false when there is none or several.
+// id names. A collection the document carries maps to the one native
+// collection with its name of its creator's profile here, the collection
+// its import created or merged into: for a profile import, the importing
+// profile's own copy, never the source profile's original. Otherwise, on
+// the server that wrote it, the same collection when the importing profile
+// can see it (its own, shared with it, or shared with the household).
+// false when there is none or several; the reference is then dropped.
 func MapCarried(ctx context.Context, tx pgx.Tx, target userdata.Target, carried map[string]Carried, id string) (string, bool, error) {
-	if target.SameServer {
-		var found string
-		err := tx.QueryRow(ctx, `SELECT id FROM user_personal_collections WHERE id = $1 AND user_id = $2`, id, target.UserID).Scan(&found)
-		if err == nil {
-			return found, true, nil
+	if c, ok := carried[id]; ok {
+		creator, mapped := target.ProfileID, true
+		if c.Profile != "" {
+			creator, mapped = target.MapProfile(c.Profile)
 		}
-		if !errors.Is(err, pgx.ErrNoRows) {
-			return "", false, fmt.Errorf("reading personal collections: %w", err)
+		if !mapped {
+			return "", false, nil
 		}
+		ids, err := collectionsNamed(ctx, tx, userdata.Owner{UserID: target.UserID, ProfileID: creator}, c.Name)
+		if err != nil || len(ids) != 1 {
+			return "", false, err
+		}
+		return ids[0], true, nil
 	}
-	c, ok := carried[id]
-	if !ok {
+	if !target.SameServer {
 		return "", false, nil
 	}
-	creator, ok := target.ProfileID, true
-	if c.Profile != "" {
-		creator, ok = target.MapProfile(c.Profile)
-	}
-	if !ok {
+	var found string
+	err := tx.QueryRow(ctx, `SELECT c.id FROM user_personal_collections c WHERE c.id = $1 AND c.user_id = $2
+		AND (c.creator_profile_id = $3 OR c.is_shared
+			OR EXISTS (SELECT 1 FROM user_personal_collection_profiles s WHERE s.collection_id = c.id AND s.profile_id = $3))`,
+		id, target.UserID, target.ProfileID).Scan(&found)
+	switch {
+	case err == nil:
+		return found, true, nil
+	case errors.Is(err, pgx.ErrNoRows):
 		return "", false, nil
 	}
-	ids, err := collectionsNamed(ctx, tx, userdata.Owner{UserID: target.UserID, ProfileID: creator}, c.Name)
-	if err != nil || len(ids) != 1 {
-		return "", false, err
-	}
-	return ids[0], true, nil
+	return "", false, fmt.Errorf("reading personal collections: %w", err)
 }

@@ -22,6 +22,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/Silo-Server/silo-server/internal/access"
+	"github.com/Silo-Server/silo-server/internal/backup/jsonsize"
 )
 
 // Data type ids. They name a profile's data in a restore set, a profile
@@ -133,13 +134,17 @@ type Target struct {
 	// here is that plugin's with the capability. Only consulted across
 	// servers.
 	PluginInstallation func(installationID int, capabilityID string) (int, bool)
-	// Collection maps a source collection id named in field
+	// Collections maps source collection ids named in field
 	// (LibraryCollectionField, an admin collection, or UserCollectionField,
-	// a personal one) to the collection here; false drops the reference.
-	// nil maps none.
-	Collection func(ctx context.Context, field, id string) (string, bool, error)
+	// a personal one) to the collections here, all at once; an id missing
+	// from the result is dropped. nil maps none.
+	Collections func(ctx context.Context, field string, ids []string) (map[string]string, error)
 	// Now stamps rows that need a time of their own.
 	Now time.Time
+	// Unverified marks a document from a backup this server cannot verify:
+	// nothing it names may make this server fetch from outside services on
+	// a schedule.
+	Unverified bool
 	// Untrusted marks a profile's own export, which whoever holds it could
 	// have edited. Its import must not write rows other accounts read, such
 	// as shared watchlist titles, from the document.
@@ -155,10 +160,18 @@ const (
 // MapCollection maps a source collection id, dropping it when no mapping
 // is set.
 func (t Target) MapCollection(ctx context.Context, field, id string) (string, bool, error) {
-	if t.Collection == nil {
-		return "", false, nil
+	mapped, err := t.MapCollections(ctx, field, []string{id})
+	local, ok := mapped[id]
+	return local, ok, err
+}
+
+// MapCollections maps source collection ids, by id; an id it drops is
+// missing from the result.
+func (t Target) MapCollections(ctx context.Context, field string, ids []string) (map[string]string, error) {
+	if t.Collections == nil || len(ids) == 0 {
+		return map[string]string{}, nil
 	}
-	return t.Collection(ctx, field, id)
+	return t.Collections(ctx, field, ids)
 }
 
 // MapPluginInstallation maps a source plugin installation, dropping it when
@@ -334,12 +347,23 @@ func PrepareAll(ctx context.Context, tx pgx.Tx, types []Type, docs map[string][]
 	return nil
 }
 
+// DecodedPerByte bounds what a document decodes to against its size
+// (DecodeStrict); a document Silo writes decodes to about its size.
+const DecodedPerByte = 8
+
 // MaxEntries bounds one data type's document.
 const MaxEntries = 500_000
 
 // DecodeStrict decodes one JSON value, refusing unknown fields and trailing
-// data: documents come from backups and uploads, which are untrusted.
+// data: documents come from backups and uploads, which are untrusted. A
+// document that would decode to more than DecodedPerByte times its size
+// plus 64 KiB, nest deeper than 32, or hold over a million elements in one
+// array or object is refused before it is decoded (jsonsize).
 func DecodeStrict(data []byte, into any) error {
+	limits := jsonsize.Limits{Depth: 32, Elements: 1_000_000, Bytes: DecodedPerByte*int64(len(data)) + 64<<10}
+	if _, err := jsonsize.Check(data, into, limits); err != nil {
+		return err
+	}
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(into); err != nil {
@@ -348,40 +372,7 @@ func DecodeStrict(data []byte, into any) error {
 	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
 		return errors.New("trailing data after the document")
 	}
-	return nil
-}
-
-// importBatchSize is how many inserts InsertEach sends in one round trip.
-const importBatchSize = 1000
-
-// InsertEach runs sql once per row of args in the caller's transaction,
-// importBatchSize statements to a round trip, and counts the rows it
-// inserted (an INSERT … ON CONFLICT DO NOTHING inserts none for a row
-// already there). An import's writes are then a few round trips, not one
-// per entry.
-func InsertEach(ctx context.Context, tx pgx.Tx, sql string, args [][]any) (inserted int, err error) {
-	for start := 0; start < len(args); start += importBatchSize {
-		chunk := args[start:min(start+importBatchSize, len(args))]
-		var batch pgx.Batch
-		for _, a := range chunk {
-			batch.Queue(sql, a...)
-		}
-		results := tx.SendBatch(ctx, &batch)
-		for range chunk {
-			tag, err := results.Exec()
-			if err != nil {
-				_ = results.Close()
-				return inserted, err
-			}
-			if tag.RowsAffected() > 0 {
-				inserted++
-			}
-		}
-		if err := results.Close(); err != nil {
-			return inserted, err
-		}
-	}
-	return inserted, nil
+	return CheckBounds(into)
 }
 
 // Distinct refuses an entry a document lists twice, by its key. Every

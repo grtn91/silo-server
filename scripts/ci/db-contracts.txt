@@ -774,6 +774,9 @@
 # could not be read, reports it so it is retried without a fallback chain.
 ./internal/backup TestBackupRestoreRoundTripDB
 ./internal/backup TestFullRestoresAreSerializedDB
+./internal/backup TestServerSpecificSettingsComeFromTheLiveServerDB
+./internal/backup TestControlConnectionIsNeverOnTheLiveDatabaseDB
+./internal/backup TestCustomPoliciesComeFromTheLiveServerDB
 ./internal/backup TestBackupWritesManifestLastDB
 ./internal/backup TestSubsystemLockSerializesBackupsAndDeletesDB
 ./internal/backup TestLostLockSessionCancelsWorkDB
@@ -787,9 +790,17 @@
 ./internal/backup TestRestoreNeverSendsLiveSecretsToARestoredAddressDB
 ./internal/backup TestTemplateCollectionsAndHomeSectionsDB
 ./internal/backup TestRestoredLibrarySectionsWaitForTheRestoreDB
+./internal/backup TestManagedSectionPointedElsewhereIsRestoredDB
+./internal/backup TestSelectiveRestoreOnOneConnectionDB
+./internal/backup TestUnverifiedRestoreLeavesCostlyWorkOffDB
+./internal/backup TestUnverifiedSectionCollectionHasNoScheduleDB
+./internal/backup TestRestoreRefusesCollectionSourcesTheEditorWouldDB
+./internal/backup TestManagedCollectionKeysMapLibrariesDB
+./internal/api/handlers TestRestoredRateLimitsUseTheirWritePathDB
 ./internal/backup TestIdentityTwinsRestoreOneToOneDB
 ./internal/backup TestLayoutCollectionsMapAcrossServersDB
 ./internal/plugins TestRestoreInstallationDB
+./internal/plugins TestRestoreInstallationOnOneConnectionDB
 ./internal/adminjob TestBackupRestoreFencingDB
 ./internal/catalog TestGroupingWaitsForTheEditorDB
 ./internal/api/handlers TestLibraryRestoredReportsFailedSetupDB
@@ -838,3 +849,11 @@
 ./internal/watchstate TestProgressMergeKeepsHeartbeatDB
 ./internal/watchstate TestPluginSourcedPlaysDB
 ./internal/usercollections TestCollectionImportRemapsLibrariesDB
+./internal/usercollections TestCarriedCollectionsMapToTheImportingProfileDB
+
+# Accounts and profile imports: one connection, and statements that do not grow with a document.
+./internal/backup TestAccountsAndImportOnOneConnectionDB
+./internal/backup TestImportsReadInBatchesDB
+./internal/historyimport TestMatchAllAgreesWithMatchDB
+./internal/backup TestCollectionImportKeepsTheProfileQuotaDB
+./internal/backup TestNewAccountNeedsItsPrimaryProfileDB

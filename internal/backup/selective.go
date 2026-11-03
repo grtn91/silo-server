@@ -82,6 +82,9 @@ const (
 	// outside services, which a backup this server cannot verify never
 	// restores.
 	ReasonUnverifiedBackup = "unverified_backup"
+	// ReasonOverRestoreBudget: the item's collection metadata would take
+	// one restore, or one library, past what a restore writes.
+	ReasonOverRestoreBudget = "over_restore_budget"
 )
 
 // Report outcomes.
@@ -190,6 +193,11 @@ var ErrTemplateNotAvailable = errors.New("this server's collection templates do 
 
 // PluginRestorer is the plugin write path a restore uses.
 type PluginRestorer interface {
+	// PrepareRestorePlugin reads what RestorePlugin needs from outside the
+	// database (the installed manifest, through the plugin archive cache)
+	// before the restore's transaction opens: that cache's lock is held by
+	// readers that wait on the pool.
+	PrepareRestorePlugin(ctx context.Context, pluginID string) error
 	RestorePlugin(ctx context.Context, tx pgx.Tx, in plugins.RestoreInstallationInput) (plugins.RestoreInstallationResult, func(context.Context), error)
 	DecodeStoredConfig(installationID int, key string, stored []byte) (map[string]any, error)
 }
@@ -388,7 +396,11 @@ func (s *Service) locateConfirmed(ctx context.Context, src restoreSource, accept
 // cachedSet is the located restore set as previews share it.
 func (s *Service) cachedSet(ctx context.Context, located locatedSource) (*RestoreSet, error) {
 	return s.restoreSets.get(ctx, located.digest, func(ctx context.Context) (*RestoreSet, error) {
-		return s.openRestoreSet(ctx, located, nil)
+		rs, err := s.openRestoreSet(ctx, located, nil)
+		if rs != nil {
+			rs.fromUnverified = !located.authenticated
+		}
+		return rs, err
 	})
 }
 

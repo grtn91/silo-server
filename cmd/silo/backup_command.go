@@ -27,21 +27,30 @@ import (
 )
 
 const backupCommandUsage = `usage:
-  silo backup restore --from <backup> [--database-only] [--accept-lost-credentials] [--keep-redis] [-env .env]
+  silo backup restore --from <backup> [--database-only] [--accept-lost-credentials] [--accept-superuser]
+                      [--keep-redis] [-env .env]
       Replace the live database (DATABASE_URL) and restore files into the live storage, then
       clear the Redis database Silo uses (FLUSHDB) unless --keep-redis.
-      Stop Silo on every server and turn off automatic restarts first.
+      Stop Silo on every server and turn off automatic restarts first. Accounts, roles, and
+      passwords go back to the backup's; before the swap it names the accounts that change.
   silo backup restore --from <backup> --into <database URL> (--blobs-into <dir> | --database-only)
-                      [--accept-lost-credentials] [-env .env]
+                      [--accept-lost-credentials] [--accept-superuser] [-env .env]
       Restore into a new, empty database and a separate location; nothing live changes.
   silo backup restore --recover <time> [-env .env]
       Finish a replace that stopped, from silo-restore-<time>.journal in this directory.
-  silo backup verify --from <backup> --scratch <database URL> [-env .env]
+  silo backup verify --from <backup> --scratch <database URL> [--accept-lost-credentials]
+                     [--accept-superuser] [-env .env]
       Restore into an empty scratch database and check it against the manifest.
   A --into or --scratch URL must not carry a password: set PGPASSWORD, or use ~/.pgpass.
+  Connect --into and --scratch as a role that is not a superuser and owns only that database.
+  A backup this SECRET_KEY cannot authenticate needs --accept-lost-credentials, and is never
+  loaded as a superuser (including the replace's DATABASE_URL role) without --accept-superuser.
 
 <backup> is a backup folder on this computer: the folder at the backup destination, or a
 downloaded copy of its objects`
+
+// acceptSuperuserUsage describes --accept-superuser.
+const acceptSuperuserUsage = "load a backup this SECRET_KEY cannot authenticate as a PostgreSQL superuser"
 
 // The `silo backup` subcommands.
 const (
@@ -108,7 +117,7 @@ func runBackupCommand(ctx context.Context, args []string, out io.Writer) error {
 type backupRestoreFlags struct {
 	envFile, from, into, blobsInto, recoverTime string
 	databaseOnly, acceptLostCredentials         bool
-	keepRedis                                   bool
+	keepRedis, acceptSuperuser                  bool
 }
 
 func parseBackupRestoreFlags(args []string) (backupRestoreFlags, error) {
@@ -122,13 +131,14 @@ func parseBackupRestoreFlags(args []string) (backupRestoreFlags, error) {
 	flags.BoolVar(&f.databaseOnly, "database-only", false, "skip files")
 	flags.BoolVar(&f.acceptLostCredentials, "accept-lost-credentials", false, "restore a backup taken with another SECRET_KEY; the encrypted settings this key cannot read are cleared and listed")
 	flags.BoolVar(&f.keepRedis, "keep-redis", false, "leave Redis as it is after a replace")
+	flags.BoolVar(&f.acceptSuperuser, "accept-superuser", false, acceptSuperuserUsage)
 	flags.StringVar(&f.recoverTime, "recover", "", "finish an interrupted replace from its journal")
 	if err := flags.Parse(args); err != nil || flags.NArg() != 0 {
 		return f, errors.New(backupCommandUsage)
 	}
 	switch {
 	case f.recoverTime != "":
-		if f.from != "" || f.into != "" || f.blobsInto != "" || f.databaseOnly || f.acceptLostCredentials || f.keepRedis {
+		if f.from != "" || f.into != "" || f.blobsInto != "" || f.databaseOnly || f.acceptLostCredentials || f.keepRedis || f.acceptSuperuser {
 			return f, errors.New("--recover takes no other options\n" + backupCommandUsage)
 		}
 	case f.from == "":
@@ -183,6 +193,7 @@ func runBackupRestore(ctx context.Context, args []string, out io.Writer) error {
 	if err != nil {
 		return err
 	}
+	validate.AcceptSuperuser = f.acceptSuperuser
 	// Validation copies the objects it checks to a private directory and
 	// every step reads those; they go when the command ends, failed or not.
 	// A restore that went ahead stays a success when they cannot be removed.
@@ -340,6 +351,8 @@ func runBackupVerify(ctx context.Context, args []string, out io.Writer) error {
 	envFile := flags.String("env", ".env", "path to .env file")
 	from := flags.String("from", "", "backup folder")
 	scratch := flags.String("scratch", "", "empty scratch database URL")
+	acceptLostCredentials := flags.Bool("accept-lost-credentials", false, "verify a backup this SECRET_KEY cannot authenticate")
+	acceptSuperuser := flags.Bool("accept-superuser", false, acceptSuperuserUsage)
 	if err := flags.Parse(args); err != nil || flags.NArg() != 0 || *from == "" || *scratch == "" {
 		return errors.New(backupCommandUsage)
 	}
@@ -353,10 +366,11 @@ func runBackupVerify(ctx context.Context, args []string, out io.Writer) error {
 	if err != nil {
 		return err
 	}
-	src, tools, validate, err := openBackupSource(ctx, *from, masterKey, keyCheck, true)
+	src, tools, validate, err := openBackupSource(ctx, *from, masterKey, keyCheck, *acceptLostCredentials)
 	if err != nil {
 		return err
 	}
+	validate.AcceptSuperuser = *acceptSuperuser
 	verified := backup.VerifyBackup(ctx, src, backup.PGLoader{Tools: tools}, *scratch, validate, out)
 	return errors.Join(verified, closeSource(src, out))
 }

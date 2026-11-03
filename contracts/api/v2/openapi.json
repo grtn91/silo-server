@@ -4253,7 +4253,9 @@
               "files_missing_here",
               "needs_install",
               "kept_stricter",
-              "unverified_backup"
+              "unverified_backup",
+              "over_restore_budget",
+              "needs_primary_profile"
             ],
             "type": "string"
           },
@@ -4771,7 +4773,9 @@
               "files_missing_here",
               "needs_install",
               "kept_stricter",
-              "unverified_backup"
+              "unverified_backup",
+              "over_restore_budget",
+              "needs_primary_profile"
             ],
             "type": "string"
           },

@@ -19,8 +19,8 @@ import (
 // taking no lock: profile columns, settings, and track, library, series,
 // and collection sort preferences that are not here or differ, and page
 // layouts whose overrides here differ.
-func (PreferencesBackupData) Pending(ctx context.Context, tx pgx.Tx, target userdata.Target, data json.RawMessage) (userdata.Result, error) {
-	doc, sum, err := decodePreferences(data)
+func (d PreferencesBackupData) Pending(ctx context.Context, tx pgx.Tx, target userdata.Target, data json.RawMessage) (userdata.Result, error) {
+	doc, sum, err := d.decode(data)
 	if err != nil {
 		return userdata.Result{}, err
 	}
@@ -93,100 +93,40 @@ func (PreferencesBackupData) Pending(ctx context.Context, tx pgx.Tx, target user
 	return res, nil
 }
 
-// comparePending reads whether a row exists and whether its values differ
-// from the backup's (sql returns one row of differs, or none), and counts
-// what an upsert guarded by "values differ" would do.
-func comparePending(ctx context.Context, tx pgx.Tx, res *userdata.Result, sql string, args ...any) error {
-	var differs bool
-	err := tx.QueryRow(ctx, sql, args...).Scan(&differs)
-	switch {
-	case errors.Is(err, pgx.ErrNoRows):
-		res.Added++
-	case err != nil:
+func pendingTrackPreferences(ctx context.Context, tx pgx.Tx, target userdata.Target, doc preferencesDocument, res *userdata.Result) error {
+	if err := pendingAudioPreferences(ctx, tx, target, doc.Audio, res); err != nil {
 		return err
-	case differs:
-		res.Updated++
-	default:
-		res.Unchanged++
 	}
-	return nil
+	if err := pendingSubtitlePreferences(ctx, tx, target, doc.Subtitles, res); err != nil {
+		return err
+	}
+	if err := pendingLibraryPreferences(ctx, tx, target, doc.LibraryPlayback, res); err != nil {
+		return err
+	}
+	if err := pendingSeriesPreferences(ctx, tx, target, doc.SeriesPlayback, res); err != nil {
+		return err
+	}
+	return pendingCollectionSorts(ctx, tx, target, doc.CollectionSort, res)
 }
 
-func pendingTrackPreferences(ctx context.Context, tx pgx.Tx, target userdata.Target, doc preferencesDocument, res *userdata.Result) error {
-	for _, a := range doc.Audio {
-		series, ok, err := resolveSeries(ctx, target, a.Series, res)
-		if err != nil {
-			return err
-		}
-		if !ok {
-			continue
-		}
-		if err := comparePending(ctx, tx, res, `
-			SELECT (audio_track_index, audio_language, audio_track_signature) IS DISTINCT FROM ($4, $5, $6::jsonb)
-			FROM user_audio_preferences WHERE user_id = $1 AND profile_id = $2 AND series_id = $3`,
-			target.UserID, target.ProfileID, series, a.TrackIndex, a.Language, trackSignature(a.Signature)); err != nil {
-			return fmt.Errorf("comparing an audio preference: %w", err)
-		}
+// pendingCollectionSorts compares the sorts with this profile's in one read.
+func pendingCollectionSorts(ctx context.Context, tx pgx.Tx, target userdata.Target, entries []collectionSort, res *userdata.Result) error {
+	rows, err := localSorts(ctx, target, entries, res)
+	if err != nil {
+		return err
 	}
-	for _, s := range doc.Subtitles {
-		series, ok, err := resolveSeries(ctx, target, s.Series, res)
-		if err != nil {
-			return err
-		}
-		if !ok {
-			continue
-		}
-		if err := comparePending(ctx, tx, res, `
-			SELECT (subtitle_language, subtitle_track_index, external_subtitle_path, subtitle_mode, show_forced_subtitles, subtitle_track_signature)
-				IS DISTINCT FROM ($4, $5, $6, $7, $8, $9::jsonb)
-			FROM user_subtitle_preferences WHERE user_id = $1 AND profile_id = $2 AND series_id = $3`,
-			target.UserID, target.ProfileID, series, s.Language, s.TrackIndex, s.localPath(target), s.Mode, s.ShowForcedSubtitles, trackSignature(s.Signature)); err != nil {
-			return fmt.Errorf("comparing a subtitle preference: %w", err)
-		}
+	kinds, collections, fields, orders := make([]string, len(rows)), make([]string, len(rows)), make([]string, len(rows)), make([]string, len(rows))
+	for i, c := range rows {
+		kinds[i], collections[i], fields[i], orders[i] = c.Kind, c.Collection, c.Field, c.Order
 	}
-	for _, l := range doc.LibraryPlayback {
-		library, ok := target.MapLibrary(l.Library)
-		if !ok {
-			res.LeftOut++
-			continue
-		}
-		if err := comparePending(ctx, tx, res, `
-			SELECT (audio_language, subtitle_language, subtitle_mode, show_forced_subtitles) IS DISTINCT FROM ($4, $5, $6, $7)
-			FROM user_library_playback_preferences WHERE user_id = $1 AND profile_id = $2 AND library_id = $3`,
-			target.UserID, target.ProfileID, library, l.AudioLanguage, l.SubtitleLanguage, l.SubtitleMode, l.ShowForcedSubtitles); err != nil {
-			return fmt.Errorf("comparing a library playback preference: %w", err)
-		}
-	}
-	for _, sp := range doc.SeriesPlayback {
-		series, ok, err := resolveSeries(ctx, target, sp.Series, res)
-		if err != nil {
-			return err
-		}
-		if !ok {
-			continue
-		}
-		if err := comparePending(ctx, tx, res, `
-			SELECT (resolution, hdr, codec_video, file_id, edition_key) IS DISTINCT FROM ($4, $5, $6, $7, $8)
-			FROM user_series_playback_preferences WHERE user_id = $1 AND profile_id = $2 AND series_id = $3`,
-			target.UserID, target.ProfileID, series, sp.Resolution, sp.HDR, sp.CodecVideo, sp.localFileID(target), sp.EditionKey); err != nil {
-			return fmt.Errorf("comparing a series playback preference: %w", err)
-		}
-	}
-	for _, c := range doc.CollectionSort {
-		collection, ok, err := c.localCollection(ctx, target)
-		if err != nil {
-			return err
-		}
-		if !ok {
-			res.LeftOut++
-			continue
-		}
-		if err := comparePending(ctx, tx, res, `
-			SELECT (sort_field, sort_order) IS DISTINCT FROM ($5, $6)
-			FROM user_collection_sort_preferences WHERE user_id = $1 AND profile_id = $2 AND collection_kind = $3 AND collection_id = $4`,
-			target.UserID, target.ProfileID, c.Kind, collection, c.Field, c.Order); err != nil {
-			return fmt.Errorf("comparing a collection sort preference: %w", err)
-		}
+	if err := comparePendingSet(ctx, tx, res, len(rows), `
+		SELECT count(*) FILTER (WHERE p.collection_id IS NULL),
+			count(*) FILTER (WHERE p.collection_id IS NOT NULL AND (p.sort_field, p.sort_order) IS DISTINCT FROM (u.field, u.sort_order))
+		FROM unnest($3::text[], $4::text[], $5::text[], $6::text[]) AS u(kind, collection, field, sort_order)
+		LEFT JOIN user_collection_sort_preferences p ON p.user_id = $1 AND p.profile_id = $2
+			AND p.collection_kind = u.kind AND p.collection_id = u.collection`,
+		target.UserID, target.ProfileID, kinds, collections, fields, orders); err != nil {
+		return fmt.Errorf("comparing collection sort preferences: %w", err)
 	}
 	return nil
 }

@@ -44,18 +44,18 @@ type collectionsDocument struct {
 type personalCollection struct {
 	ID          string   `json:"id"`
 	Name        string   `json:"name"`
-	Description string   `json:"description"`
+	Description string   `json:"description" bound:"8192"`
 	Type        string   `json:"type"`
 	IsShared    bool     `json:"is_shared"`
 	SharedWith  []string `json:"shared_with"`
 	// Group is the account's shelf group the collection sits in, or nil.
 	Group                      *collectionGroup `json:"group"`
 	IncludeInServerCollections bool             `json:"include_in_server_collections"`
-	QueryDefinition            json.RawMessage  `json:"query_definition"`
-	DisplayQueryDefinition     json.RawMessage  `json:"display_query_definition"`
-	SortConfig                 json.RawMessage  `json:"sort_config"`
-	SourceURL                  string           `json:"source_url"`
-	SourceConfig               json.RawMessage  `json:"source_config"`
+	QueryDefinition            json.RawMessage  `json:"query_definition" bound:"1048576"`
+	DisplayQueryDefinition     json.RawMessage  `json:"display_query_definition" bound:"1048576"`
+	SortConfig                 json.RawMessage  `json:"sort_config" bound:"1048576"`
+	SourceURL                  string           `json:"source_url" bound:"2048"`
+	SourceConfig               json.RawMessage  `json:"source_config" bound:"1048576"`
 	SyncSchedule               *string          `json:"sync_schedule"`
 	WatchFilter                string           `json:"watch_filter"`
 	MediaFilter                string           `json:"media_filter"`
@@ -213,7 +213,8 @@ func decodeCollections(data json.RawMessage) (collectionsDocument, userdata.Summ
 		return doc, sum, err
 	}
 	seen := map[string]bool{}
-	for _, c := range doc.Collections {
+	for i := range doc.Collections {
+		c := &doc.Collections[i]
 		if !userdata.ValidContentID(c.ID) || seen[c.ID] || strings.TrimSpace(c.Name) == "" || !userdata.ValidText(c.Name, 512) ||
 			!userdata.ValidText(c.Description, 8192) || !collectionTypes[c.Type] {
 			return doc, sum, fmt.Errorf("personal collection %q is not valid", c.ID)
@@ -223,6 +224,14 @@ func decodeCollections(data json.RawMessage) (collectionsDocument, userdata.Summ
 			if len(raw) > 0 && !json.Valid(raw) {
 				return doc, sum, fmt.Errorf("personal collection %q carries invalid JSON", c.ID)
 			}
+		}
+		// Its sort and sync source are kept as the editors encode them.
+		var err error
+		if c.SortConfig, err = canonicalSort(c.SortConfig); err != nil {
+			return doc, sum, fmt.Errorf("personal collection %q: %w", c.ID, err)
+		}
+		if c.SourceURL, c.SourceConfig, err = canonicalSource(c.Type, c.SourceURL, c.SourceConfig); err != nil {
+			return doc, sum, fmt.Errorf("personal collection %q: %w", c.ID, err)
 		}
 		if g := c.Group; g != nil && (strings.TrimSpace(g.Slug) == "" || strings.TrimSpace(g.Label) == "" || !groupSortModes[g.DefaultSortMode] ||
 			!userdata.ValidText(g.Label, 512) || !userdata.ValidText(g.Title, 512) || !userdata.ValidText(g.Name, 512) || !userdata.ValidText(g.Slug, 512)) {
@@ -241,7 +250,7 @@ func decodeCollections(data json.RawMessage) (collectionsDocument, userdata.Summ
 			sum.Profiles = append(sum.Profiles, p)
 		}
 		if strings.HasPrefix(c.Poster, posterPrefix) {
-			if !uploadedPoster(c) {
+			if !uploadedPoster(*c) {
 				return doc, sum, fmt.Errorf("personal collection %q names another collection's poster", c.ID)
 			}
 			sum.Blobs = append(sum.Blobs, userdata.Blob{Store: userdata.StoreAssets, Key: c.Poster})
@@ -262,7 +271,16 @@ func (BackupData) Import(ctx context.Context, tx pgx.Tx, target userdata.Target,
 		return userdata.Result{}, err
 	}
 	var res userdata.Result
+	if extra := len(doc.Collections) - maxImportedCollections; extra > 0 {
+		res.LeftOut += extra
+		res.Notes = append(res.Notes, fmt.Sprintf("Only the first %d collections were restored; %d more were left out.", maxImportedCollections, extra))
+		doc.Collections = doc.Collections[:maxImportedCollections]
+	}
 	unmatched, missingPosters, droppedSchedules := 0, 0, 0
+	quota, err := profileQuota(ctx, tx, target)
+	if err != nil {
+		return res, err
+	}
 	for _, c := range doc.Collections {
 		var items []string
 		for _, item := range c.Items {
@@ -282,13 +300,21 @@ func (BackupData) Import(ctx context.Context, tx pgx.Tx, target userdata.Target,
 		}
 		switch len(existing) {
 		case 0:
-			created, err := createCollection(ctx, tx, target, c, items, &missingPosters, &droppedSchedules)
+			if !quota.take() {
+				res.LeftOut++
+				continue
+			}
+			problem, err := createCollection(ctx, tx, target, c, items, &missingPosters, &droppedSchedules, quota)
 			if err != nil {
 				return res, err
 			}
-			if !created {
+			if problem == errOverQuota {
 				res.LeftOut++
-				res.Notes = append(res.Notes, fmt.Sprintf("The collection %q was left out: its rules or sync source name only libraries that are not on this server.", c.Name))
+				continue
+			}
+			if problem != "" {
+				res.LeftOut++
+				res.Notes = append(res.Notes, fmt.Sprintf("The collection %q was left out: %s.", c.Name, problem))
 				continue
 			}
 			res.Added++
@@ -324,7 +350,104 @@ func (BackupData) Import(ctx context.Context, tx pgx.Tx, target userdata.Target,
 	if droppedSchedules > 0 {
 		res.Notes = append(res.Notes, fmt.Sprintf("%d collection sync schedules were not daily, weekly, or monthly, so those collections were created without one.", droppedSchedules))
 	}
+	res.Notes = append(res.Notes, quota.notes()...)
 	return res, nil
+}
+
+// The most personal collections, and scheduled ones, a profile has after an
+// import or restore, counting those it already has: an import never grows
+// them, or the provider fetches their schedules run, without bound. (The
+// collection editor has no limit of its own.)
+const (
+	maxProfileCollections   = 1000
+	maxScheduledCollections = 50
+	// maxProfileDefinitionBytes bounds the rules, display filters, sorts,
+	// and sync sources of a profile's collections together.
+	maxProfileDefinitionBytes = 16 << 20
+)
+
+// collectionQuota is what an import may still add to a profile.
+type collectionQuota struct {
+	collections, scheduled, bytes int
+	// unverified withholds every schedule (userdata.Target.Unverified).
+	unverified bool
+	// What the import was refused: collections over the quota, schedules
+	// over theirs, schedules of an unverified backup, definitions over the
+	// bytes left.
+	overCollections, overScheduled, unverifiedSchedules, overBytes int
+}
+
+// profileQuota reads what the profile has, under the account lock the
+// import holds (pgstore.LockAccountForImport).
+func profileQuota(ctx context.Context, tx pgx.Tx, target userdata.Target) (*collectionQuota, error) {
+	var have, scheduled, size int
+	if err := tx.QueryRow(ctx, `
+		SELECT count(*), count(*) FILTER (WHERE sync_schedule IS NOT NULL AND btrim(sync_schedule) <> ''),
+			coalesce(sum(octet_length(query_definition::text) + octet_length(coalesce(display_query_definition::text, ''))
+				+ octet_length(sort_config::text) + octet_length(source_config::text)), 0)
+		FROM user_personal_collections WHERE user_id = $1 AND creator_profile_id = $2 AND native`, target.UserID, target.ProfileID).Scan(&have, &scheduled, &size); err != nil {
+		return nil, fmt.Errorf("counting personal collections: %w", err)
+	}
+	return &collectionQuota{collections: maxProfileCollections - have, scheduled: maxScheduledCollections - scheduled,
+		bytes: maxProfileDefinitionBytes - size, unverified: target.Unverified}, nil
+}
+
+// errOverQuota is createCollection's problem for a collection over the
+// definition bytes left, which the quota's own note reports.
+const errOverQuota = "over the quota"
+
+// takeBytes counts a new collection's definitions; false when they do not
+// fit what is left.
+func (q *collectionQuota) takeBytes(n int) bool {
+	if n > q.bytes {
+		q.overBytes++
+		return false
+	}
+	q.bytes -= n
+	return true
+}
+
+// take counts one new collection; false when the profile is at the quota.
+func (q *collectionQuota) take() bool {
+	if q.collections <= 0 {
+		q.overCollections++
+		return false
+	}
+	q.collections--
+	return true
+}
+
+// schedule is the schedule a new collection stores of the one it carries.
+func (q *collectionQuota) schedule(s *string) *string {
+	switch {
+	case s == nil:
+		return nil
+	case q.unverified:
+		q.unverifiedSchedules++
+		return nil
+	case q.scheduled <= 0:
+		q.overScheduled++
+		return nil
+	}
+	q.scheduled--
+	return s
+}
+
+func (q *collectionQuota) notes() []string {
+	var out []string
+	if q.overCollections > 0 {
+		out = append(out, fmt.Sprintf("%d collections were left out: a profile has at most %d personal collections.", q.overCollections, maxProfileCollections))
+	}
+	if q.overScheduled > 0 {
+		out = append(out, fmt.Sprintf("%d collections were created without their sync schedule: a profile has at most %d scheduled collections.", q.overScheduled, maxScheduledCollections))
+	}
+	if q.overBytes > 0 {
+		out = append(out, fmt.Sprintf("%d collections were left out: a profile's collection rules hold at most %d MB together.", q.overBytes, maxProfileDefinitionBytes>>20))
+	}
+	if q.unverifiedSchedules > 0 {
+		out = append(out, fmt.Sprintf("%d collections were created without their sync schedule: schedules are not restored from a backup this server cannot verify.", q.unverifiedSchedules))
+	}
+	return out
 }
 
 func collectionsNamed(ctx context.Context, tx pgx.Tx, owner userdata.Owner, name string) ([]string, error) {
@@ -344,34 +467,38 @@ func collectionsNamed(ctx context.Context, tx pgx.Tx, owner userdata.Owner, name
 // uploaded poster is copied under the new id before the row that references
 // it (a rollback leaves an orphan for the orphan sweeps); with no file to
 // copy it is dropped. Any other poster reference is kept as it is.
-func createCollection(ctx context.Context, tx pgx.Tx, target userdata.Target, c personalCollection, items []string, missingPosters, droppedSchedules *int) (bool, error) {
+// createCollection creates the imported collection, or says why it cannot
+// be created.
+func createCollection(ctx context.Context, tx pgx.Tx, target userdata.Target, c personalCollection, items []string, missingPosters, droppedSchedules *int,
+	quota *collectionQuota) (string, error) {
 	query, display, source, ok := remapScopes(c, target)
 	if !ok {
-		return false, nil
+		return "its rules or sync source name only libraries that are not on this server", nil
+	}
+	def, problem := canonicalDefinition(query, display, c.SortConfig, source)
+	if problem != "" {
+		return problem, nil
+	}
+	if !quota.takeBytes(len(def.query) + len(def.display) + len(def.sort) + len(def.source)) {
+		return errOverQuota, nil
 	}
 	group, err := ensureGroup(ctx, tx, target.UserID, c.Group)
 	if err != nil {
-		return false, err
+		return "", err
 	}
 	id := uuid.NewString()
 	poster, err := copyPoster(ctx, target, c, id, missingPosters)
 	if err != nil {
-		return false, err
+		return "", err
 	}
 	thumb := c.PosterThumbhash
 	if poster == "" {
 		thumb = ""
 	}
-	schedule := importedSchedule(c, droppedSchedules)
-	orEmpty := func(raw json.RawMessage) string {
-		if len(raw) == 0 {
-			return "{}"
-		}
-		return string(raw)
-	}
+	schedule := quota.schedule(importedSchedule(c, droppedSchedules))
 	var displayArg any
-	if len(display) > 0 {
-		displayArg = string(display)
+	if def.display != "" {
+		displayArg = def.display
 	}
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO user_personal_collections (
@@ -381,15 +508,65 @@ func createCollection(ctx context.Context, tx pgx.Tx, target userdata.Target, c 
 		VALUES ($1, $2, $3, $3, $4, $5, $6, $7, $8, $9::jsonb, $10::jsonb, $11::jsonb, $12, $13::jsonb, $14, $15, $16, $17, $18, $19, $20,
 			COALESCE((SELECT MAX(sort_order) + 1 FROM user_personal_collections WHERE user_id = $2 AND creator_profile_id = $3 AND native), 0), TRUE)`,
 		id, target.UserID, target.ProfileID, c.Name, c.Description, c.Type, c.IsShared, c.IncludeInServerCollections,
-		orEmpty(query), displayArg, orEmpty(c.SortConfig), c.SourceURL, orEmpty(source), schedule,
+		def.query, displayArg, def.sort, c.SourceURL, def.source, schedule,
 		InitialNextSyncAt(schedule), c.WatchFilter, c.MediaFilter, poster, thumb, group); err != nil {
-		return false, fmt.Errorf("creating personal collection %q: %w", c.Name, err)
+		return "", fmt.Errorf("creating personal collection %q: %w", c.Name, err)
 	}
 	if _, err := addMissingItems(ctx, tx, target.UserID, id, items); err != nil {
-		return false, err
+		return "", err
 	}
 	_, err = shareWith(ctx, tx, target, id, c.SharedWith)
-	return err == nil, err
+	return "", err
+}
+
+// maxImportedCollections bounds the collections one import creates or
+// merges into: each is a few statements of its own.
+const maxImportedCollections = 1000
+
+// maxDefinitionBytes bounds each of an imported collection's definitions
+// (rules, display filter, sort, sync source) as the API's request body cap
+// bounds what an editor stores.
+const maxDefinitionBytes = 1 << 20
+
+// definition is an imported collection's definitions in the form its
+// editors store them.
+type definition struct {
+	query, display, sort, source string
+}
+
+// canonicalDefinition runs an imported collection's definitions through
+// the editors' canonicalizers and validators (catalog), or says why one
+// fails: a definition an editor would refuse is never stored, since every
+// read of the collection list decodes it.
+func canonicalDefinition(query, display, sort, source json.RawMessage) (definition, string) {
+	for _, raw := range []json.RawMessage{query, display, sort, source} {
+		if len(raw) > maxDefinitionBytes {
+			return definition{}, "its rules are larger than an editor accepts"
+		}
+	}
+	def := definition{query: "{}", sort: "{}", source: "{}"}
+	if trimmed := strings.TrimSpace(string(query)); trimmed != "" && trimmed != "{}" && trimmed != "null" {
+		normalized, err := catalog.NormalizeSmartCollectionQueryJSON(query, true, true, false)
+		if err != nil {
+			return definition{}, "its rules are not ones this server accepts"
+		}
+		def.query = string(normalized)
+	}
+	var err error
+	if def.display, err = catalog.NormalizeDisplayQueryFragment(display); err != nil {
+		return definition{}, "its display filter is not one this server accepts"
+	}
+	if def.sort, err = catalog.NormalizeCollectionSortConfig(sort, true); err != nil {
+		return definition{}, "its sort is not one this server accepts"
+	}
+	if len(source) > 0 {
+		var object map[string]json.RawMessage
+		if json.Unmarshal(source, &object) != nil || object == nil {
+			return definition{}, "its sync source is not one this server accepts"
+		}
+		def.source = string(source)
+	}
+	return def, ""
 }
 
 // remapScopes maps the libraries of the collection's smart rules, display
@@ -559,6 +736,10 @@ func (BackupData) Pending(ctx context.Context, tx pgx.Tx, target userdata.Target
 		return userdata.Result{}, err
 	}
 	var res userdata.Result
+	quota, err := profileQuota(ctx, tx, target)
+	if err != nil {
+		return res, err
+	}
 	for _, c := range doc.Collections {
 		existing, err := collectionsNamed(ctx, tx, target.Owner, c.Name)
 		if err != nil {
@@ -566,7 +747,7 @@ func (BackupData) Pending(ctx context.Context, tx pgx.Tx, target userdata.Target
 		}
 		switch len(existing) {
 		case 0:
-			if _, _, _, ok := remapScopes(c, target); ok {
+			if _, _, _, ok := remapScopes(c, target); ok && quota.take() {
 				res.Added++
 			} else {
 				res.LeftOut++

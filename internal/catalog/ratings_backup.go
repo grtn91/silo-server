@@ -89,7 +89,9 @@ func (RatingsBackupData) Import(ctx context.Context, tx pgx.Tx, target userdata.
 		return userdata.Result{}, err
 	}
 	var res userdata.Result
-	var rows [][]any
+	var items []string
+	var ratings []int
+	var at []time.Time
 	for _, e := range doc.Ratings {
 		local, ok, err := target.Items.Resolve(ctx, e.Item)
 		if err != nil {
@@ -103,15 +105,20 @@ func (RatingsBackupData) Import(ctx context.Context, tx pgx.Tx, target userdata.
 		if ratedAt.IsZero() {
 			ratedAt = target.Now
 		}
-		rows = append(rows, []any{target.UserID, target.ProfileID, local, e.Rating, ratedAt})
+		items, ratings, at = append(items, local), append(ratings, e.Rating), append(at, ratedAt)
 	}
-	added, err := userdata.InsertEach(ctx, tx, `
-		INSERT INTO user_ratings (user_id, profile_id, media_item_id, rating, rated_at) VALUES ($1, $2, $3, $4, $5)
-		ON CONFLICT (user_id, profile_id, media_item_id) DO NOTHING`, rows)
-	res.Added, res.Unchanged = added, len(rows)-added
+	if len(items) == 0 {
+		return res, nil
+	}
+	tag, err := tx.Exec(ctx, `
+		INSERT INTO user_ratings (user_id, profile_id, media_item_id, rating, rated_at)
+		SELECT $1, $2, u.* FROM unnest($3::text[], $4::int[], $5::timestamptz[]) AS u
+		ON CONFLICT (user_id, profile_id, media_item_id) DO NOTHING`, target.UserID, target.ProfileID, items, ratings, at)
 	if err != nil {
 		return res, fmt.Errorf("restoring ratings: %w", err)
 	}
+	res.Added = int(tag.RowsAffected())
+	res.Unchanged = len(items) - res.Added
 	return res, nil
 }
 

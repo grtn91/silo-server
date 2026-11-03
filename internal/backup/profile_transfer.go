@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/Silo-Server/silo-server/internal/access"
+	"github.com/Silo-Server/silo-server/internal/backup/jsonsize"
 	"github.com/Silo-Server/silo-server/internal/backup/userdata"
 	"github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/usercollections"
@@ -31,6 +32,10 @@ const (
 	ProfileExportVersion = 1
 	// MaxProfileImportBytes bounds an import's document.
 	MaxProfileImportBytes = 64 << 20
+	// maxProfileItems bounds the items an export names (its items list):
+	// a profile's history, ratings, and lists name a few thousand titles,
+	// tens of thousands at most.
+	maxProfileItems = 100_000
 )
 
 // ProfileExport is the silo-profile-export document.
@@ -183,7 +188,7 @@ func (t *ProfileTransfer) Capability() ProfileExportCapability {
 
 // ErrProfileExportTooLarge refuses an export larger than an import
 // accepts: no server could import it.
-var ErrProfileExportTooLarge = fmt.Errorf("this profile's data is larger than an import accepts (%d bytes)", MaxProfileImportBytes)
+var ErrProfileExportTooLarge = fmt.Errorf("this profile's data is larger than an import accepts (%d bytes, %d items)", MaxProfileImportBytes, maxProfileItems)
 
 // Export writes the profile's data, read in one snapshot, as the profile
 // may see it now: rows about titles its library access or maturity limits
@@ -235,6 +240,9 @@ func (t *ProfileTransfer) Export(ctx context.Context, scope ProfileImportScope) 
 	}
 	if doc.Items, err = readItemRefs(ctx, tx, items); err != nil {
 		return nil, err
+	}
+	if len(doc.Items) > maxProfileItems {
+		return nil, ErrProfileExportTooLarge
 	}
 	out, err := json.Marshal(doc)
 	if err == nil && len(out) > MaxProfileImportBytes {
@@ -312,10 +320,12 @@ func ParseProfileExport(data []byte) (*ProfileExport, error) {
 	if len(data) > MaxProfileImportBytes {
 		return nil, ErrProfileImportTooLarge
 	}
-	if err := checkJSONDepth(data); err != nil {
+	// Both decodes are bounded before they run (jsonsize): the document's
+	// members as a map, then the document strictly.
+	var top map[string]json.RawMessage
+	if _, err := jsonsize.Check(data, &top, decodeLimits(len(data))); err != nil {
 		return nil, &InvalidProfileExportError{Err: err}
 	}
-	var top map[string]json.RawMessage
 	if err := json.Unmarshal(data, &top); err != nil {
 		return nil, &InvalidProfileExportError{Err: err}
 	}
@@ -339,6 +349,9 @@ func ParseProfileExport(data []byte) (*ProfileExport, error) {
 		return nil, err
 	}
 	var doc ProfileExport
+	if _, err := jsonsize.Check(data, &doc, decodeLimits(len(data))); err != nil {
+		return nil, &InvalidProfileExportError{Err: err}
+	}
 	if err := decodeStrict(data, &doc); err != nil {
 		return nil, &InvalidProfileExportError{Err: err}
 	}
@@ -360,8 +373,8 @@ func ParseProfileExport(data []byte) (*ProfileExport, error) {
 		}
 		doc.summaries[id] = sum
 	}
-	if len(doc.Items) > userdata.MaxEntries {
-		return nil, &InvalidProfileExportError{Err: errors.New("too many items")}
+	if len(doc.Items) > maxProfileItems {
+		return nil, &InvalidProfileExportError{Err: fmt.Errorf("names more than %d items", maxProfileItems)}
 	}
 	seen := map[string]bool{}
 	for _, r := range doc.Items {
@@ -476,7 +489,7 @@ func (t *ProfileTransfer) Import(ctx context.Context, scope ProfileImportScope, 
 		Library:   func(id int) (int, bool) { return id, libraries[id] },
 		Untrusted: true,
 	}
-	target.Collection = transferCollections(tx, target, doc.Data[userdata.Collections])
+	target.Collections = transferCollections(tx, target, doc.Data[userdata.Collections])
 	for _, dt := range userDataTypes {
 		raw, ok := doc.Data[dt.ID()]
 		if !ok {
@@ -504,23 +517,28 @@ func (t *ProfileTransfer) Import(ctx context.Context, scope ProfileImportScope, 
 // transferCollections maps the collection ids a profile export names: its
 // own personal collections as their import matches them, and an admin
 // collection only on the server that wrote it, while it is still there.
-func transferCollections(tx pgx.Tx, target userdata.Target, collections json.RawMessage) func(ctx context.Context, field, id string) (string, bool, error) {
+func transferCollections(tx pgx.Tx, target userdata.Target, collections json.RawMessage) func(ctx context.Context, field string, ids []string) (map[string]string, error) {
 	carried := usercollections.CarriedCollections(map[string]json.RawMessage{"": collections})
-	return func(ctx context.Context, field, id string) (string, bool, error) {
+	return func(ctx context.Context, field string, ids []string) (map[string]string, error) {
 		switch field {
 		case userdata.UserCollectionField:
-			return usercollections.MapCarried(ctx, tx, target, carried, id)
+			return usercollections.MapCarriedEach(ctx, tx, target, carried, ids)
 		case userdata.LibraryCollectionField:
+			out := map[string]string{}
 			if !target.SameServer {
-				return "", false, nil
+				return out, nil
 			}
-			var found bool
-			if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM library_collections WHERE id = $1)`, id).Scan(&found); err != nil {
-				return "", false, err
+			rows, err := tx.Query(ctx, `SELECT id FROM library_collections WHERE id = ANY($1)`, ids)
+			if err != nil {
+				return nil, err
 			}
-			return id, found, nil
+			found, err := pgx.CollectRows(rows, pgx.RowTo[string])
+			for _, id := range found {
+				out[id] = id
+			}
+			return out, err
 		}
-		return "", false, nil
+		return map[string]string{}, nil
 	}
 }
 

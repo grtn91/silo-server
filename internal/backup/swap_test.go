@@ -74,7 +74,13 @@ type fakeControl struct {
 	// liveServerID is the live server's identity; "" is the manifest's.
 	// carriedFrom records the live URL each credential carry read from.
 	liveServerID string
-	carriedFrom  []string
+	// superuser is what Superuser reports for every database.
+	superuser   bool
+	carriedFrom []string
+	// checkedExtensions are what CheckExtensions was asked about, and
+	// extensionsErr its answer.
+	checkedExtensions []string
+	extensionsErr     error
 	// restoreLocks is the restore lock table, shared by every control of
 	// one server; held names the databases locked.
 	restoreLocks *fakeRestoreLocks
@@ -155,6 +161,10 @@ func (f *fakeControl) OtherConnections(_ context.Context, name string) (int, err
 	return 0, nil
 }
 func (f *fakeControl) CheckPrivileges(context.Context, string) error { return nil }
+func (f *fakeControl) CheckExtensions(_ context.Context, names []string) error {
+	f.checkedExtensions = names
+	return f.extensionsErr
+}
 
 func (f *fakeControl) Create(_ context.Context, name string) error {
 	return f.do("create "+name, func() error {
@@ -247,6 +257,26 @@ func (l fakeLoader) RotateSigningSecrets(context.Context, string, *secret.Cipher
 }
 func (l fakeLoader) KeepStricterSettings(context.Context, string, string, *secret.Cipher) ([]string, error) {
 	return nil, nil
+}
+func (l fakeLoader) Extensions(context.Context, string) ([]string, error) {
+	return []string{"vector"}, nil
+}
+func (l fakeLoader) CarryPolicies(context.Context, string, string) ([]string, error) {
+	return nil, nil
+}
+func (l fakeLoader) CarryPluginReleases(context.Context, string, string) ([]string, error) {
+	return nil, nil
+}
+func (l fakeLoader) CarryServerSpecificSettings(context.Context, string, string) (int, error) {
+	return 0, nil
+}
+func (l fakeLoader) CarryOutboundSettings(context.Context, string, string) ([]string, []string, error) {
+	return nil, nil, nil
+}
+func (l fakeLoader) InterruptWork(context.Context, string, string) ([]string, error) { return nil, nil }
+func (l fakeLoader) Superuser(context.Context, string) (bool, error)                 { return l.ctl.superuser, nil }
+func (l fakeLoader) AccountRollback(context.Context, string, string) (AccountRollback, error) {
+	return AccountRollback{}, nil
 }
 func (l fakeLoader) ServerID(context.Context, string) (string, error) {
 	if l.ctl.liveServerID != "" {
@@ -838,6 +868,69 @@ func TestSwapCarriesOnlyForTheSameDeployment(t *testing.T) {
 	}
 }
 
+// TestSwapRefusesExtensionsTheRoleCannotCreate: the restored database is
+// new, so a role that cannot create an extension the backup needs is
+// refused in preflight, before anything changes.
+func TestSwapRefusesExtensionsTheRoleCannotCreate(t *testing.T) {
+	f := newSwapFixture(t)
+	f.ctl.extensionsErr = ErrExtensionNeedsSuperuser
+	if err, _ := f.restore(); !errors.Is(err, ErrExtensionNeedsSuperuser) || slices.ContainsFunc(f.ctl.calls, func(c string) bool { return strings.HasPrefix(c, "create ") }) {
+		t.Fatalf("restore = %v, calls %v; want ErrExtensionNeedsSuperuser before any database is created", err, f.ctl.calls)
+	}
+	if !slices.Equal(f.ctl.checkedExtensions, []string{"vector"}) {
+		t.Fatalf("checked extensions %v, want the dump's", f.ctl.checkedExtensions)
+	}
+}
+
+// TestUnverifiedDumpsAreNotLoadedAsASuperuser: a backup this key cannot
+// authenticate could have been changed, and pg_restore runs what its dump
+// says with the connecting role's rights. Restored or verified, it needs
+// --accept-lost-credentials, is loaded with a warning, and is refused for a
+// superuser role before anything changes unless the operator passes
+// --accept-superuser. This deployment's own backup loads as any role.
+func TestUnverifiedDumpsAreNotLoadedAsASuperuser(t *testing.T) {
+	unverified := func(f *swapFixture) {
+		f.validate = ValidateOptions{KeyCheck: testKeyCheck}
+		f.ctl.superuser = true
+	}
+	f := newSwapFixture(t)
+	f.ctl.superuser = true
+	if err, _ := f.restore(); err != nil {
+		t.Fatalf("this deployment's backup as a superuser: %v\n%s", err, f.output.String())
+	}
+
+	f = newSwapFixture(t)
+	unverified(f)
+	if err, _ := f.restore(); !errors.Is(err, ErrUnauthenticatedBackup) || len(f.ctl.calls) != 0 {
+		t.Fatalf("unverified backup = %v, calls %v; want ErrUnauthenticatedBackup before any change", err, f.ctl.calls)
+	}
+	f.validate.AcceptLostCredentials = true
+	if err, _ := f.restore(); !errors.Is(err, ErrSuperuserLoad) || len(f.ctl.calls) != 0 || !strings.Contains(f.output.String(), msgUnverifiedLoad) {
+		t.Fatalf("accepted unverified backup as a superuser = %v, calls %v; want ErrSuperuserLoad before any change\n%s", err, f.ctl.calls, f.output.String())
+	}
+	f.validate.AcceptSuperuser = true
+	if err, _ := f.restore(); err != nil {
+		t.Fatalf("with --accept-superuser: %v\n%s", err, f.output.String())
+	}
+
+	f = newSwapFixture(t)
+	unverified(f)
+	loader := fakeLoader{ctl: f.ctl, m: f.src.Manifest}
+	f.ctl.dbs["scratch"] = &fakeDB{oid: 300, allow: true}
+	scratch := "postgres://silo@db.invalid/scratch"
+	if err := VerifyBackup(t.Context(), f.src, loader, scratch, f.validate, io.Discard); !errors.Is(err, ErrUnauthenticatedBackup) {
+		t.Fatalf("verify of an unverified backup = %v, want ErrUnauthenticatedBackup", err)
+	}
+	f.validate.AcceptLostCredentials = true
+	if err := VerifyBackup(t.Context(), f.src, loader, scratch, f.validate, io.Discard); !errors.Is(err, ErrSuperuserLoad) || len(f.ctl.calls) != 0 {
+		t.Fatalf("verify as a superuser = %v, calls %v; want ErrSuperuserLoad before loading", err, f.ctl.calls)
+	}
+	f.ctl.superuser = false
+	if err := VerifyBackup(t.Context(), f.src, loader, scratch, f.validate, io.Discard); err != nil {
+		t.Fatalf("verify as an ordinary role: %v", err)
+	}
+}
+
 // TestSwapStopsWhenAClientJoinsTheLiveDatabase: the credentials a restore
 // carries are the live server's only while nothing else is on the live
 // database. A client that connects after preflight, before or after the
@@ -1077,5 +1170,94 @@ func TestValidateAuthenticatesTheManifest(t *testing.T) {
 				t.Fatalf("Validate with --accept-lost-credentials = %v, want %v", err, tt.wantAfter)
 			}
 		})
+	}
+}
+
+// TestTarGuardRefusesWhatTheWriterNeverMakes: an archive's headers are
+// checked before tar.Reader expands them. Regular files, with PAX records
+// for long names and large sizes, read as before; an old-GNU sparse
+// header with 50,000 extension blocks, a directory, a link, an oversized
+// PAX record, a PAX key given twice, and a PAX key the writer never emits
+// are refused at their header, without expanding them.
+func TestTarGuardRefusesWhatTheWriterNeverMakes(t *testing.T) {
+	var ok bytes.Buffer
+	tw := tar.NewWriter(&ok)
+	for _, h := range []*tar.Header{
+		{Name: "assets/" + strings.Repeat("long/", 40) + "a.jpg", Mode: 0o644, Size: 3, Typeflag: tar.TypeReg, Format: tar.FormatPAX, ModTime: time.Unix(1, 5)},
+		{Name: "assets/b.jpg", Mode: 0o644, Size: 2, Typeflag: tar.TypeReg},
+	} {
+		if err := tw.WriteHeader(h); err != nil {
+			t.Fatal(err)
+		}
+		_, _ = tw.Write(bytes.Repeat([]byte("x"), int(h.Size)))
+	}
+	_ = tw.Close()
+	guard := newTarGuard(bytes.NewReader(ok.Bytes()))
+	tr := tar.NewReader(guard)
+	for range 2 {
+		h, err := tr.Next()
+		if err != nil {
+			t.Fatalf("a regular archive: %v", err)
+		}
+		if err := guard.checkEntry(h.Size); err != nil {
+			t.Fatalf("a regular archive: %v", err)
+		}
+	}
+	if _, err := tr.Next(); !errors.Is(err, io.EOF) {
+		t.Fatalf("after the last entry: %v", err)
+	}
+
+	header := func(typeflag byte, size int64) []byte {
+		var b bytes.Buffer
+		tw := tar.NewWriter(&b)
+		_ = tw.WriteHeader(&tar.Header{Name: "x", Mode: 0o644, Size: size, Typeflag: tar.TypeReg})
+		raw := b.Bytes()[:512]
+		raw[156] = typeflag
+		// Recompute the checksum as tar.Reader would expect it.
+		copy(raw[148:156], "        ")
+		sum := 0
+		for _, c := range raw {
+			sum += int(c)
+		}
+		copy(raw[148:156], fmt.Sprintf("%06o\x00 ", sum))
+		return raw
+	}
+	sparse := append(header('S', 0), bytes.Repeat(append(make([]byte, 511), 1), 50_000)...)
+	// pax is a PAX record of records, then a regular header of size 0.
+	pax := func(records ...string) []byte {
+		var body []byte
+		for _, r := range records {
+			n := len(r) + 3
+			for len(fmt.Sprintf("%d %s\n", n, r)) != n {
+				n++
+			}
+			body = append(body, fmt.Sprintf("%d %s\n", n, r)...)
+		}
+		out := append(header('x', int64(len(body))), body...)
+		out = append(out, make([]byte, (512-len(body)%512)%512)...)
+		return append(out, header('0', 0)...)
+	}
+	for name, archive := range map[string][]byte{
+		"old GNU sparse":   sparse,
+		"directory":        header('5', 0),
+		"symlink":          header('2', 0),
+		"oversized record": append(header('x', maxPAXRecord+1), make([]byte, maxPAXRecord+512)...),
+		// tar.Reader keeps the last of a repeated key; the guard would
+		// have read the first, and taken what follows for data.
+		"size given twice":    pax("size=100000", "size=0"),
+		"path given twice":    pax("path=a", "path=b"),
+		"a GNU sparse record": pax("GNU.sparse.size=1000"),
+	} {
+		var before, after runtime.MemStats
+		runtime.GC()
+		runtime.ReadMemStats(&before)
+		_, err := tar.NewReader(newTarGuard(bytes.NewReader(archive))).Next()
+		runtime.ReadMemStats(&after)
+		if !errors.Is(err, errTarShape) {
+			t.Fatalf("%s: %v, want errTarShape", name, err)
+		}
+		if allocated := after.TotalAlloc - before.TotalAlloc; allocated > 1<<20 {
+			t.Fatalf("%s: refusing allocated %d bytes", name, allocated)
+		}
 	}
 }

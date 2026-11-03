@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -200,6 +201,12 @@ type selectiveFixture struct {
 func newSelectiveFixture(t *testing.T) *selectiveFixture {
 	t.Helper()
 	pool, dsn := backuptest.Database(t)
+	return newSelectiveFixtureOn(t, pool, dsn)
+}
+
+// newSelectiveFixtureOn is newSelectiveFixture with every part on pool.
+func newSelectiveFixtureOn(t *testing.T, pool *pgxpool.Pool, dsn string) *selectiveFixture {
+	t.Helper()
 	tools := testTools(t)
 	masterKey := []byte("selective-restore-test-key-0123456789")
 	cipher, err := secret.New(masterKey)
@@ -599,7 +606,25 @@ func TestRestoreNeverSendsLiveSecretsToARestoredAddressDB(t *testing.T) {
 	}
 
 	// The same backup under another key: nothing that reaches a service.
-	manifestKey := objectKey(f.serverID, source.ID, ManifestName)
+	f.unverify(t, source.ID)
+	if err := f.settings.Set(ctx, host, "mail.example.com"); err != nil {
+		t.Fatal(err)
+	}
+	unverified, err := f.svc.Preview(ctx, source.ID, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if page := previewItem(t, unverified, SectionSettings, pageEmail); page.Selectable || page.Reason != ReasonUnverifiedBackup {
+		t.Fatalf("email page of an unverified backup = %+v, want unselectable, unverified_backup", page)
+	}
+}
+
+// unverify rewrites the backup's manifest with another key's check value,
+// so this server cannot verify it.
+func (f *selectiveFixture) unverify(t *testing.T, backupID string) {
+	t.Helper()
+	ctx := t.Context()
+	manifestKey := objectKey(f.serverID, backupID, ManifestName)
 	body, _, err := f.store.Get(ctx, manifestKey)
 	if err != nil {
 		t.Fatal(err)
@@ -617,15 +642,49 @@ func TestRestoreNeverSendsLiveSecretsToARestoredAddressDB(t *testing.T) {
 	if err := f.store.Put(ctx, manifestKey, data); err != nil {
 		t.Fatal(err)
 	}
-	if err := f.settings.Set(ctx, host, "mail.example.com"); err != nil {
+}
+
+// TestUnverifiedRestoreLeavesCostlyWorkOffDB: a verified backup's preview
+// names the options of a library that send its data to outside services or
+// run long jobs; restored from a backup this server cannot verify, the
+// library is created with them off, and the preview says so.
+func TestUnverifiedRestoreLeavesCostlyWorkOffDB(t *testing.T) {
+	f := newSelectiveFixture(t)
+	ctx := t.Context()
+	seed := seedSelective(t, f.pool, f.settings, f.store)
+	dbExec(t, f.pool, `UPDATE media_folders SET auto_translate_metadata = true, trickplay_enabled = true, intro_detection_enabled = true WHERE id = $1`,
+		seed.library2ID)
+	source, err := backupUnderLock(t, f.svc, KindManual)
+	if err != nil {
 		t.Fatal(err)
 	}
+	f.lose(t, seed)
+	ref := strconv.Itoa(seed.library2ID)
+	verified, err := f.svc.Preview(ctx, source.ID, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const costly = "AI translation of metadata, trickplay previews, and intro detection"
+	if item := previewItem(t, verified, SectionLibraries, ref); !item.Selectable || item.Message != "Restoring it turns on "+costly+"." {
+		t.Fatalf("library of a verified backup = %+v, want its costly options named", item)
+	}
+	f.unverify(t, source.ID)
 	unverified, err := f.svc.Preview(ctx, source.ID, true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if page := previewItem(t, unverified, SectionSettings, pageEmail); page.Selectable || page.Reason != ReasonUnverifiedBackup {
-		t.Fatalf("email page of an unverified backup = %+v, want unselectable, unverified_backup", page)
+	if item := previewItem(t, unverified, SectionLibraries, ref); !item.Selectable || !strings.HasPrefix(item.Message, "Restored with "+costly+" off") {
+		t.Fatalf("library of an unverified backup = %+v, want its costly options off", item)
+	}
+	report := f.restoreRequest(t, RestoreRequest{BackupID: source.ID, Digest: unverified.Digest,
+		Selection: map[string][]string{SectionLibraries: {ref}}, AcceptUnauthenticated: true})
+	var translate, trickplay, intro bool
+	if err := f.pool.QueryRow(ctx, `SELECT auto_translate_metadata, trickplay_enabled, intro_detection_enabled FROM media_folders WHERE id = $1`,
+		report.LibraryMap[ref]).Scan(&translate, &trickplay, &intro); err != nil {
+		t.Fatalf("restored library %v: %v (%+v)", report.LibraryMap, err, report.Items)
+	}
+	if translate || trickplay || intro {
+		t.Fatalf("library restored from an unverified backup: translate %v, trickplay %v, intro detection %v; want all off", translate, trickplay, intro)
 	}
 }
 
@@ -921,6 +980,193 @@ func TestTemplateCollectionsAndHomeSectionsDB(t *testing.T) {
 	checkChangesNothing(t, f.restoreRequest(t, req))
 }
 
+// TestManagedSectionPointedElsewhereIsRestoredDB: a managed section an
+// admin pointed at an ordinary collection after the backup differs from the
+// backup even when that collection holds the same items; restoring it
+// creates the managed collection again, and a second preview finds it the
+// same.
+func TestManagedSectionPointedElsewhereIsRestoredDB(t *testing.T) {
+	f := newSelectiveFixture(t)
+	ctx, pool := t.Context(), f.pool
+	wirePageTargets(f, new(bool), &[]string{})
+	s := seedPages(t, f)
+	source, err := backupUnderLock(t, f.svc, KindManual)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo := catalog.NewLibraryCollectionRepository(pool)
+	ordinary, err := repo.Create(ctx, catalog.CreateLibraryCollectionInput{LibraryID: s.library, Slug: "ordinary-" + s.suffix, Title: "Ordinary " + s.suffix})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, id := range s.items {
+		if err := repo.AddItem(ctx, ordinary.ID, id, i); err != nil {
+			t.Fatal(err)
+		}
+	}
+	dbExec(t, pool, `UPDATE page_sections SET config = jsonb_build_object('library_collection_id', $2::text) WHERE id = $1`, s.managed, ordinary.ID)
+	preview, err := f.svc.Preview(ctx, source.ID, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := homeSectionItemID(s.managed)
+	if got := previewItem(t, preview, SectionHomeSections, id); got.Status != ItemDiffers || !slices.Contains(got.HomeSection.Changes, "collection replaced") {
+		t.Fatalf("section pointed at an ordinary collection = %+v %+v", got, got.HomeSection)
+	}
+	report := f.restoreRequest(t, RestoreRequest{BackupID: source.ID, Digest: preview.Digest, Selection: map[string][]string{SectionHomeSections: {id}}})
+	if got := reportItem(t, report, SectionHomeSections, id); got.Outcome != OutcomeRestored {
+		t.Fatalf("restoring it = %+v", got)
+	}
+	var shown string
+	if err := pool.QueryRow(ctx, `SELECT config->>'library_collection_id' FROM page_sections WHERE id = $1`, s.managed).Scan(&shown); err != nil ||
+		shown == ordinary.ID || countRows(t, pool, `SELECT count(*) FROM library_collections WHERE id = $1 AND management_mode = 'section'`, shown) != 1 {
+		t.Fatalf("restored section shows %q (%v), want a managed collection", shown, err)
+	}
+	again, err := f.svc.Preview(ctx, source.ID, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := previewItem(t, again, SectionHomeSections, id); got.Status != ItemOnThisServer || got.Reason != ReasonSame {
+		t.Fatalf("after the restore = %+v %+v", got, got.HomeSection)
+	}
+}
+
+// TestUnverifiedSectionCollectionHasNoScheduleDB: a section's carried
+// collection that a restore from a backup this server cannot verify creates
+// keeps its source but gets no sync schedule, as every collection the
+// restore creates (applier.createCollection), and the preview says so.
+func TestUnverifiedSectionCollectionHasNoScheduleDB(t *testing.T) {
+	f := newSelectiveFixture(t)
+	ctx, pool := t.Context(), f.pool
+	wirePageTargets(f, new(bool), &[]string{})
+	s := seedPages(t, f)
+	const source, daily = "https://mdblist.com/lists/someone/list", "30 4 * * *"
+	dbExec(t, pool, `UPDATE library_collections SET collection_type = 'mdblist', source_url = $2, sync_schedule = $3 WHERE id = $1`,
+		s.managedCollection, source, daily)
+	backup, err := backupUnderLock(t, f.svc, KindManual)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The section now shows another collection, so the restore creates
+	// the carried one again.
+	repo := catalog.NewLibraryCollectionRepository(pool)
+	ordinary, err := repo.Create(ctx, catalog.CreateLibraryCollectionInput{LibraryID: s.library, Slug: "ordinary-" + s.suffix, Title: "Ordinary " + s.suffix})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dbExec(t, pool, `UPDATE page_sections SET config = jsonb_build_object('library_collection_id', $2::text) WHERE id = $1`, s.managed, ordinary.ID)
+	dbExec(t, pool, `DELETE FROM library_collections WHERE id = $1`, s.managedCollection)
+	f.unverify(t, backup.ID)
+	preview, err := f.svc.Preview(ctx, backup.ID, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := homeSectionItemID(s.managed)
+	if got := previewItem(t, preview, SectionHomeSections, id); !got.Selectable || !strings.Contains(got.Message, "A collection it creates gets no sync schedule") {
+		t.Fatalf("section of an unverified backup = %+v, want its collection's schedule withheld", got)
+	}
+	report := f.restoreRequest(t, RestoreRequest{BackupID: backup.ID, Digest: preview.Digest,
+		Selection: map[string][]string{SectionHomeSections: {id}}, AcceptUnauthenticated: true})
+	got := reportItem(t, report, SectionHomeSections, id)
+	if got.Outcome != OutcomeRestored || !slices.Contains(got.Notes, msgScheduleWithheld) {
+		t.Fatalf("restoring it = %+v", got)
+	}
+	var url string
+	var schedule *string
+	if err := pool.QueryRow(ctx, `SELECT c.source_url, c.sync_schedule FROM page_sections p
+		JOIN library_collections c ON c.id = p.config->>'library_collection_id' WHERE p.id = $1`, s.managed).Scan(&url, &schedule); err != nil {
+		t.Fatal(err)
+	}
+	// Kept, in the canonical form the editors store.
+	if url != source+"/json" || schedule != nil {
+		t.Fatalf("restored collection: source %q, schedule %v; want the source kept and no schedule", url, schedule)
+	}
+}
+
+// TestRestoreRefusesCollectionSourcesTheEditorWouldDB: a collection whose
+// source the editors would not store (an MDBList collection whose list is
+// on loopback) is refused by the preview, carried by a section or not.
+func TestRestoreRefusesCollectionSourcesTheEditorWouldDB(t *testing.T) {
+	f := newSelectiveFixture(t)
+	ctx, pool := t.Context(), f.pool
+	wirePageTargets(f, new(bool), &[]string{})
+	s := seedPages(t, f)
+	dbExec(t, pool, `UPDATE library_collections SET collection_type = 'mdblist', source_url = 'http://127.0.0.1:9/lists/a/b',
+		source_config = '{"mode":"mdblist_json","url":"http://127.0.0.1:9/lists/a/b"}' WHERE id = $1`, s.managedCollection)
+	backup, err := backupUnderLock(t, f.svc, KindManual)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dbExec(t, pool, `DELETE FROM library_collections WHERE id = $1`, s.managedCollection)
+	preview, err := f.svc.Preview(ctx, backup.ID, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := previewItem(t, preview, SectionHomeSections, homeSectionItemID(s.managed)); got.Selectable || got.Reason != ReasonUnreadable ||
+		!strings.Contains(got.Message, "not one this server accepts") {
+		t.Fatalf("section whose collection's list is on loopback = %+v, want refused", got)
+	}
+}
+
+// TestManagedCollectionKeysMapLibrariesDB: a section-managed collection's
+// management key names its library; restored where the backup's library is
+// another one here, the key names that one, and a collection here holding
+// the backup's key for the library with the backup's old id is not reused.
+func TestManagedCollectionKeysMapLibrariesDB(t *testing.T) {
+	f := newSelectiveFixture(t)
+	ctx, pool := t.Context(), f.pool
+	wirePageTargets(f, new(bool), &[]string{})
+	s := seedPages(t, f)
+	keyFor := func(library int) string { return "trakt:trending:movie:library:" + strconv.Itoa(library) }
+	dbExec(t, pool, `UPDATE library_collections SET management_key = $2 WHERE id = $1`, s.managedCollection, keyFor(s.library))
+	backup, err := backupUnderLock(t, f.svc, KindManual)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Here the backup's library has another id: the library with its old
+	// id now has other folders, and a new one has the backup's.
+	var folder string
+	if err := pool.QueryRow(ctx, `SELECT path FROM media_folder_paths WHERE media_folder_id = $1`, s.library).Scan(&folder); err != nil {
+		t.Fatal(err)
+	}
+	dbExec(t, pool, `UPDATE media_folder_paths SET path = $2 WHERE media_folder_id = $1`, s.library, folder+"-elsewhere")
+	moved, err := catalog.NewFolderRepository(pool).Create(ctx, catalog.CreateFolderInput{Paths: []string{folder}, Type: "movies", Name: "Moved " + s.suffix})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = pool.Exec(context.Background(), `DELETE FROM media_folders WHERE id = $1`, moved.ID) })
+	// The section shows another collection, so the restore looks for its
+	// own by key.
+	repo := catalog.NewLibraryCollectionRepository(pool)
+	ordinary, err := repo.Create(ctx, catalog.CreateLibraryCollectionInput{LibraryID: s.library, Slug: "ordinary-" + s.suffix, Title: "Ordinary " + s.suffix})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dbExec(t, pool, `UPDATE page_sections SET config = jsonb_build_object('library_collection_id', $2::text) WHERE id = $1`, s.managed, ordinary.ID)
+	dbExec(t, pool, `DELETE FROM library_collection_items WHERE collection_id = $1`, s.managedCollection)
+	preview, err := f.svc.Preview(ctx, backup.ID, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := homeSectionItemID(s.managed)
+	report := f.restoreRequest(t, RestoreRequest{BackupID: backup.ID, Digest: preview.Digest, Selection: map[string][]string{SectionHomeSections: {id}}})
+	if got := reportItem(t, report, SectionHomeSections, id); got.Outcome != OutcomeRestored {
+		t.Fatalf("restoring it = %+v", got)
+	}
+	var shown, key string
+	var library int
+	if err := pool.QueryRow(ctx, `SELECT c.id, c.management_key, c.library_id FROM page_sections p
+		JOIN library_collections c ON c.id = p.config->>'library_collection_id' WHERE p.id = $1`, s.managed).Scan(&shown, &key, &library); err != nil {
+		t.Fatal(err)
+	}
+	if shown == s.managedCollection || key != keyFor(moved.ID) || library != moved.ID {
+		t.Fatalf("restored section shows %s (key %q, library %d), want a new collection in library %d keyed for it", shown, key, library, moved.ID)
+	}
+	if n := countRows(t, pool, `SELECT count(*) FROM library_collection_items WHERE collection_id = $1`, s.managedCollection); n != 0 {
+		t.Fatalf("the other library's collection got %d of the backup's items", n)
+	}
+}
+
 // TestRestoredLibrarySectionsWaitForTheRestoreDB: a library the restore
 // recreates gets its default sections only after the restore wrote its saved
 // ones, and only where it wrote none. A default renamed before the backup
@@ -942,6 +1188,16 @@ func TestRestoredLibrarySectionsWaitForTheRestoreDB(t *testing.T) {
 	dbExec(t, pool, `UPDATE page_sections SET title = 'Renamed before the backup'
 		WHERE id = (SELECT id FROM page_sections WHERE library_id = $1 ORDER BY position LIMIT 1)`, library)
 	saved := countRows(t, pool, `SELECT count(*) FROM page_sections WHERE library_id = $1`, library)
+	// A template collection of the library, created again before its
+	// sections: its follow-up runs before theirs are written.
+	defaults, err := f.svc.targets.TemplateCollection("core_defaults", "tmdb_popular_movies", library, "movies")
+	if err != nil {
+		t.Fatal(err)
+	}
+	template, err := catalog.NewLibraryCollectionRepository(pool).Create(ctx, defaults.Input)
+	if err != nil {
+		t.Fatal(err)
+	}
 	source, err := backupUnderLock(t, f.svc, KindManual)
 	if err != nil {
 		t.Fatal(err)
@@ -951,7 +1207,7 @@ func TestRestoredLibrarySectionsWaitForTheRestoreDB(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	selection := map[string][]string{SectionLibraries: {strconv.Itoa(library)}}
+	selection := map[string][]string{SectionLibraries: {strconv.Itoa(library)}, SectionCollections: {templateCollectionItemID(template.ID)}}
 	for _, section := range preview.Sections {
 		for _, item := range section.Items {
 			if section.ID == SectionHomeSections && item.Selectable && item.HomeSection != nil && item.HomeSection.Scope == pageScopeLibrary {
@@ -962,6 +1218,9 @@ func TestRestoredLibrarySectionsWaitForTheRestoreDB(t *testing.T) {
 	report := f.restoreRequest(t, RestoreRequest{BackupID: source.ID, Digest: preview.Digest, Selection: selection})
 	restored := report.LibraryMap[strconv.Itoa(library)]
 	t.Cleanup(func() { _, _ = pool.Exec(context.Background(), `DELETE FROM media_folders WHERE id = $1`, restored) })
+	if got := report.Counts[OutcomeRestored]; got != len(selection[SectionLibraries])+len(selection[SectionCollections])+len(selection[SectionHomeSections]) {
+		t.Fatalf("restored %d items, want every selected one: %+v", got, report.Items)
+	}
 	if n := countRows(t, pool, `SELECT count(*) FROM page_sections WHERE library_id = $1`, restored); restored == 0 || n != saved {
 		t.Fatalf("restored library %d has %d sections, want the %d saved ones and no seeded defaults beside them", restored, n, saved)
 	}
@@ -1305,4 +1564,66 @@ func (f *selectiveFixture) checkRestoredPages(t *testing.T, s pagesSeed, report 
 		t.Fatalf("restored home layout %s, %v; want it to name section %s", layout, err, s.layout)
 	}
 	return id
+}
+
+// TestSelectiveRestoreOnOneConnectionDB: Silo may run with a pool of one
+// connection, and a restore item's fenced transaction holds it, so nothing
+// an item does may wait on the pool. A restore of every item a preview
+// offers, libraries, settings, collections with their template and
+// artwork, and page sections, runs on such a pool with nothing cached and
+// finishes; any pool use inside an item would hang until the deadline.
+func TestSelectiveRestoreOnOneConnectionDB(t *testing.T) {
+	_, dsn := backuptest.Database(t)
+	cfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.MaxConns = 1
+	pool, err := pgxpool.NewWithConfig(t.Context(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	f := newSelectiveFixtureOn(t, pool, dsn)
+	wirePageTargets(f, new(bool), &[]string{})
+	seed := seedSelective(t, f.pool, f.settings, f.store)
+	pages := seedPages(t, f)
+	source, err := backupUnderLock(t, f.svc, KindManual)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.lose(t, seed)
+	f.losePages(t, pages)
+	// A fresh service: no restore set, settings, or installation cached.
+	targets := f.svc.targets
+	f.svc = New(f.svc.opts)
+	f.svc.SetRestoreTargets(targets)
+	preview, err := f.svc.Preview(t.Context(), source.ID, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	selection := map[string][]string{}
+	for _, section := range preview.Sections {
+		for _, item := range section.Items {
+			if item.Selectable {
+				selection[section.ID] = append(selection[section.ID], item.ID)
+			}
+		}
+	}
+	if len(selection[SectionLibraries]) == 0 || len(selection[SectionCollections]) == 0 || len(selection[SectionHomeSections]) == 0 {
+		t.Fatalf("selection %v leaves out a section", selection)
+	}
+	done := make(chan *SelectiveReport, 1)
+	go func() {
+		report, _ := f.restore(t, source.ID, preview.Digest, selection, &testFence{pool: f.pool})
+		done <- report
+	}()
+	select {
+	case report := <-done:
+		if report == nil || report.Error != "" || report.Counts[OutcomeFailed] != 0 {
+			t.Fatalf("restore on one connection = %+v", report)
+		}
+	case <-time.After(2 * time.Minute):
+		t.Fatal("a restore item waited on the pool its own transaction holds")
+	}
 }

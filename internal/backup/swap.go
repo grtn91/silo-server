@@ -24,6 +24,10 @@ type ControlDB interface {
 	// CheckPrivileges confirms the role can create and rename databases and
 	// change ALLOW_CONNECTIONS on live.
 	CheckPrivileges(ctx context.Context, live string) error
+	// CheckExtensions confirms the role can create each extension in a new
+	// database: a superuser can create any installed one, any other role
+	// only trusted ones.
+	CheckExtensions(ctx context.Context, names []string) error
 	Create(ctx context.Context, name string) error
 	Drop(ctx context.Context, name string) error
 	Rename(ctx context.Context, from, to string) error
@@ -127,7 +131,9 @@ func RestoreSwap(ctx context.Context, src *Source, loader DatabaseLoader, ctl Co
 	}
 	stores := storesOf(opened)
 	// Step 2: preflight. Nothing changes here.
-	liveOID, err := swapPreflight(ctx, ctl, stores, live, restored, before)
+	liveOID, err := swapPreflight(ctx, ctl, stores, live, restored, before, func() ([]string, error) {
+		return loader.Extensions(ctx, src.path(DumpName))
+	})
 	if err != nil {
 		return err
 	}
@@ -176,7 +182,7 @@ func RestoreSwap(ctx context.Context, src *Source, loader DatabaseLoader, ctl Co
 	if err := clearLostSettings(ctx, loader, restoredURL, m, opts.Validate, opts.Cipher, out); err != nil {
 		return discard(err)
 	}
-	if err := carryLiveState(ctx, ctl, live, loader, restoredURL, opts, sameDeployment, out); err != nil {
+	if err := carryLiveState(ctx, ctl, live, loader, restoredURL, opts, sameDeployment, m.CreatedAt, out); err != nil {
 		return discard(err)
 	}
 	// A subtitle the backup left out may still be in the live storage the
@@ -252,13 +258,19 @@ func lockLive(ctx context.Context, ctl ControlDB, liveURL string) (string, func(
 	return live, unlock, err
 }
 
-// carryLiveState carries the live server's credentials into the restored
-// database, and keeps its stricter access settings and security switches.
+// carryLiveState says which accounts the restore rolls back to the backup's
+// (taken), carries the live server's credentials into the restored
+// database, ends the backup's unfinished work with the live storage
+// transition (interruptWork), and keeps its stricter access settings and
+// security switches.
 // They are as they will be at the swap only while no other client is on the
 // live database: one that connected since preflight stops the restore here,
 // and the swap checks again once the live database is closed (swap.run).
-func carryLiveState(ctx context.Context, ctl ControlDB, live string, loader DatabaseLoader, restoredURL string, opts SwapOptions, sameDeployment bool, out io.Writer) error {
+func carryLiveState(ctx context.Context, ctl ControlDB, live string, loader DatabaseLoader, restoredURL string, opts SwapOptions, sameDeployment bool, taken time.Time, out io.Writer) error {
 	if err := checkLiveIdle(ctx, ctl, live); err != nil {
+		return err
+	}
+	if err := reportAccountRollback(ctx, loader, restoredURL, opts.LiveURL, taken, sameDeployment, out); err != nil {
 		return err
 	}
 	// What is tied to an account, a profile, or an installation is the live
@@ -269,6 +281,23 @@ func carryLiveState(ctx context.Context, ctl ControlDB, live string, loader Data
 		carryFrom = ""
 	}
 	if err := carryCredentials(ctx, loader, restoredURL, carryFrom, out); err != nil {
+		return err
+	}
+	if err := carryOutboundSettings(ctx, loader, restoredURL, carryFrom, out); err != nil {
+		return err
+	}
+	if err := carryPluginReleases(ctx, loader, restoredURL, carryFrom, out); err != nil {
+		return err
+	}
+	if err := carryPolicies(ctx, loader, restoredURL, carryFrom, out); err != nil {
+		return err
+	}
+	// This server's own settings describe it whichever deployment the
+	// backup came from.
+	if err := carryServerSpecificSettings(ctx, loader, restoredURL, opts.LiveURL, out); err != nil {
+		return err
+	}
+	if err := interruptWork(ctx, loader, restoredURL, opts.LiveURL, out); err != nil {
 		return err
 	}
 	return keepStricterSettings(ctx, loader, restoredURL, opts.LiveURL, opts.Cipher, out)
@@ -286,6 +315,11 @@ func (opts SwapOptions) now() time.Time {
 // this deployment's (checkDeployment).
 func validateForSwap(ctx context.Context, src *Source, loader DatabaseLoader, opts SwapOptions, out io.Writer) (bool, error) {
 	if err := src.Validate(ctx, opts.Validate); err != nil {
+		return false, err
+	}
+	// The restored database is created on the live server, and pg_restore
+	// connects to it as the live URL's role.
+	if err := checkLoadRole(ctx, src, loader, opts.LiveURL, opts.Validate, out); err != nil {
 		return false, err
 	}
 	return checkDeployment(ctx, src, loader, opts, out)
@@ -337,7 +371,7 @@ func checkLiveIdle(ctx context.Context, ctl ControlDB, live string) error {
 // swapPreflight is §10.2 step 2: no other client on the live database, the
 // privileges a swap needs, free names for the two databases it creates, and
 // writable stores. It changes nothing and returns the live database's oid.
-func swapPreflight(ctx context.Context, ctl ControlDB, stores blobStores, live, restored, before string) (uint32, error) {
+func swapPreflight(ctx context.Context, ctl ControlDB, stores blobStores, live, restored, before string, extensions func() ([]string, error)) (uint32, error) {
 	if others, err := ctl.OtherConnections(ctx, live); err != nil {
 		return 0, fmt.Errorf("checking for other connections: %w", err)
 	} else if others > 0 {
@@ -345,6 +379,15 @@ func swapPreflight(ctx context.Context, ctl ControlDB, stores blobStores, live, 
 	}
 	if err := ctl.CheckPrivileges(ctx, live); err != nil {
 		return 0, fmt.Errorf("%w; stop here and use separate mode (--into) instead", err)
+	}
+	// The restored database is new, from template0: pg_restore creates the
+	// backup's extensions in it as this role.
+	needed, err := extensions()
+	if err != nil {
+		return 0, fmt.Errorf("reading the extensions the backup needs: %w", err)
+	}
+	if err := ctl.CheckExtensions(ctx, needed); err != nil {
+		return 0, err
 	}
 	for _, name := range []string{restored, before} {
 		if _, taken, err := ctl.OID(ctx, name); err != nil {

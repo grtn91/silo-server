@@ -71,24 +71,33 @@ func ensureTitle(ctx context.Context, tx pgx.Tx, snap Snapshot, now time.Time) e
 	return fmt.Errorf("creating watchlist title: lost the race to create it %d times", maxAddAttempts)
 }
 
-// ProfileHasTitleInTx reports whether the profile's own watchlist holds the
-// title snap names, by any TMDB id the title has had. It reads only that
-// profile's entries, so its answer says nothing about any other account's
-// watchlist: an untrusted import (a profile's own export) links no title
-// the profile does not already list (watchlist.BackupData.Import).
-func ProfileHasTitleInTx(ctx context.Context, tx pgx.Tx, userID int, profileID string, snap Snapshot) (bool, error) {
-	if snap.MediaType != mediaTypeMovie && snap.MediaType != mediaTypeSeries || snap.TMDBID <= 0 {
-		return false, fmt.Errorf("watchlist: invalid title %s/%d", snap.MediaType, snap.TMDBID)
+// ProfileTitlesInTx lists, in one read, the titles a profile's own
+// watchlist holds, as "<media type>:<TMDB ID>" for every TMDB id each has
+// had. It reads only that profile's entries, so it says nothing about any
+// other account's watchlist: an untrusted import (a profile's own export)
+// links no title the profile does not already list
+// (watchlist.BackupData.Import).
+func ProfileTitlesInTx(ctx context.Context, tx pgx.Tx, userID int, profileID string) (map[string]bool, error) {
+	rows, err := tx.Query(ctx, `
+		SELECT a.media_type || ':' || a.provider_id FROM user_watchlist_titles u
+		JOIN watchlist_title_aliases a ON a.title_id = u.title_id
+		WHERE u.user_id = $1 AND u.profile_id = $2 AND a.provider = 'tmdb'`, userID, profileID)
+	if err != nil {
+		return nil, err
 	}
-	var has bool
-	err := tx.QueryRow(ctx, `
-		SELECT EXISTS (
-			SELECT 1 FROM user_watchlist_titles u
-			JOIN watchlist_title_aliases a ON a.title_id = u.title_id
-			WHERE u.user_id = $1 AND u.profile_id = $2 AND a.media_type = $3 AND a.provider = 'tmdb' AND a.provider_id = $4)`,
-		userID, profileID, snap.MediaType, strconv.Itoa(snap.TMDBID)).Scan(&has)
-	return has, err
+	keys, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]bool, len(keys))
+	for _, k := range keys {
+		out[k] = true
+	}
+	return out, nil
 }
+
+// TitleKey is a snapshot's key in ProfileTitlesInTx.
+func (snap Snapshot) TitleKey() string { return snap.MediaType + ":" + strconv.Itoa(snap.TMDBID) }
 
 // AddSnapshotInTx puts a title on a profile's watchlist in the caller's
 // transaction, as AddSnapshot does: the title holding the TMDB ID, current

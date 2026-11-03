@@ -135,7 +135,9 @@ type ProfileEntry struct {
 	AllowedLibraryIDs          []int  `json:"allowed_library_ids"`
 	MaxPlaybackQuality         string `json:"max_playback_quality"`
 	// Data holds each data type's document by data type id.
-	Data map[string]json.RawMessage `json:"data"`
+	// Data is each type's own document, which the type bounds itself
+	// (userdata.DecodeStrict).
+	Data map[string]json.RawMessage `json:"data" bound:"-"`
 	// counts is each data type's entry count, recorded when the reader
 	// validated Data, so a preview does not decode the documents again.
 	counts map[string]int
@@ -575,7 +577,12 @@ func (p *restoreSetParser) decodeUsers(spec sectionSpec) (int, error) {
 			p.unusable(SectionUsers, KindAccount, label, "Its document names another account than its file.")
 			continue
 		}
-		blobs, err := validateUserDocument(&doc)
+		// Bounds first: validation may clear what it locks.
+		err = userdata.CheckBounds(&doc)
+		var blobs []string
+		if err == nil {
+			blobs, err = validateUserDocument(&doc)
+		}
 		if err != nil {
 			p.unusable(SectionUsers, KindAccount, label, truncateText("It cannot be restored: "+err.Error(), 500))
 			continue
@@ -614,6 +621,11 @@ func validateUserDocument(doc *UserDocument) ([]string, error) {
 			return nil, fmt.Errorf("profile id %q is not valid or is listed twice", p.ID)
 		}
 		seen[p.ID] = true
+		bounded := *p
+		bounded.Data = nil // each data type bounds its own document
+		if entryTooLarge(bounded) {
+			return nil, fmt.Errorf("profile %q holds more than this server's editors accept in one request", p.ID)
+		}
 		keys, err := validateProfileEntry(p)
 		if err != nil {
 			return nil, err
@@ -639,6 +651,9 @@ func validateUserDocument(doc *UserDocument) ([]string, error) {
 func validateAccountEntry(a AccountEntry) error {
 	if a.ID <= 0 {
 		return fmt.Errorf("account id %d is not valid", a.ID)
+	}
+	if entryTooLarge(a) {
+		return fmt.Errorf("account %d holds more than this server's editors accept in one request", a.ID)
 	}
 	for _, s := range []string{a.Username, a.Email, a.PasswordHash} {
 		if len(s) > maxAccountField || !utf8.ValidString(s) {

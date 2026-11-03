@@ -174,10 +174,13 @@ func (r *Repository) RunFenced(ctx context.Context, id string, fn func(pgx.Tx) (
 	if err != nil {
 		return fmt.Errorf("marshaling admin job result payload: %w", err)
 	}
+	// clock_timestamp, not NOW: NOW is the transaction's start, and an item
+	// longer than the stale window would commit a heartbeat already stale
+	// to the recovery waiting behind its row lock.
 	if _, err := tx.Exec(ctx, `
 		UPDATE admin_jobs
 		SET result_payload = $2, progress_current = $3, progress_total = $4, message = $5,
-			heartbeat_at = NOW(), updated_at = NOW()
+			heartbeat_at = GREATEST(heartbeat_at, clock_timestamp()), updated_at = clock_timestamp()
 		WHERE id = $1`, id, payload, update.Current, update.Total, update.Message); err != nil {
 		return fmt.Errorf("recording the job result: %w", err)
 	}

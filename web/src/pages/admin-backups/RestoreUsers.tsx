@@ -11,7 +11,13 @@ import { SettingFieldStatus } from "@/pages/admin-settings/SettingField";
 import { RowDisclosure } from "./Disclosure";
 import { itemState } from "./restoreGroups";
 import { StateTag, type ToggleKeys } from "./RestoreRows";
-import { REASON_SENTENCES, policyDifferenceSentence, profileKey, toggleKeys } from "./restoreModel";
+import {
+  REASON_SENTENCES,
+  policyDifferenceSentence,
+  profileKey,
+  requiredPrimary,
+  toggleKeys,
+} from "./restoreModel";
 
 function droppedLibraries(count: number): string {
   return count === 1
@@ -33,15 +39,27 @@ function ProfileRow({
   account,
   profile,
   checked,
+  locked,
+  primary,
   onToggle,
 }: {
   account: RestoreItem;
   profile: RestoreProfile;
   checked: boolean;
+  /** The required primary profile while another of the account's profiles is chosen. */
+  locked: boolean;
+  /** The account's required primary profile, chosen with this one. */
+  primary: RestoreProfile | undefined;
   onToggle: ToggleKeys;
 }) {
   const controlId = useId();
-  const selectable = profile.selectable && account.selectable;
+  const selectable = profile.selectable && account.selectable && !locked;
+  const keys = (value: boolean) => {
+    const own = profileKey(account.id, profile.id);
+    return value && primary && primary.id !== profile.id
+      ? [own, profileKey(account.id, primary.id)]
+      : [own];
+  };
   // A choosable profile's detail line already says it merges or is created;
   // only a profile that can't be restored needs a sentence, saying why.
   // A matched profile with nothing to change is the normal state, not a caveat.
@@ -58,9 +76,9 @@ function ProfileRow({
       <Checkbox
         id={controlId}
         className="mt-0.5"
-        checked={checked}
+        checked={checked || locked}
         disabled={!selectable}
-        onCheckedChange={(value) => onToggle([profileKey(account.id, profile.id)], value === true)}
+        onCheckedChange={(value) => onToggle(keys(value === true), value === true)}
       />
       <div className="min-w-0 flex-1">
         <div className="flex min-w-0 items-baseline gap-2">
@@ -77,6 +95,12 @@ function ProfileRow({
         {why ? (
           <SettingFieldStatus tone={profile.selectable ? "muted" : "warn"}>
             {why}
+          </SettingFieldStatus>
+        ) : null}
+        {locked ? (
+          <SettingFieldStatus tone="muted">
+            Restored with the account&apos;s other profiles: only a primary profile manages the
+            household.
           </SettingFieldStatus>
         ) : null}
         {profile.no_library_access ? (
@@ -116,6 +140,7 @@ export const AccountRow = memo(function AccountRow({
   const account = item.account;
   if (!account) return null;
   const chosen = new Set(chosenProfiles ? chosenProfiles.split("\u0000") : []);
+  const primary = requiredPrimary(item);
   const merges = account.target !== "new";
   const newProfiles = account.profiles.filter(
     (profile) => profile.selectable && profile.target === "new",
@@ -233,6 +258,8 @@ export const AccountRow = memo(function AccountRow({
                   account={item}
                   profile={profile}
                   checked={chosen.has(profile.id)}
+                  locked={profile.id === primary?.id && [...chosen].some((id) => id !== primary.id)}
+                  primary={primary}
                   onToggle={onToggle}
                 />
               ))}

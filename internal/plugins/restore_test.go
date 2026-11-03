@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -128,6 +129,101 @@ func TestRestoreInstallationDB(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestRestoreInstallationOnOneConnectionDB: a restore item's transaction
+// may hold a pool's only connection, so RestoreInstallation reads the
+// installation and its manifest through the transaction, and the archive
+// cache never holds its lock while it waits on the pool: a cold-cache
+// manifest load on the same pool, already waiting for the connection the
+// restore holds, does not stop the restore, and finishes after it.
+func TestRestoreInstallationOnOneConnectionDB(t *testing.T) {
+	pool := restoreTestPool(t)
+	ctx := t.Context()
+	cipher, err := secret.New([]byte("plugin-restore-test-key-0123456789abcdef"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := newRestoreFixture(t, pool, cipher)
+	pluginID := f.newPluginID()
+	manifest := testPluginManifest(t, pluginID, "1.0.0")
+	archivePath := filepath.Join(t.TempDir(), "plugin.zip")
+	writePluginArchive(t, archivePath, manifest)
+	if _, err := f.svc.installer.InstallLocal(ctx, InstallArchiveRequest{ArchivePath: archivePath}); err != nil {
+		t.Fatal(err)
+	}
+	installs, err := f.installations.ListByPluginID(ctx, pluginID)
+	if err != nil || len(installs) != 1 {
+		t.Fatalf("installations = %v, %v", installs, err)
+	}
+	inst := installs[0]
+	cfg := pool.Config().Copy()
+	cfg.MaxConns = 1
+	one, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(one.Close)
+	cold := newRestoreFixture(t, one, cipher)
+	// The installed files are gone, so every reader rehydrates them from
+	// the stored archive.
+	binaryPath, err := cold.svc.archiveCache.LocalInstallPath(inst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(filepath.Dir(binaryPath)); err != nil {
+		t.Fatal(err)
+	}
+	waiting := make(chan struct{}, 1)
+	cold.svc.archiveCache.archives = signalingArchives{archiveStore: cold.svc.archiveCache.archives, reading: waiting}
+
+	tx, err := one.Begin(ctx) // the pool's only connection
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+	loaded := make(chan error, 1)
+	go func() {
+		_, err := cold.svc.archiveCache.Manifest(ctx, inst)
+		loaded <- err
+	}()
+	select {
+	case <-waiting: // reading the stored archive, on the pool
+	case <-time.After(time.Minute):
+		t.Fatal("the cold-cache load never read the stored archive")
+	}
+	restored := make(chan error, 1)
+	go func() {
+		_, _, err := cold.svc.RestoreInstallation(ctx, tx, RestoreInstallationInput{PluginID: pluginID, Version: "1.0.0", SourceInstallationID: 1})
+		if err == nil {
+			err = tx.Commit(ctx)
+		}
+		restored <- err
+	}()
+	for name, done := range map[string]chan error{"RestoreInstallation": restored, "the cold-cache load": loaded} {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("%s: %v", name, err)
+			}
+		case <-time.After(time.Minute):
+			t.Fatalf("%s waited on the pool the restore's transaction holds", name)
+		}
+	}
+}
+
+// signalingArchives reports each archive read as it starts.
+type signalingArchives struct {
+	archiveStore
+	reading chan struct{}
+}
+
+func (s signalingArchives) GetArchive(ctx context.Context, installationID int) (*InstallationArchive, error) {
+	select {
+	case s.reading <- struct{}{}:
+	default:
+	}
+	return s.archiveStore.GetArchive(ctx, installationID)
 }
 
 // restoreFixture is TestRestoreInstallationDB's service over pool and its

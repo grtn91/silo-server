@@ -75,6 +75,11 @@ func TestBackupRestoreFencingDB(t *testing.T) {
 		t.Fatalf("after a committed item the job is %+v, %v; want still running", current, err)
 	}
 
+	// An item that outlasts the stale window: its commit writes the
+	// heartbeat at the commit's time, not its transaction's start, so the
+	// recovery waiting behind it does not find the job stale.
+	checkLongItem(t, r, worker, job.ID)
+
 	// A worker that stopped heartbeating is interrupted, not requeued.
 	makeStale()
 	if _, err := r.RequeueStaleRunning(ctx, staleBefore()); err != nil {
@@ -98,5 +103,63 @@ func TestBackupRestoreFencingDB(t *testing.T) {
 	})
 	if !errors.Is(err, ErrJobNotFound) || called {
 		t.Fatalf("fenced write after interruption = %v (ran %v), want ErrJobNotFound without running", err, called)
+	}
+}
+
+// checkLongItem runs an item that holds the job row past a stale window
+// that starts after the item did, with an ordinary heartbeat and then
+// recovery waiting on its row lock.
+func checkLongItem(t *testing.T, r *Repository, worker *Repository, id string) {
+	t.Helper()
+	ctx := t.Context()
+	locked, release := make(chan struct{}), make(chan struct{})
+	fenced := make(chan error, 1)
+	go func() {
+		fenced <- worker.RunFenced(ctx, id, func(pgx.Tx) (FencedUpdate, error) {
+			close(locked)
+			<-release
+			return FencedUpdate{Result: map[string]int{"items": 1}, Current: 1, Total: 2, Message: "item 1, again"}, nil
+		})
+	}()
+	<-locked
+	// An ordinary heartbeat that began during the item waits on the row
+	// first, then recovery: neither may take the job for stale.
+	waitFor := func(n int) {
+		t.Helper()
+		for waiting := 0; waiting < n; {
+			if err := r.pool.QueryRow(ctx, `SELECT count(*) FROM pg_stat_activity
+				WHERE wait_event_type = 'Lock' AND query LIKE '%UPDATE admin_jobs%'`).Scan(&waiting); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	beat := make(chan error, 1)
+	go func() { beat <- worker.TouchHeartbeat(context.Background(), id) }()
+	waitFor(1)
+	// Anything older than now is stale: the item's transaction and the
+	// waiting heartbeat's statement both began before it.
+	var window time.Time
+	if err := r.pool.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&window); err != nil {
+		t.Fatal(err)
+	}
+	recovered := make(chan error, 1)
+	go func() {
+		_, err := r.RequeueStaleRunning(context.Background(), window)
+		recovered <- err
+	}()
+	waitFor(2)
+	close(release)
+	if err := <-fenced; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-beat; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-recovered; err != nil {
+		t.Fatal(err)
+	}
+	current, err := r.GetByID(ctx, id)
+	if err != nil || current.Status != StatusRunning || current.Message != "item 1, again" {
+		t.Fatalf("after an item longer than the stale window the job is %+v, %v; want still running", current, err)
 	}
 }

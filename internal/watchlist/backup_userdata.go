@@ -131,6 +131,9 @@ func decodeFavorites(data json.RawMessage) (favoritesDocument, userdata.Summary,
 	if err := userdata.DecodeStrict(data, &doc); err != nil {
 		return doc, sum, err
 	}
+	if len(doc.Titles) > maxImportedTitles {
+		return doc, sum, fmt.Errorf("more than %d watchlist titles", maxImportedTitles)
+	}
 	sum.Count = len(doc.Favorites) + len(doc.Watchlist) + len(doc.Titles)
 	if err := userdata.CheckEntries("favorites", sum.Count); err != nil {
 		return doc, sum, err
@@ -195,6 +198,10 @@ func (BackupData) Prepare(ctx context.Context, tx pgx.Tx, docs []userdata.Prepar
 	return EnsureTitlesInTx(ctx, tx, snaps, now)
 }
 
+// maxImportedTitles bounds the watchlist titles outside the library one
+// document carries: a profile's watchlist holds a few hundred.
+const maxImportedTitles = 10_000
+
 func (BackupData) Import(ctx context.Context, tx pgx.Tx, target userdata.Target, data json.RawMessage) (userdata.Result, error) {
 	doc, _, err := decodeFavorites(data)
 	if err != nil {
@@ -205,10 +212,10 @@ func (BackupData) Import(ctx context.Context, tx pgx.Tx, target userdata.Target,
 	if err := importTitles(ctx, tx, target, doc.Titles, &res); err != nil {
 		return res, err
 	}
-	if err := importKeyed(ctx, tx, target, `INSERT INTO user_favorites (user_id, profile_id, media_item_id, added_at) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING`, doc.Favorites, &res); err != nil {
+	if err := importKeyed(ctx, tx, target, `INSERT INTO user_favorites (user_id, profile_id, media_item_id, added_at) SELECT $1, $2, u.item, u.at FROM unnest($3::text[], $4::timestamptz[]) AS u(item, at) ON CONFLICT DO NOTHING`, doc.Favorites, &res); err != nil {
 		return res, fmt.Errorf("restoring favorites: %w", err)
 	}
-	if err := importKeyed(ctx, tx, target, `INSERT INTO user_watchlist (user_id, profile_id, media_item_id, added_at) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING`, doc.Watchlist, &res); err != nil {
+	if err := importKeyed(ctx, tx, target, `INSERT INTO user_watchlist (user_id, profile_id, media_item_id, added_at) SELECT $1, $2, u.item, u.at FROM unnest($3::text[], $4::timestamptz[]) AS u(item, at) ON CONFLICT DO NOTHING`, doc.Watchlist, &res); err != nil {
 		return res, fmt.Errorf("restoring the watchlist: %w", err)
 	}
 	return res, nil
@@ -222,13 +229,17 @@ func (BackupData) Import(ctx context.Context, tx pgx.Tx, target userdata.Target,
 // account has listed the title.
 func importTitles(ctx context.Context, tx pgx.Tx, target userdata.Target, titles []watchedTitle, res *userdata.Result) error {
 	missing := 0
+	var listed map[string]bool
+	if target.Untrusted && len(titles) > 0 {
+		// The profile's titles are read once, not once per title.
+		var err error
+		if listed, err = ProfileTitlesInTx(ctx, tx, target.UserID, target.ProfileID); err != nil {
+			return fmt.Errorf("reading the profile's watchlist: %w", err)
+		}
+	}
 	for _, w := range titles {
 		if target.Untrusted {
-			has, err := ProfileHasTitleInTx(ctx, tx, target.UserID, target.ProfileID, w.snapshot())
-			if err != nil {
-				return fmt.Errorf("reading the profile's watchlist: %w", err)
-			}
-			if has {
+			if listed[w.snapshot().TitleKey()] {
 				res.Unchanged++
 			} else {
 				missing++
@@ -252,10 +263,12 @@ func importTitles(ctx context.Context, tx pgx.Tx, target userdata.Target, titles
 	return nil
 }
 
-// importKeyed inserts each mapped entry the profile does not have. sql takes
-// user id, profile id, item, and time, and must do nothing on conflict.
+// importKeyed inserts, in one statement, each mapped entry the profile
+// does not have. sql takes user id, profile id, an array of items, and an
+// array of times, and must do nothing on conflict.
 func importKeyed(ctx context.Context, tx pgx.Tx, target userdata.Target, sql string, entries []keyedEntry, res *userdata.Result) error {
-	var rows [][]any
+	var items []string
+	var at []time.Time
 	for _, e := range entries {
 		local, ok, err := target.Items.Resolve(ctx, e.Item)
 		if err != nil {
@@ -265,15 +278,19 @@ func importKeyed(ctx context.Context, tx pgx.Tx, target userdata.Target, sql str
 			res.LeftOut++
 			continue
 		}
-		at := e.At
-		if at.IsZero() {
-			at = target.Now
+		when := e.At
+		if when.IsZero() {
+			when = target.Now
 		}
-		rows = append(rows, []any{target.UserID, target.ProfileID, local, at})
+		items, at = append(items, local), append(at, when)
 	}
-	added, err := userdata.InsertEach(ctx, tx, sql, rows)
+	if len(items) == 0 {
+		return nil
+	}
+	tag, err := tx.Exec(ctx, sql, target.UserID, target.ProfileID, items, at)
+	added := int(tag.RowsAffected())
 	res.Added += added
-	res.Unchanged += len(rows) - added
+	res.Unchanged += len(items) - added
 	return err
 }
 

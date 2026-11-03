@@ -6,6 +6,7 @@ package backup
 // (RestoreSet.Unusable) and anything that breaks the set refused.
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -23,10 +24,7 @@ func (p *restoreSetParser) document(name string, into any) (bool, error) {
 	if !ok {
 		return false, nil
 	}
-	if err := checkJSONDepth(data); err != nil {
-		return false, fmt.Errorf("%s: %w", name, err)
-	}
-	if err := decodeStrict(data, into); err != nil {
+	if err := p.decode(data, into); err != nil {
 		return false, fmt.Errorf("%s: %w", name, err)
 	}
 	return true, nil
@@ -40,12 +38,18 @@ func (p *restoreSetParser) decodeSection(si SectionIndex) (int, error) {
 			return 0, requireDocument(spec, ok, err)
 		}
 		n := len(p.rs.Settings.Settings)
+		if err := capEntries("settings", n, maxSettingEntries); err != nil {
+			return 0, err
+		}
 		return n, p.validateSettings()
 	case SectionLibraries:
 		if ok, err := p.document(spec.document, &p.rs.Libraries); err != nil || !ok {
 			return 0, requireDocument(spec, ok, err)
 		}
 		n := len(p.rs.Libraries.Libraries)
+		if err := capEntries("libraries", n, maxLibraryEntries); err != nil {
+			return 0, err
+		}
 		return n, p.validateLibraries()
 	case SectionCollections:
 		if ok, err := p.document(spec.document, &p.rs.Collections); err != nil || !ok {
@@ -53,12 +57,21 @@ func (p *restoreSetParser) decodeSection(si SectionIndex) (int, error) {
 		}
 		d := p.rs.Collections
 		n := len(d.Collections) + len(d.TemplateCollections) + len(d.ItemArtwork) + len(d.Branding)
+		if err := errors.Join(capEntries("collections", len(d.Collections), maxCollectionEntries),
+			capEntries("template collections", len(d.TemplateCollections), maxCollectionEntries),
+			capEntries("item artwork entries", len(d.ItemArtwork), maxArtworkEntries),
+			capEntries("branding assets", len(d.Branding), maxBrandingEntries)); err != nil {
+			return 0, err
+		}
 		return n, p.validateCollections()
 	case SectionHomeSections:
 		if ok, err := p.document(spec.document, &p.rs.HomeSections); err != nil || !ok {
 			return 0, requireDocument(spec, ok, err)
 		}
 		n := len(p.rs.HomeSections.Sections)
+		if err := capEntries("page sections", n, maxSectionEntries); err != nil {
+			return 0, err
+		}
 		return n, p.validateHomeSections()
 	case SectionPlugins:
 		return p.decodePlugins(spec)
@@ -66,6 +79,27 @@ func (p *restoreSetParser) decodeSection(si SectionIndex) (int, error) {
 		return p.decodeUsers(spec)
 	}
 	return 0, fmt.Errorf("no reader for section %q", si.ID)
+}
+
+// Caps on the entries of one section, at what a large server has: each is
+// an item a preview lists and a restore may write, so a set beyond them is
+// refused rather than previewed.
+const (
+	maxSettingEntries    = 5000
+	maxLibraryEntries    = 1000
+	maxCollectionEntries = 20_000
+	maxArtworkEntries    = 50_000
+	maxBrandingEntries   = 64
+	maxSectionEntries    = 10_000
+	maxPluginEntries     = 500
+)
+
+// capEntries refuses a set with more than max entries of one kind.
+func capEntries(what string, n, maxEntries int) error {
+	if n > maxEntries {
+		return fmt.Errorf("it holds %d %s, more than the %d a restore reads", n, what, maxEntries)
+	}
+	return nil
 }
 
 // UnusableEntry is an entry of a restore set the reader left out.
@@ -79,8 +113,19 @@ type UnusableEntry struct {
 	Message string
 }
 
-// unusable records an entry left out, labeled by what the archive names it.
+// maxUnusableListed bounds the entries left out that a set lists for one
+// section; the rest are counted (summarizeUnusable).
+const maxUnusableListed = 100
+
+// unusable records an entry left out, labeled by what the archive names it:
+// the first maxUnusableListed of a section, and a count of the rest.
 func (p *restoreSetParser) unusable(section, kind, label, message string) {
+	if p.unusableCount == nil {
+		p.unusableCount = map[string]int{}
+	}
+	if p.unusableCount[section]++; p.unusableCount[section] > maxUnusableListed {
+		return
+	}
 	label = strings.TrimSpace(strings.ToValidUTF8(label, ""))
 	if len(label) > 200 {
 		label = strings.ToValidUTF8(label[:200], "")
@@ -90,6 +135,24 @@ func (p *restoreSetParser) unusable(section, kind, label, message string) {
 	}
 	p.rs.Unusable = append(p.rs.Unusable, UnusableEntry{Section: section, ID: fmt.Sprintf("unreadable:%d", len(p.rs.Unusable)+1),
 		Kind: kind, Label: label, Message: message})
+}
+
+// summarizeUnusable adds, for a section with more entries left out than it
+// lists, one entry saying how many more there are.
+func (p *restoreSetParser) summarizeUnusable(section string) {
+	more := p.unusableCount[section] - maxUnusableListed
+	if more <= 0 {
+		return
+	}
+	kind := ""
+	for _, e := range p.rs.Unusable {
+		if e.Section == section {
+			kind = e.Kind
+		}
+	}
+	p.rs.Unusable = append(p.rs.Unusable, UnusableEntry{Section: section, ID: fmt.Sprintf("unreadable:%d", len(p.rs.Unusable)+1),
+		Kind: kind, Label: fmt.Sprintf("%d more entries", more),
+		Message: fmt.Sprintf("They cannot be restored either; only the first %d are listed.", maxUnusableListed)})
 }
 
 func requireDocument(spec sectionSpec, ok bool, err error) error {
@@ -115,6 +178,10 @@ func (p *restoreSetParser) validateSettings() error {
 			return fmt.Errorf("setting %q is listed twice", s.Key)
 		}
 		seen[s.Key] = true
+		if entryTooLarge(s) {
+			p.unusable(SectionSettings, KindSettingsPage, s.Key, msgEntryTooLarge)
+			continue
+		}
 		kept = append(kept, s)
 	}
 	d.Settings = kept
@@ -151,13 +218,26 @@ func libraryProblem(l LibraryEntry) string {
 	if entryTooLarge(l) {
 		return msgEntryTooLarge
 	}
+	if len(l.Paths) > maxLibraryFolders {
+		return fmt.Sprintf("It has more than %d folders.", maxLibraryFolders)
+	}
+	seen := make(map[string]bool, len(l.Paths))
 	for _, folder := range l.Paths {
 		if !filepath.IsAbs(folder) || filepath.Clean(folder) != folder {
 			return "A folder is not a clean absolute path."
 		}
+		if seen[folder] {
+			return "A folder is listed twice."
+		}
+		seen[folder] = true
 	}
 	return ""
 }
+
+// maxLibraryFolders bounds a restored library's folders, each of which a
+// preview checks on this server's disk. The library editor sets no limit;
+// a library has a handful.
+const maxLibraryFolders = 64
 
 func (p *restoreSetParser) validateCollections() error {
 	d := &p.rs.Collections
@@ -168,6 +248,13 @@ func (p *restoreSetParser) validateCollections() error {
 		}
 		seen[id] = true
 		return nil
+	}
+	items := 0
+	for _, c := range d.Collections {
+		items += len(c.Items)
+	}
+	if items > maxCollectionItems {
+		return fmt.Errorf("its collections list more than %d items", maxCollectionItems)
 	}
 	collections := d.Collections[:0]
 	for _, c := range d.Collections {
@@ -207,6 +294,10 @@ func (p *restoreSetParser) validateCollections() error {
 		if err := claim(a.itemID()); err != nil {
 			return err
 		}
+		if entryTooLarge(a) {
+			p.unusable(SectionCollections, KindItemArtwork, a.ContentID, msgEntryTooLarge)
+			continue
+		}
 		artwork = append(artwork, a)
 	}
 	d.ItemArtwork = artwork
@@ -221,6 +312,10 @@ func (p *restoreSetParser) validateCollections() error {
 		}
 		if err := claim(b.itemID()); err != nil {
 			return err
+		}
+		if entryTooLarge(b) {
+			p.unusable(SectionCollections, KindBranding, b.Key, msgEntryTooLarge)
+			continue
 		}
 		brandingEntries = append(brandingEntries, b)
 	}
@@ -321,8 +416,10 @@ func homeSectionProblem(e HomeSectionEntry) string {
 	return ""
 }
 
-// maxRestoredEntryBytes bounds one library, collection, template
-// collection, or section, encoded, as the v2 API's request body cap
+// maxRestoredEntryBytes bounds every entry a restore writes (a setting, a
+// library, a plugin configuration, a collection, a template collection, an
+// item artwork, a branding asset, a page section, and in account documents
+// each profile), encoded, as the v2 API's request body cap
 // (apiv2.MaxJSONBodyBytes, which this package cannot import) bounds what one
 // create or update writes: a restore stores no more for one than its editor
 // could. A collection's items are not counted; they are added one by one.
@@ -341,6 +438,22 @@ func entryTooLarge(v any) bool {
 func collectionTooLarge(c CollectionEntry) bool {
 	c.Items = nil
 	return entryTooLarge(c)
+}
+
+// maxThumbhashLength bounds a thumbhash: base64 of at most 25 bytes.
+const maxThumbhashLength = 64
+
+// validThumbhash reports whether s could be a thumbhash; a restore stores
+// none that is not.
+func validThumbhash(s string) bool {
+	if s == "" {
+		return true
+	}
+	if len(s) > maxThumbhashLength {
+		return false
+	}
+	_, err := base64.StdEncoding.DecodeString(s)
+	return err == nil
 }
 
 // validBrandingEntry admits only a branding asset setting whose reference
@@ -406,6 +519,9 @@ func (p *restoreSetParser) itemIDs(spec sectionSpec) []string {
 }
 
 func (p *restoreSetParser) decodePlugins(spec sectionSpec) (int, error) {
+	if err := capEntries("plugins", len(p.itemIDs(spec)), maxPluginEntries); err != nil {
+		return 0, err
+	}
 	for _, id := range p.itemIDs(spec) {
 		var doc PluginDocument
 		docPath := spec.itemDir + id + "/" + pluginDocumentName
@@ -447,6 +563,9 @@ func pluginConfigProblem(doc PluginDocument) string {
 		keys[c.Key] = true
 		if !json.Valid(c.Value) {
 			return "A configuration value is not valid JSON."
+		}
+		if entryTooLarge(c) {
+			return msgEntryTooLarge
 		}
 	}
 	return ""

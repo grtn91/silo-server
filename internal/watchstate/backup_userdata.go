@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"time"
 
@@ -239,16 +240,30 @@ func decodeWatchHistory(data json.RawMessage) (watchHistoryDocument, userdata.Su
 			return doc, sum, fmt.Errorf("progress of %q is not valid", e.Item)
 		}
 	}
+	// A play at the same second of the same item is the same play (the
+	// witness index keys plays this way): repeats collapse here, before
+	// anything plans or writes them.
+	plays := map[string]bool{}
+	history := doc.History[:0]
 	for _, e := range doc.History {
-		if err := add(e.Item); err != nil {
-			return doc, sum, err
-		}
 		if e.WatchedAt.IsZero() || !validWatchSource(e.Source) || (e.Duration != nil && *e.Duration < 0) {
 			return doc, sum, fmt.Errorf("a play of %q is not valid", e.Item)
 		}
-	}
-	for _, e := range doc.Hidden {
+		key := e.Item + "\x00" + e.WatchedAt.UTC().Truncate(time.Second).Format(time.RFC3339)
+		if plays[key] {
+			sum.Count--
+			continue
+		}
+		plays[key] = true
 		if err := add(e.Item); err != nil {
+			return doc, sum, err
+		}
+		history = append(history, e)
+	}
+	doc.History = history
+	hidden := userdata.Distinct{}
+	for _, e := range doc.Hidden {
+		if err := errors.Join(add(e.Item), hidden.Add("history hides", e.Item)); err != nil {
 			return doc, sum, err
 		}
 		if !e.HiddenBefore.Valid {
@@ -307,6 +322,15 @@ func (BackupData) Import(ctx context.Context, tx pgx.Tx, target userdata.Target,
 	return res, nil
 }
 
+// importBatch is how many rows one import statement writes: each is one
+// set-based statement over arrays, so an import of the most a document
+// holds is a few hundred statements, not one per entry.
+const importBatch = 5000
+
+// maxImportedPlays bounds the plays one import adds to a profile's history:
+// the newest are kept. Years of daily viewing are a few tens of thousands.
+const maxImportedPlays = 100_000
+
 func importProgress(ctx context.Context, tx pgx.Tx, target userdata.Target, entries []watchProgressEntry, res *userdata.Result) error {
 	// The newest entry per local item: two source items can match one here.
 	newest := map[string]watchProgressEntry{}
@@ -331,16 +355,33 @@ func importProgress(ctx context.Context, tx pgx.Tx, target userdata.Target, entr
 			newest[local] = e
 		}
 	}
-	for _, local := range order {
-		e := newest[local]
-		// One statement decides newer-wins against the row as committed: a
-		// playback heartbeat that lands meanwhile is newer and is kept, and a
-		// row created concurrently is merged instead of failing the insert.
-		var inserted bool
-		err := tx.QueryRow(ctx, `
+	for start := 0; start < len(order); start += importBatch {
+		chunk := order[start:min(start+importBatch, len(order))]
+		n := len(chunk)
+		var (
+			positions, durations = make([]float64, n), make([]float64, n)
+			completed, hide      = make([]bool, n), make([]bool, n)
+			updated              = make([]time.Time, n)
+			events               = make([]*time.Time, n)
+			files                = make([]*int, n)
+			resolutions, codecs  = make([]*string, n), make([]*string, n)
+			editions             = make([]*string, n)
+			hdr                  = make([]*bool, n)
+		)
+		for i, local := range chunk {
+			e := newest[local]
+			positions[i], durations[i], completed[i], hide[i] = e.Position, e.Duration, e.Completed, e.HideFromContinue
+			updated[i], events[i], files[i] = e.UpdatedAt, e.EventAt, e.LastFileID
+			resolutions[i], codecs[i], editions[i], hdr[i] = e.LastResolution, e.LastCodecVideo, e.LastEditionKey, e.LastHDR
+		}
+		// One statement decides newer-wins against each row as committed:
+		// a playback heartbeat that lands meanwhile is newer and is kept,
+		// and a row created concurrently is merged instead of failing.
+		rows, err := tx.Query(ctx, `
 			INSERT INTO user_watch_progress (user_id, profile_id, media_item_id, position_seconds, duration_seconds, completed, updated_at,
 				event_at, hide_from_continue, last_file_id, last_resolution, last_hdr, last_codec_video, last_edition_key)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+			SELECT $1, $2, u.* FROM unnest($3::text[], $4::float8[], $5::float8[], $6::bool[], $7::timestamptz[], $8::timestamptz[],
+				$9::bool[], $10::int[], $11::text[], $12::bool[], $13::text[], $14::text[]) AS u
 			ON CONFLICT (user_id, profile_id, media_item_id) DO UPDATE SET position_seconds = EXCLUDED.position_seconds,
 				duration_seconds = EXCLUDED.duration_seconds, completed = EXCLUDED.completed, updated_at = EXCLUDED.updated_at,
 				event_at = EXCLUDED.event_at, hide_from_continue = EXCLUDED.hide_from_continue, last_file_id = EXCLUDED.last_file_id,
@@ -348,24 +389,36 @@ func importProgress(ctx context.Context, tx pgx.Tx, target userdata.Target, entr
 				last_edition_key = EXCLUDED.last_edition_key
 			WHERE user_watch_progress.updated_at < EXCLUDED.updated_at
 			RETURNING (xmax = 0)`,
-			target.UserID, target.ProfileID, local, e.Position, e.Duration, e.Completed, e.UpdatedAt, e.EventAt, e.HideFromContinue,
-			e.LastFileID, e.LastResolution, e.LastHDR, e.LastCodecVideo, e.LastEditionKey).Scan(&inserted)
-		switch {
-		case errors.Is(err, pgx.ErrNoRows):
-			res.Unchanged++
-		case err != nil:
+			target.UserID, target.ProfileID, chunk, positions, durations, completed, updated, events, hide, files, resolutions, hdr, codecs, editions)
+		if err != nil {
 			return fmt.Errorf("restoring progress: %w", err)
-		case inserted:
-			res.Added++
-		default:
-			res.Updated++
 		}
+		written, err := pgx.CollectRows(rows, pgx.RowTo[bool])
+		if err != nil {
+			return fmt.Errorf("restoring progress: %w", err)
+		}
+		for _, inserted := range written {
+			if inserted {
+				res.Added++
+			} else {
+				res.Updated++
+			}
+		}
+		res.Unchanged += n - len(written)
 	}
 	return nil
 }
 
+// importedPlay is a play resolved to an item here.
+type importedPlay struct {
+	item string
+	at   time.Time
+	e    watchPlayEntry
+}
+
 func importPlays(ctx context.Context, tx pgx.Tx, target userdata.Target, entries []watchPlayEntry, res *userdata.Result) error {
 	seen := map[string]bool{}
+	var plays []importedPlay
 	for _, e := range entries {
 		local, ok, err := target.Items.Resolve(ctx, e.Item)
 		if err != nil {
@@ -375,6 +428,8 @@ func importPlays(ctx context.Context, tx pgx.Tx, target userdata.Target, entries
 			res.LeftOut++
 			continue
 		}
+		// A play at the same second of the same item is the same play: the
+		// witness index keys plays this way.
 		watchedAt := e.WatchedAt.UTC().Truncate(time.Second)
 		key := local + "\x00" + watchedAt.Format(time.RFC3339)
 		if seen[key] {
@@ -382,25 +437,40 @@ func importPlays(ctx context.Context, tx pgx.Tx, target userdata.Target, entries
 			continue
 		}
 		seen[key] = true
-		identity, _ := json.Marshal(e.Identity) // a struct of strings and ints
-		// A play at the same second of the same item is the same play: the
-		// witness index keys plays this way.
+		plays = append(plays, importedPlay{item: local, at: watchedAt, e: e})
+	}
+	if len(plays) > maxImportedPlays {
+		slices.SortStableFunc(plays, func(a, b importedPlay) int { return b.at.Compare(a.at) })
+		res.LeftOut += len(plays) - maxImportedPlays
+		res.Notes = append(res.Notes, fmt.Sprintf("Only the newest %d plays were restored; %d older ones were left out.", maxImportedPlays, len(plays)-maxImportedPlays))
+		plays = plays[:maxImportedPlays]
+	}
+	for start := 0; start < len(plays); start += importBatch {
+		chunk := plays[start:min(start+importBatch, len(plays))]
+		n := len(chunk)
+		ids, items, sources, identities := make([]string, n), make([]string, n), make([]string, n), make([]string, n)
+		watched, completed := make([]time.Time, n), make([]bool, n)
+		durations := make([]*float64, n)
+		for i, p := range chunk {
+			identity, _ := json.Marshal(p.e.Identity) // a struct of strings and ints
+			ids[i], items[i], sources[i], identities[i] = uuid.NewString(), p.item, importedSource(target, p.e.Source), string(identity)
+			watched[i], completed[i], durations[i] = p.e.WatchedAt, p.e.Completed, p.e.Duration
+		}
 		tag, err := tx.Exec(ctx, `
 			INSERT INTO user_watch_history (id, user_id, profile_id, media_item_id, watched_at, duration_seconds, completed, source, watch_identity)
-			SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb
+			SELECT u.id, $1, $2, u.item, u.watched_at, u.duration, u.completed, u.source, u.identity::jsonb
+			FROM unnest($3::text[], $4::text[], $5::timestamptz[], $6::float8[], $7::bool[], $8::text[], $9::text[])
+				AS u(id, item, watched_at, duration, completed, source, identity)
 			WHERE NOT EXISTS (
 				SELECT 1 FROM user_watch_history h
-				WHERE h.user_id = $2 AND h.profile_id = $3 AND h.media_item_id = $4
-				  AND date_trunc('second', h.watched_at AT TIME ZONE 'UTC') = date_trunc('second', $5::timestamptz AT TIME ZONE 'UTC'))`,
-			uuid.NewString(), target.UserID, target.ProfileID, local, e.WatchedAt, e.Duration, e.Completed, importedSource(target, e.Source), string(identity))
+				WHERE h.user_id = $1 AND h.profile_id = $2 AND h.media_item_id = u.item
+				  AND date_trunc('second', h.watched_at AT TIME ZONE 'UTC') = date_trunc('second', u.watched_at AT TIME ZONE 'UTC'))`,
+			target.UserID, target.ProfileID, ids, items, watched, durations, completed, sources, identities)
 		if err != nil {
-			return fmt.Errorf("restoring a play: %w", err)
+			return fmt.Errorf("restoring plays: %w", err)
 		}
-		if tag.RowsAffected() > 0 {
-			res.Added++
-		} else {
-			res.Unchanged++
-		}
+		res.Added += int(tag.RowsAffected())
+		res.Unchanged += n - int(tag.RowsAffected())
 	}
 	return nil
 }
@@ -409,7 +479,10 @@ func importPlays(ctx context.Context, tx pgx.Tx, target userdata.Target, entries
 // mark watched or unwatched raises them: the later hidden_before wins, and
 // the later removed_before wins, reading a legacy NULL as the
 // hidden_before it stands for. A hide changes when either cutoff advances.
+// One local item takes the backup's last hide for it.
 func importHidden(ctx context.Context, tx pgx.Tx, target userdata.Target, entries []watchHiddenEntry, res *userdata.Result) error {
+	byItem := map[string]watchHiddenEntry{}
+	var order []string
 	for _, e := range entries {
 		local, ok, err := target.Items.Resolve(ctx, e.Item)
 		if err != nil {
@@ -419,14 +492,36 @@ func importHidden(ctx context.Context, tx pgx.Tx, target userdata.Target, entrie
 			res.LeftOut++
 			continue
 		}
-		updatedAt := e.UpdatedAt
-		if updatedAt.IsZero() {
-			updatedAt = target.Now
+		if e.UpdatedAt.IsZero() {
+			e.UpdatedAt = target.Now
 		}
-		var inserted bool
-		err = tx.QueryRow(ctx, `
+		prev, seen := byItem[local]
+		if !seen {
+			order = append(order, local)
+			byItem[local] = e
+			continue
+		}
+		// Two backup items that match one here merge as two hides would.
+		res.Unchanged++
+		prev.HiddenBefore = laterCutoff(prev.HiddenBefore, e.HiddenBefore)
+		prev.RemovedBefore = laterCutoff(prev.removedBefore(), e.removedBefore())
+		if e.UpdatedAt.After(prev.UpdatedAt) {
+			prev.UpdatedAt = e.UpdatedAt
+		}
+		byItem[local] = prev
+	}
+	for start := 0; start < len(order); start += importBatch {
+		chunk := order[start:min(start+importBatch, len(order))]
+		n := len(chunk)
+		hidden, removed := make([]pgtype.Timestamptz, n), make([]pgtype.Timestamptz, n)
+		updated := make([]time.Time, n)
+		for i, local := range chunk {
+			e := byItem[local]
+			hidden[i], removed[i], updated[i] = e.HiddenBefore, e.removedBefore(), e.UpdatedAt
+		}
+		rows, err := tx.Query(ctx, `
 			INSERT INTO user_history_hidden_items (user_id, profile_id, media_item_id, hidden_before, removed_before, updated_at)
-			VALUES ($1, $2, $3, $4, $5, $6)
+			SELECT $1, $2, u.* FROM unnest($3::text[], $4::timestamptz[], $5::timestamptz[], $6::timestamptz[]) AS u
 			ON CONFLICT (user_id, profile_id, media_item_id) DO UPDATE SET
 				hidden_before = GREATEST(user_history_hidden_items.hidden_before, EXCLUDED.hidden_before),
 				removed_before = GREATEST(COALESCE(user_history_hidden_items.removed_before, user_history_hidden_items.hidden_before),
@@ -435,19 +530,44 @@ func importHidden(ctx context.Context, tx pgx.Tx, target userdata.Target, entrie
 			WHERE user_history_hidden_items.hidden_before < EXCLUDED.hidden_before
 			   OR COALESCE(user_history_hidden_items.removed_before, user_history_hidden_items.hidden_before) < EXCLUDED.removed_before
 			RETURNING (xmax = 0)`,
-			target.UserID, target.ProfileID, local, e.HiddenBefore, e.removedBefore(), updatedAt).Scan(&inserted)
-		switch {
-		case errors.Is(err, pgx.ErrNoRows):
-			res.Unchanged++
-		case err != nil:
-			return fmt.Errorf("restoring a history hide: %w", err)
-		case inserted:
-			res.Added++
-		default:
-			res.Updated++
+			target.UserID, target.ProfileID, chunk, hidden, removed, updated)
+		if err != nil {
+			return fmt.Errorf("restoring history hides: %w", err)
 		}
+		written, err := pgx.CollectRows(rows, pgx.RowTo[bool])
+		if err != nil {
+			return fmt.Errorf("restoring history hides: %w", err)
+		}
+		for _, inserted := range written {
+			if inserted {
+				res.Added++
+			} else {
+				res.Updated++
+			}
+		}
+		res.Unchanged += n - len(written)
 	}
 	return nil
+}
+
+// laterCutoff is the later of two cutoffs, with -infinity before and
+// infinity after every time.
+func laterCutoff(a, b pgtype.Timestamptz) pgtype.Timestamptz {
+	rank := func(t pgtype.Timestamptz) int { return int(t.InfinityModifier) }
+	switch {
+	case !a.Valid:
+		return b
+	case !b.Valid:
+		return a
+	case rank(a) != rank(b):
+		if rank(b) > rank(a) {
+			return b
+		}
+		return a
+	case b.Time.After(a.Time):
+		return b
+	}
+	return a
 }
 
 // Pending counts what Import would do, by its rules, without writing: a

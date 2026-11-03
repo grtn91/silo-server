@@ -22,6 +22,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/Silo-Server/silo-server/internal/blobstore"
+	"github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/config"
 	"github.com/Silo-Server/silo-server/internal/imageutil"
 	"github.com/Silo-Server/silo-server/internal/models"
@@ -418,6 +419,105 @@ func TestRetryableItemError(t *testing.T) {
 	} {
 		if got := retryableItemError(err); got != want {
 			t.Errorf("retryableItemError(%v) = %v, want %v", err, got, want)
+		}
+	}
+}
+
+// TestCollectionMetadataBudget: once a restore's committed collections
+// reach its budget, in all or in one library, the next is left out with
+// its reason; another library still has room until the total is reached.
+func TestCollectionMetadataBudget(t *testing.T) {
+	a := &applier{}
+	big := collectionCharge{library: 1, bytes: maxLibraryCollectionMetadata - 10}
+	if _, over := a.overCollectionBudget(ReportItem{}, big); over {
+		t.Fatal("the first collection is over the budget")
+	}
+	a.charge(big)
+	if got, over := a.overCollectionBudget(ReportItem{}, collectionCharge{library: 1, bytes: 11}); !over || got.item.Reason != ReasonOverRestoreBudget {
+		t.Fatalf("over the library's budget = %+v, %v", got.item, over)
+	}
+	if _, over := a.overCollectionBudget(ReportItem{}, collectionCharge{library: 2, bytes: 11}); over {
+		t.Fatal("another library has room")
+	}
+	a.charge(collectionCharge{library: 2, bytes: maxRestoreCollectionMetadata - maxLibraryCollectionMetadata})
+	if _, over := a.overCollectionBudget(ReportItem{}, collectionCharge{library: 3, bytes: 11}); !over {
+		t.Fatal("the restore's total budget is spent")
+	}
+}
+
+// busyLocker answers ErrBusy until free is closed, and signals tries on
+// each answer when set.
+type busyLocker struct {
+	Locker
+	free, tries chan struct{}
+}
+
+func (l busyLocker) TryLock(context.Context) (Held, error) {
+	select {
+	case <-l.free:
+		return nil, nil
+	default:
+	}
+	if l.tries != nil {
+		select {
+		case l.tries <- struct{}{}:
+		default:
+		}
+	}
+	return nil, ErrBusy
+}
+
+// TestRestoreJobWaitsForTheRequestThatQueuedIt: a restore job claimed while
+// the request that queued it still holds the lock takes the lock once that
+// request lets go, and gives up only after enqueueHandoff.
+func TestRestoreJobWaitsForTheRequestThatQueuedIt(t *testing.T) {
+	l := busyLocker{free: make(chan struct{}), tries: make(chan struct{}, 1)}
+	// The request lets go once the job has asked once and found it held.
+	go func() { <-l.tries; close(l.free) }()
+	if _, err := lockWithin(t.Context(), l, enqueueHandoff); err != nil {
+		t.Fatalf("lock released after the handoff: %v", err)
+	}
+	if _, err := lockWithin(t.Context(), busyLocker{free: make(chan struct{})}, 0); !errors.Is(err, ErrBusy) {
+		t.Fatalf("lock held past the wait: %v, want ErrBusy", err)
+	}
+}
+
+// TestUnverifiedTemplateWithholdsSourceAndSchedule: from a backup this
+// server cannot verify, a template collection's changed source and sync
+// schedule are withheld, not written, since either makes it fetch from
+// outside services; the other changes still apply.
+func TestUnverifiedTemplateWithholdsSourceAndSchedule(t *testing.T) {
+	daily := "0 3 * * *"
+	entry := TemplateCollectionEntry{Title: "Mine", SourceURL: "https://lists.example.test/1", SourceConfig: json.RawMessage(`{"list":"1"}`),
+		SyncSchedule: &daily}
+	def := catalog.CreateLibraryCollectionInput{Title: "Popular"}
+	trusted := customizeTemplate(entry, def, nil, nil, true)
+	if !slices.Equal(trusted.changes, []string{"title", "source", "sync schedule"}) || len(trusted.withheld) != 0 || trusted.update.SyncSchedule == nil {
+		t.Fatalf("verified = %+v", trusted)
+	}
+	untrusted := customizeTemplate(entry, def, nil, nil, false)
+	if !slices.Equal(untrusted.changes, []string{"title"}) || !slices.Equal(untrusted.withheld, []string{"source", "sync schedule"}) ||
+		untrusted.update.SourceURL != nil || untrusted.update.SyncSchedule != nil || untrusted.update.SourceConfig != nil {
+		t.Fatalf("unverified = %+v, want the source and schedule withheld", untrusted)
+	}
+}
+
+// TestRestoredLibraryFoldersAreBounded: a library entry whose folders the
+// preview would check on disk is refused past maxLibraryFolders folders,
+// or with a folder listed twice.
+func TestRestoredLibraryFoldersAreBounded(t *testing.T) {
+	entry := LibraryEntry{ID: 1, Name: "Movies", Type: "movies", Paths: []string{"/media/a", "/media/b"}}
+	if problem := libraryProblem(entry); problem != "" {
+		t.Fatalf("two folders: %s", problem)
+	}
+	many := LibraryEntry{ID: 1, Name: "Movies", Type: "movies"}
+	for i := range maxLibraryFolders + 1 {
+		many.Paths = append(many.Paths, fmt.Sprintf("/media/%d", i))
+	}
+	twice := LibraryEntry{ID: 1, Name: "Movies", Type: "movies", Paths: []string{"/", "/"}}
+	for name, e := range map[string]LibraryEntry{"too many folders": many, "a folder twice": twice} {
+		if libraryProblem(e) == "" {
+			t.Errorf("%s was accepted", name)
 		}
 	}
 }

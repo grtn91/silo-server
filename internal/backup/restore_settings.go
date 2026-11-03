@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/Silo-Server/silo-server/internal/branding"
+	"github.com/Silo-Server/silo-server/internal/catalog"
 )
 
 // SettingClass says whether a restore offers a setting.
@@ -38,7 +39,7 @@ type SettingsPage struct {
 var settingsPages = []SettingsPage{
 	{"general", "General"}, {pageAppearance, "Appearance"}, {"storage", "Storage"}, {"logging", "Logging"},
 	{pageSignIn, "Sign-in"}, {"security", "Security"}, {pageLibrary, "Library & Metadata"}, {"search", "Search"},
-	{"playback", "Playback"}, {"downloads", "Downloads"}, {"requests", "Requests"}, {"providers", "Providers"},
+	{"playback", "Playback"}, {"downloads", "Downloads"}, {pageRequests, "Requests"}, {"providers", "Providers"},
 	{"ai", "AI Services"}, {pageEmail, "Email"}, {"notifications", "Notifications"}, {"compatibility", "Compatibility"},
 	{"recommendations", "Recommendations"}, {"nodes", "Nodes"}, {pageBackups, "Backups"}, {pageOther, "Other settings"},
 }
@@ -60,6 +61,7 @@ const (
 	pageLibrary    = "library"
 	pageSignIn     = "sign-in"
 	pageEmail      = "email"
+	pageRequests   = "requests"
 )
 
 // settingRateLimitOn is the switch that throttles sign-in.
@@ -138,8 +140,8 @@ var settingRulesByPage = []struct {
 	}},
 	{"search", map[string]SettingClass{
 		"catalog.search.provider":                SettingServerSpecific,
-		"catalog.search.meilisearch.url":         SettingServerSpecific,
-		"catalog.search.meilisearch.api_key":     SettingServerSpecific,
+		catalog.SearchSettingMeilisearchURL:      SettingServerSpecific,
+		catalog.SearchSettingMeilisearchAPIKey:   SettingServerSpecific,
 		"catalog.search.meilisearch.index":       SettingServerSpecific,
 		"catalog.search.meilisearch.index_types": SettingPortable,
 		"catalog.search.meilisearch.":            SettingPortable,
@@ -159,7 +161,7 @@ var settingRulesByPage = []struct {
 		"download.artifact_dir": SettingServerSpecific,
 		"download.":             SettingPortable,
 	}},
-	{"requests", map[string]SettingClass{
+	{pageRequests, map[string]SettingClass{
 		"requests.": SettingExternalService,
 	}},
 	{"providers", map[string]SettingClass{
@@ -168,19 +170,23 @@ var settingRulesByPage = []struct {
 		"introdb.api_key": SettingExternalService,
 	}},
 	{"ai", map[string]SettingClass{
-		"ai.providers":          SettingServerSpecific,
-		"ai.chatgpt.":           SettingServerSpecific,
-		"ai.text_provider_id":   SettingServerSpecific,
-		"ai.speech_provider_id": SettingServerSpecific,
-		"ai.api_key":            SettingExternalService,
-		"ai.base_url":           SettingExternalService,
-		"ai.asr_base_url":       SettingExternalService,
-		"subtitle_ai.base_url":  SettingExternalService,
-		"ai.asr_api_key":        SettingExternalService,
-		"subtitle_ai.api_key":   SettingExternalService,
-		"ai.":                   SettingPortable,
-		"subtitle_ai.":          SettingPortable,
-		"metadata_ai.":          SettingPortable,
+		"ai.providers":           SettingServerSpecific,
+		"ai.chatgpt.":            SettingServerSpecific,
+		"ai.text_provider_id":    SettingServerSpecific,
+		"ai.speech_provider_id":  SettingServerSpecific,
+		"ai.auth_mode":           SettingServerSpecific,
+		"ai.chat_model":          SettingServerSpecific,
+		"ai.reasoning_effort":    SettingServerSpecific,
+		"subtitle_ai.chat_model": SettingServerSpecific,
+		"ai.api_key":             SettingExternalService,
+		"ai.base_url":            SettingExternalService,
+		"ai.asr_base_url":        SettingExternalService,
+		"subtitle_ai.base_url":   SettingExternalService,
+		settingASRKey:            SettingExternalService,
+		settingSubtitleAIKey:     SettingExternalService,
+		"ai.":                    SettingPortable,
+		"subtitle_ai.":           SettingPortable,
+		"metadata_ai.":           SettingPortable,
 	}},
 	{pageEmail, map[string]SettingClass{
 		"email.": SettingExternalService,
@@ -208,8 +214,8 @@ var settingRulesByPage = []struct {
 		// the stored vectors, and the access-policy generation they reflect.
 		"recommendations.embedding_lock":           SettingServerSpecific,
 		"recommendations.policy_marked_generation": SettingServerSpecific,
-		"recommendations.embedding_auth_token":     SettingExternalService,
-		"recommendations.openai_api_key":           SettingExternalService,
+		settingEmbeddingToken:                      SettingExternalService,
+		settingOpenAIEmbeddingKey:                  SettingExternalService,
 		"recommendations.embedding_base_url":       SettingExternalService,
 		"recommendations.":                         SettingPortable,
 	}},
