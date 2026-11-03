@@ -57,8 +57,9 @@ func s3Settings(srv *s3test.Server, acknowledged string) *mapSettings {
 
 // putEncryptedBackup stores a complete encrypted backup at the fake bucket,
 // as a backup with key would have written it, and returns its manifest.
-func putEncryptedBackup(t *testing.T, srv *s3test.Server, key *ArchiveKey, serverID, id string, restoreSet []byte) *Manifest {
+func putEncryptedBackup(t *testing.T, srv *s3test.Server, seed, serverID, id string, restoreSet []byte) *Manifest {
 	t.Helper()
+	key := testArchiveKey(t, seed)
 	m := validTestManifest()
 	m.ID, m.ServerID, m.Encrypted, m.KeyCheck = id, serverID, true, key.Check
 	_, kind, _ := ParseFolderName(id)
@@ -72,6 +73,9 @@ func putEncryptedBackup(t *testing.T, srv *s3test.Server, key *ArchiveKey, serve
 		m.Objects = append(m.Objects, s.entry(name+EncryptedSuffix))
 	}
 	m.RestoreSet = &RestoreSetSummary{FormatVersion: restoreSetVersion, Sections: map[string]int{}}
+	if err := m.sign(seedManifestKey(t, seed)); err != nil {
+		t.Fatal(err)
+	}
 	data, err := json.Marshal(m)
 	if err != nil {
 		t.Fatal(err)
@@ -103,10 +107,12 @@ func TestRotationRecordsRefusedDeletes(t *testing.T) {
 	srv := s3test.New(t, testBucket)
 	key := testArchiveKey(t, "server-a")
 	settings := s3Settings(srv, key.Check)
-	svc := New(Options{Settings: settings, ArchiveKey: key, ServerID: func(context.Context) (string, error) { return "server", nil }})
+	svc := New(Options{Settings: settings, ArchiveKey: key, KeyCheck: key.Check, ManifestKey: seedManifestKey(t, "server-a"),
+		ServerID:      func(context.Context) (string, error) { return "server", nil },
+		ActiveRestore: func(context.Context) (*RestoreRequest, error) { return nil, nil }})
 	start := time.Date(2026, 10, 1, 4, 0, 0, 0, time.UTC)
 	for i := range config.DefaultBackupKeep + 2 {
-		putEncryptedBackup(t, srv, key, "server", FolderName(start.Add(time.Duration(i)*24*time.Hour), KindNightly), []byte("set"))
+		putEncryptedBackup(t, srv, "server-a", "server", FolderName(start.Add(time.Duration(i)*24*time.Hour), KindNightly), []byte("set"))
 	}
 	ctx := t.Context()
 	tgt, err := svc.preflight(ctx)
@@ -254,10 +260,11 @@ func TestEncryptedBackupReadsWithThisServersKeyOnly(t *testing.T) {
 	key := testArchiveKey(t, "server-a")
 	settings := s3Settings(srv, key.Check)
 	serverID := "server"
-	svc := New(Options{Settings: settings, ArchiveKey: key, ServerID: func(context.Context) (string, error) { return serverID, nil }})
+	svc := New(Options{Settings: settings, ArchiveKey: key, KeyCheck: key.Check, ManifestKey: seedManifestKey(t, "server-a"),
+		ServerID: func(context.Context) (string, error) { return serverID, nil }})
 	ctx := t.Context()
-	mine := putEncryptedBackup(t, srv, key, serverID, "20261031T040000Z-manual", []byte("restore set bytes"))
-	other := putEncryptedBackup(t, srv, testArchiveKey(t, "server-b"), serverID, "20261030T040000Z-manual", []byte("other"))
+	mine := putEncryptedBackup(t, srv, "server-a", serverID, "20261031T040000Z-manual", []byte("restore set bytes"))
+	other := putEncryptedBackup(t, srv, "server-b", serverID, "20261030T040000Z-manual", []byte("other"))
 
 	listing, err := svc.List(ctx)
 	if err != nil || len(listing.Backups) != 2 {
@@ -291,14 +298,15 @@ func TestEncryptedBackupReadsWithThisServersKeyOnly(t *testing.T) {
 	if err != nil || len(links) != 1 || links[0].Name != RestoreSetName || links[0].URL != "" {
 		t.Fatalf("restore set links = %+v, %v; want one unsigned link this server streams", links, err)
 	}
-	digest, open, err := svc.locate(ctx, restoreSource{backupID: mine.ID})
+	located, err := svc.locate(ctx, restoreSource{backupID: mine.ID})
 	if err != nil {
 		t.Fatal(err)
 	}
+	digest := located.digest
 	if entry, _ := mine.object(RestoreSetName); digest != entry.SHA256 {
 		t.Fatalf("restore set digest %s, want the stored one %s", digest, entry.SHA256)
 	}
-	r, err := open(ctx)
+	r, err := located.open(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -308,7 +316,7 @@ func TestEncryptedBackupReadsWithThisServersKeyOnly(t *testing.T) {
 	}
 
 	var wrong *WrongKeyError
-	if _, _, err := svc.locate(ctx, restoreSource{backupID: other.ID}); !errors.As(err, &wrong) || wrong.Backup != other.KeyCheck {
+	if _, err := svc.locate(ctx, restoreSource{backupID: other.ID}); !errors.As(err, &wrong) || wrong.Backup != other.KeyCheck {
 		t.Fatalf("preview of another key's backup = %v, want WrongKeyError", err)
 	}
 	if _, _, err := svc.OpenObject(ctx, other.ID, RestoreSetName); !errors.Is(err, ErrWrongKey) {

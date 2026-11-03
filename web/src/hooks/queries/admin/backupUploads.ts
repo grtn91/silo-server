@@ -2,7 +2,11 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { captureProfileRequestContext } from "@/api/client";
 import { captureAdminAuthority } from "@/api/v2/adminAuthority";
-import { deleteBackupUpload, listBackupUploads } from "@/api/v2/adminBackupUpload";
+import {
+  completeBackupUpload,
+  deleteBackupUpload,
+  listBackupUploads,
+} from "@/api/v2/adminBackupUpload";
 import { backupsRootKey } from "@/hooks/queries/admin/backups";
 
 const CHECKING_POLL_MS = 3_000;
@@ -29,6 +33,16 @@ export function useDeleteAdminBackupUpload() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (id: string) => deleteBackupUpload(captureAdminAuthority(), id),
+    retry: false,
+    onSettled: () => queryClient.invalidateQueries({ queryKey: backupUploadsKey() }),
+  });
+}
+
+/** Checks a fully received upload again: a check its server never finished. */
+export function useCompleteAdminBackupUpload() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (id: string) => completeBackupUpload(captureAdminAuthority(), id),
     retry: false,
     onSettled: () => queryClient.invalidateQueries({ queryKey: backupUploadsKey() }),
   });

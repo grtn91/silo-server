@@ -783,6 +783,7 @@ func newChiRouter(deps Dependencies) chi.Router {
 				nil,
 				checkPrimaryProfile,
 				householdRequiresProfile,
+				accessGroupStore,
 			).RequireMarkerEdit
 		}
 	}
@@ -2877,6 +2878,7 @@ func newChiRouter(deps Dependencies) chi.Router {
 		v2deps.AndroidPushRetirement = deps.Notifications.PushDevices
 		v2deps.OrderedApplePush = handlers.NewOrderedApplePushV2(deps.Notifications.PushDevices, jwtService, sessionRepo, userRepo, viewerResolver, actingAdmin)
 		v2deps.ApplePushRetirement = deps.Notifications.PushDevices
+		v2deps.ApplePushReset = deps.Notifications.PushDevices
 		v2deps.AdminNotificationPush = deps.Notifications
 		v2deps.AdminNotificationDiscord = deps.Notifications
 		v2deps.NotificationChannels = deps.Notifications
@@ -2938,6 +2940,7 @@ func newChiRouter(deps Dependencies) chi.Router {
 		v2deps.AdminStorageTransition = deps.StorageTransition
 	}
 	if deps.ProfileTransfer != nil {
+		deps.ProfileTransfer.SetItemsChanged(importedChanges(deps.Notifications, deps.RecWorker))
 		v2deps.ProfileTransfer = deps.ProfileTransfer
 	}
 	if deps.Backups != nil {
@@ -3064,7 +3067,7 @@ func newChiRouter(deps Dependencies) chi.Router {
 		externalSignInPlugins = v2PluginHandler
 	}
 	if deps.Backups != nil && deps.DB != nil {
-		wireBackupRestore(deps, adminHandler, libraryHandler, adminImageHandler, externalSignInPlugins, libraryCollectionHandler, sectionHandler)
+		wireBackupRestore(deps, adminHandler, libraryHandler, adminImageHandler, externalSignInPlugins, libraryCollectionHandler, sectionHandler, rateLimitHandler)
 	}
 	if deps.DB != nil && authService != nil && userRepo != nil {
 		v2deps.ExternalSignIn = handlers.NewExternalSignInHandler(auth.NewIdentityService(deps.DB), authService, userRepo, externalSignInPlugins)

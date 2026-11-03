@@ -370,7 +370,14 @@ func TestUploadCompletionDeadlineDB(t *testing.T) {
 		t.Fatalf("completing again = %+v, %v", again, err)
 	}
 
-	// A checking upload left by a server that stopped, with the lock free.
+	// A checking upload a server left an hour ago, with the lock free: the
+	// sweep reopens it, fully received, for a completion to check again.
+	dbExec(t, pool, `UPDATE backup_uploads SET status = 'checking', updated_at = now() - interval '1 hour' WHERE id = $1`, u.ID)
+	b.sweepUploads(ctx, false, nil)
+	if status := uploadStatus(t, pool, u.ID); status != UploadUploading {
+		t.Fatalf("a check abandoned an hour ago after the sweep = %s, want uploading", status)
+	}
+	// One left over a day ago is deleted.
 	dbExec(t, pool, `UPDATE backup_uploads SET status = 'checking', updated_at = now() - interval '25 hours' WHERE id = $1`, u.ID)
 	b.sweepUploads(ctx, false, nil)
 	if status := uploadStatus(t, pool, u.ID); status != statusGone {

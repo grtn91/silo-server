@@ -8,18 +8,12 @@ import (
 	"reflect"
 
 	"github.com/jackc/pgx/v5"
-
-	pluginv1 "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginproto/silo/plugin/v1"
 )
 
 // RestoreInstallationInput is one plugin from a backup's restore set.
 type RestoreInstallationInput struct {
 	PluginID string
 	Version  string
-	Enabled  bool
-	// Archive is the stored archive (plugin_archives.archive_bytes), installed
-	// through the admin upload path's checks when the plugin is missing here.
-	Archive []byte
 	// SourceInstallationID is the installation id the configuration rows
 	// were encrypted under on the source server.
 	SourceInstallationID int
@@ -45,8 +39,6 @@ type RestoreConfigProblem struct {
 // RestoreInstallationResult says what RestoreInstallation did.
 type RestoreInstallationResult struct {
 	InstallationID int
-	// Installed is true when the plugin was installed from the backup.
-	Installed bool
 	// SettingsOnly is true when another version is installed here: only
 	// configuration was restored.
 	SettingsOnly  bool
@@ -57,24 +49,48 @@ type RestoreInstallationResult struct {
 }
 
 // Changed reports whether the restore wrote anything.
-func (r RestoreInstallationResult) Changed() bool { return r.Installed || len(r.Written) > 0 }
+func (r RestoreInstallationResult) Changed() bool { return len(r.Written) > 0 }
 
 // ErrRestoreUnavailable reports a service built without the concrete stores
 // a restore writes through.
 var ErrRestoreUnavailable = errors.New("plugin restore is not available on this server")
 
-// RestoreInstallation restores one plugin inside the caller's transaction.
-//
-// A plugin missing here is installed from the backup's archive through the
-// admin upload path's checks, persisted disabled with no intermediate
-// enable. Its configuration is then decrypted with this server's key under
+// ErrPluginNotInstalled refuses restoring a plugin this server does not
+// have: a restore never installs one. Its binary would come from the backup,
+// which only the backup's own checksums vouch for, and anyone who can write
+// the backup destination could swap it. An admin installs it from a plugin
+// catalog, and restoring it again then applies its settings.
+var ErrPluginNotInstalled = errors.New("the plugin is not installed on this server; install it from a plugin catalog, then restore it again")
+
+// PrepareRestore reads the installed manifest of plugin pluginID on the
+// pool, before a restore opens its transaction, so RestoreInstallation finds
+// it in the archive cache rather than reading the stored archive inside the
+// transaction. A plugin not installed here needs nothing.
+func (s *Service) PrepareRestore(ctx context.Context, pluginID string) error {
+	store, ok := s.installations.(*InstallationStore)
+	if !ok {
+		return ErrRestoreUnavailable
+	}
+	existing, err := store.ListByPluginID(ctx, pluginID)
+	if err != nil {
+		return err
+	}
+	for _, inst := range existing {
+		if !inst.IsBuiltin() {
+			if _, err := s.readInstalledManifest(ctx, inst); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// RestoreInstallation restores one installed plugin's configuration inside
+// the caller's transaction. It never installs a plugin: one missing here is
+// ErrPluginNotInstalled. The installation keeps its enabled state. At the
+// same version its configuration is decrypted with this server's key under
 // the source installation id, checked by the same validation an admin save
-// uses, and written re-encrypted under the new installation id. Only then is
-// the backup's enabled state applied; a configuration that cannot be read or
-// fails validation leaves the plugin disabled.
-//
-// A plugin installed here keeps its installation and enabled state: at the
-// same version its configuration is restored the same way, at another
+// uses, and written re-encrypted under this installation's id; at another
 // version only values the installed version accepts are written.
 //
 // The returned func runs once the transaction commits: it stops reconfigured
@@ -83,7 +99,7 @@ func (s *Service) RestoreInstallation(ctx context.Context, tx pgx.Tx, in Restore
 	var result RestoreInstallationResult
 	store, ok := s.installations.(*InstallationStore)
 	configs, okConfigs := s.configs.(*RuntimeConfigStore)
-	if !ok || !okConfigs || s.installer == nil || tx == nil {
+	if !ok || !okConfigs || tx == nil {
 		return result, nil, ErrRestoreUnavailable
 	}
 	txStore := store.WithTx(tx)
@@ -101,22 +117,18 @@ func (s *Service) RestoreInstallation(ctx context.Context, tx pgx.Tx, in Restore
 		return result, nil, fmt.Errorf("multiple installations of plugin %q exist", in.PluginID)
 	}
 
-	var manifest *pluginv1.PluginManifest
 	if len(installs) == 0 {
-		installed, err := s.installFromBackup(ctx, txStore, in)
-		if err != nil {
-			return result, nil, err
-		}
-		result.InstallationID, result.Installed, manifest = installed.Installation.ID, true, installed.Manifest
-	} else {
-		inst := installs[0]
-		_, manifest, err = s.loadForManifestRead(ctx, inst.ID, false)
-		if err != nil {
-			return result, nil, err
-		}
-		result.InstallationID, result.Enabled, result.InstalledHere = inst.ID, inst.Enabled, inst.Version
-		result.SettingsOnly = inst.Version != in.Version
+		return result, nil, ErrPluginNotInstalled
 	}
+	inst := installs[0]
+	// The installation and its manifest are read through the transaction:
+	// it may hold the pool's last connection.
+	manifest, err := s.readInstalledManifestFrom(ctx, inst, txStore)
+	if err != nil {
+		return result, nil, err
+	}
+	result.InstallationID, result.Enabled, result.InstalledHere = inst.ID, inst.Enabled, inst.Version
+	result.SettingsOnly = inst.Version != in.Version
 
 	current, err := storedConfigs(ctx, tx, configs, result.InstallationID)
 	if err != nil {
@@ -145,43 +157,20 @@ func (s *Service) RestoreInstallation(ctx context.Context, tx pgx.Tx, in Restore
 		result.Written = append(result.Written, c.Key)
 	}
 
-	if result.Installed {
-		result.Enabled = in.Enabled && len(result.Rejected) == 0 && !in.ConfigUnreadable
-		if result.Enabled {
-			enabled := true
-			if err := txStore.Update(ctx, result.InstallationID, UpdateInstallationInput{Enabled: &enabled}); err != nil {
-				return result, nil, fmt.Errorf("enable plugin installation: %w", err)
-			}
-		}
-	}
-
-	id, reconfigured, changed := result.InstallationID, !result.Installed && len(result.Written) > 0, result.Changed()
+	id, changed := result.InstallationID, result.Changed()
 	after := func(ctx context.Context) {
 		if !changed {
 			return
 		}
-		if reconfigured {
-			if s.host != nil {
-				// A stop that fails leaves a stale process; the lifecycle
-				// change below and the advanced runtime generation replace it.
-				_ = s.host.Stop(id)
-			}
-			s.resident.Reset(id)
+		if s.host != nil {
+			// A stop that fails leaves a stale process; the lifecycle
+			// change below and the advanced runtime generation replace it.
+			_ = s.host.Stop(id)
 		}
+		s.resident.Reset(id)
 		s.OnLifecycleChange(ctx)
 	}
 	return result, after, nil
-}
-
-// installFromBackup installs the backup's archive through the upload path's
-// checks, persisted disabled.
-func (s *Service) installFromBackup(ctx context.Context, store *InstallationStore, in RestoreInstallationInput) (*InstallResult, error) {
-	if len(in.Archive) == 0 {
-		return nil, errors.New("the backup carries no archive for this plugin")
-	}
-	return s.installer.withStore(store).installArchive(ctx, in.Archive, InstallArchiveRequest{
-		PluginID: in.PluginID, Version: in.Version, KeepDisabled: true,
-	})
 }
 
 // storedConfigs reads an installation's configuration in tx, decrypted.

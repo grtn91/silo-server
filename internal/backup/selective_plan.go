@@ -7,14 +7,15 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/Silo-Server/silo-server/internal/blobstore"
 	"github.com/Silo-Server/silo-server/internal/catalog"
-	"github.com/Silo-Server/silo-server/internal/config"
+	"github.com/Silo-Server/silo-server/internal/collectionutil"
 	"github.com/Silo-Server/silo-server/internal/plugins"
-	"github.com/Silo-Server/silo-server/internal/secret"
 )
 
 // PreviewItem is one item of a section, as it compares with this server.
@@ -96,13 +97,15 @@ type planner struct {
 	rs         *RestoreSet
 	q          queryer
 	keyMatches bool
+	// authenticated is set when the backup's manifest verified here.
+	authenticated bool
 	// claimed maps "kind:local id" to the item of this restore that wrote
 	// it; nil for a preview.
 	claimed map[string]string
 }
 
 func (s *Service) newPlanner(rs *RestoreSet, q queryer) *planner {
-	return &planner{s: s, rs: rs, q: q, keyMatches: s.keyMatches(rs)}
+	return &planner{s: s, rs: rs, q: q, keyMatches: s.keyMatches(rs), authenticated: !rs.unverified}
 }
 
 // keyMatches reports whether rs was written under this server's SECRET_KEY,
@@ -186,6 +189,13 @@ func (p *planner) planLibraries(ctx context.Context) ([]libraryPlan, error) {
 			continue
 		}
 		plan.item.Status = ItemNotOnThisServer
+		if check := p.s.targets.CheckLibrary; check != nil {
+			if err := check(libraryInput(e)); err != nil {
+				plan.item.Reason, plan.item.Message = ReasonUnreadable, refusedMessage(err)
+				out = append(out, plan)
+				continue
+			}
+		}
 		var inUse string
 		for _, path := range e.Paths {
 			if local, ok := byPath[path]; ok {
@@ -211,9 +221,30 @@ func (p *planner) planLibraries(ctx context.Context) ([]libraryPlan, error) {
 			continue
 		}
 		plan.item.Selectable = true
+		if costly := costlyLibraryOptions(e); len(costly) > 0 {
+			if p.authenticated {
+				plan.item.Message = "Restoring it turns on " + joinLabels(costly) + "."
+			} else {
+				plan.item.Message = "Restored with " + joinLabels(costly) + " off: a backup this server cannot verify does not turn on work that sends library data to outside services or runs for hours. Turn them on in the library's settings."
+			}
+		}
 		out = append(out, plan)
 	}
 	return out, nil
+}
+
+// joinLabels joins labels as a list in a sentence: "a", "a and b",
+// "a, b, and c".
+func joinLabels(labels []string) string {
+	switch len(labels) {
+	case 0:
+		return ""
+	case 1:
+		return labels[0]
+	case 2:
+		return labels[0] + " and " + labels[1]
+	}
+	return strings.Join(labels[:len(labels)-1], ", ") + ", and " + labels[len(labels)-1]
 }
 
 // ---- Plugins ----
@@ -287,12 +318,7 @@ func (p *planner) planPlugin(doc PluginDocument, locals map[string]localPlugin) 
 	}
 	local, installed := locals[doc.PluginID]
 	if !installed {
-		item.Status, item.Selectable = ItemNotOnThisServer, true
-		item.Message = "Installs the plugin from the backup, disabled until its configuration is applied."
-		if len(doc.Configs) > 0 && !p.keyMatches {
-			item.Reason = ReasonConfigNeedsKey
-			item.Message = "Installs without its configuration, which was encrypted with another SECRET_KEY. The plugin stays disabled."
-		}
+		item.Status, item.Reason, item.Message = ItemNotOnThisServer, ReasonNeedsInstall, needsInstallMessage(doc)
 		return item
 	}
 	item.Plugin.InstalledVersion = local.version
@@ -302,6 +328,13 @@ func (p *planner) planPlugin(doc PluginDocument, locals map[string]localPlugin) 
 	}
 	if len(doc.Configs) == 0 {
 		item.Status, item.Reason, item.Message = ItemOnThisServer, ReasonSame, ""
+		return item
+	}
+	// A plugin's configuration can name services and the tokens it sends
+	// them: it comes only from a backup this server verified.
+	if !p.authenticated {
+		item.Status, item.Reason, item.Message = ItemDiffers, ReasonUnverifiedBackup,
+			"Its configuration can connect to outside services, so it is not restored from a backup this server cannot verify."
 		return item
 	}
 	if !p.keyMatches || p.s.targets.Plugins == nil {
@@ -335,127 +368,42 @@ func (p *planner) planPlugin(doc PluginDocument, locals map[string]localPlugin) 
 	return item
 }
 
-// ---- Settings ----
-
-func readStoredSettings(ctx context.Context, q queryer) (map[string]string, error) {
-	rows, err := q.Query(ctx, `SELECT key, value FROM server_settings`)
-	if err != nil {
-		return nil, fmt.Errorf("reading settings: %w", err)
-	}
-	defer rows.Close()
-	out := map[string]string{}
-	for rows.Next() {
-		var key, value string
-		if err := rows.Scan(&key, &value); err != nil {
-			return nil, err
-		}
-		out[key] = value
-	}
-	return out, rows.Err()
-}
-
-// settingPlan is one backup setting against this server: its plaintext when
-// readable.
-type settingPlan struct {
-	preview PreviewSetting
-	page    string
-	value   string
-}
-
-// planSettings compares each setting this server's table offers. An
-// encrypted value is read only with a matching key; otherwise it needs
-// another key and is never written.
-func (p *planner) planSettings(ctx context.Context) ([]settingPlan, error) {
-	stored, err := readStoredSettings(ctx, p.q)
-	if err != nil {
-		return nil, err
-	}
-	cipher := p.s.opts.Cipher
-	var out []settingPlan
-	for _, e := range p.rs.Settings.Settings {
-		rule, ok := RestorableSetting(e.Key)
-		if !ok {
-			continue
-		}
-		plan := settingPlan{page: rule.page, preview: PreviewSetting{Key: e.Key, Class: rule.class, RestartRequired: config.RestartRequired(e.Key),
-			Masked: e.Encrypted || catalog.SensitiveSettingKeys[e.Key]}}
-		value := e.Value
-		if e.Encrypted {
-			if !p.keyMatches || cipher == nil {
-				plan.preview.Status = ItemNeedsAnotherKey
-				out = append(out, plan)
-				continue
-			}
-			if value, err = cipher.Decrypt(e.Value, secret.SettingsAAD(e.Key)); err != nil {
-				plan.preview.Status = ItemNeedsAnotherKey
-				out = append(out, plan)
-				continue
-			}
-		}
-		plan.value = value
-		current, have := stored[e.Key]
-		if have && cipher != nil {
-			if plain, err := cipher.DecryptIfEncrypted(current, secret.SettingsAAD(e.Key)); err == nil {
-				current = plain
-			} else {
-				have = false
-			}
-		}
-		if have && current == value {
-			plan.preview.Status = ItemOnThisServer
-		} else {
-			plan.preview.Status = ItemDiffers
-		}
-		if !plan.preview.Masked {
-			plan.preview.BackupValue, plan.preview.CurrentValue = value, current
-		}
-		out = append(out, plan)
-	}
-	return out, nil
-}
-
-// settingsPageItems groups settings by page in display order.
-func settingsPageItems(plans []settingPlan) []PreviewItem {
-	byPage := map[string][]settingPlan{}
-	for _, plan := range plans {
-		byPage[plan.page] = append(byPage[plan.page], plan)
-	}
-	var out []PreviewItem
-	for _, page := range SettingsPages() {
-		list := byPage[page.ID]
-		if len(list) == 0 {
-			continue
-		}
-		sort.Slice(list, func(i, j int) bool { return list[i].preview.Key < list[j].preview.Key })
-		item := PreviewItem{ID: page.ID, Kind: KindSettingsPage, Label: page.Title, Status: ItemOnThisServer, Reason: ReasonSame}
-		differs, needsKey := 0, 0
-		for _, plan := range list {
-			item.Settings = append(item.Settings, plan.preview)
-			switch plan.preview.Status {
-			case ItemDiffers:
-				differs++
-				item.RestartRequired = item.RestartRequired || plan.preview.RestartRequired
-				item.ExternalService = item.ExternalService || plan.preview.Class == SettingExternalService
-			case ItemNeedsAnotherKey:
-				needsKey++
-			}
-		}
-		switch {
-		case differs > 0:
-			item.Status, item.Reason, item.Selectable = ItemDiffers, "", true
-			if needsKey > 0 {
-				item.Message = fmt.Sprintf("%d encrypted settings on this page were encrypted with another SECRET_KEY and are left out.", needsKey)
-			}
-		case needsKey > 0:
-			item.Status, item.Reason = ItemNeedsAnotherKey, ReasonNeedsAnotherKey
-			item.Message = "The settings that differ were encrypted with another SECRET_KEY."
-		}
-		out = append(out, item)
-	}
-	return out
-}
-
 // ---- Collections and artwork ----
+
+// collectionInput is the fields of c an editor's create command checks.
+func collectionInput(c CollectionEntry) catalog.CreateLibraryCollectionInput {
+	return catalog.CreateLibraryCollectionInput{
+		LibraryID: c.LibraryID, Slug: c.Slug, Title: c.Title, Description: c.Description, CollectionType: c.CollectionType,
+		Visibility: c.Visibility, SortOrder: c.SortOrder, Featured: c.Featured, SourceURL: c.SourceURL,
+		QueryDefinition: c.QueryDefinition, SortConfig: c.SortConfig, SourceConfig: c.SourceConfig, SyncSchedule: c.SyncSchedule,
+	}
+}
+
+// checkCollection checks a collection the restore would write: its
+// source as the editors canonicalize one (collectionutil
+// .CanonicalCollectionSource), and CheckCollection when this server has it.
+func (p *planner) checkCollection(in catalog.CreateLibraryCollectionInput) error {
+	if _, _, err := collectionutil.CanonicalCollectionSource(in.CollectionType, in.SourceURL, in.SourceConfig); err != nil {
+		return err
+	}
+	if p.s.targets.CheckCollection == nil {
+		return nil
+	}
+	return p.s.targets.CheckCollection(in)
+}
+
+// truncateText cuts s to at most limit bytes on a rune boundary.
+func truncateText(s string, limit int) string {
+	if len(s) <= limit {
+		return s
+	}
+	return strings.ToValidUTF8(s[:limit], "")
+}
+
+// refusedMessage says why an editor refuses an entry.
+func refusedMessage(err error) string {
+	return truncateText("It cannot be restored: "+err.Error(), 500)
+}
 
 // collectionPlan is one backup collection against this server.
 type collectionPlan struct {
@@ -478,6 +426,10 @@ func (p *planner) planCollection(ctx context.Context, c CollectionEntry, libMap 
 		if strings.HasPrefix(key, "collection-images/") && !p.rs.HasBlob(key) {
 			plan.item.MissingBlobs = append(plan.item.MissingBlobs, key)
 		}
+	}
+	if err := p.checkCollection(collectionInput(c)); err != nil {
+		plan.item.Status, plan.item.Reason, plan.item.Message = ItemNotOnThisServer, ReasonUnreadable, refusedMessage(err)
+		return plan, nil
 	}
 	libraries := []int{c.LibraryID}
 	for _, l := range c.Libraries {
@@ -519,6 +471,7 @@ func (p *planner) planCollection(ctx context.Context, c CollectionEntry, libMap 
 		return plan, nil
 	case match == "":
 		plan.item.Status, plan.item.Selectable = ItemNotOnThisServer, true
+		plan.item.Message = p.scheduleNote("It is restored with", c.SyncSchedule)
 		for _, id := range c.Items {
 			if known[id] {
 				plan.missing = append(plan.missing, id)
@@ -675,30 +628,88 @@ func (p *planner) planArtwork(ctx context.Context, a ItemArtworkEntry) (PreviewI
 		return item, fmt.Errorf("reading artwork of %s: %w", a.ContentID, err)
 	}
 	if path == a.Path && source == a.Source {
-		item.Status, item.Reason = ItemOnThisServer, ReasonSame
-		return item, nil
+		return p.sameUnlessMissing(ctx, item, p.rs.blobFamily(a.Path))
 	}
 	item.Status, item.Selectable = ItemDiffers, true
 	return item, nil
 }
 
-func (p *planner) planBranding(stored map[string]string, b BrandingEntry) PreviewItem {
+// sameUnlessMissing is item shown here as it is in the backup: the same,
+// unless one of keys, the files the backup carries for it, is missing from
+// this server's assets storage. Then restoring it writes them back
+// (applier.writeBlob, which never replaces an object) and changes nothing
+// else.
+func (p *planner) sameUnlessMissing(ctx context.Context, item PreviewItem, keys []string) (PreviewItem, error) {
+	missing, err := p.s.missingHere(ctx, storeAssets, keys)
+	if err != nil {
+		return item, err
+	}
+	if len(missing) == 0 {
+		item.Status, item.Reason = ItemOnThisServer, ReasonSame
+		return item, nil
+	}
+	item.Status, item.Selectable, item.Reason = ItemDiffers, true, ReasonFilesMissingHere
+	item.Message = fmt.Sprintf("%d of its files are missing on this server. Restoring writes them back.", len(missing))
+	return item, nil
+}
+
+// missingHereConcurrency bounds the objects missingHere checks at once.
+const missingHereConcurrency = 8
+
+// missingHere lists the keys missing from the named store, checking at
+// most missingHereConcurrency at a time. A server without that store has
+// none of them.
+func (s *Service) missingHere(ctx context.Context, storeName string, keys []string) ([]string, error) {
+	store := s.stores[storeName]
+	if store == nil {
+		return keys, nil
+	}
+	gone := make([]bool, len(keys))
+	errs := make([]error, len(keys))
+	sem := make(chan struct{}, missingHereConcurrency)
+	var wg sync.WaitGroup
+	for i, key := range keys {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer func() { <-sem; wg.Done() }()
+			_, err := store.Stat(ctx, key)
+			gone[i] = errors.Is(err, blobstore.ErrNotFound)
+			if err != nil && !gone[i] {
+				errs[i] = fmt.Errorf("checking %s here: %w", key, err)
+			}
+		}()
+	}
+	wg.Wait()
+	if err := errors.Join(errs...); err != nil {
+		return nil, err
+	}
+	var missing []string
+	for i, key := range keys {
+		if gone[i] {
+			missing = append(missing, key)
+		}
+	}
+	return missing, nil
+}
+
+func (p *planner) planBranding(ctx context.Context, stored map[string]string, b BrandingEntry) (PreviewItem, error) {
 	item := PreviewItem{ID: b.itemID(), Kind: KindBranding, Label: b.Key}
 	if !p.rs.HasBlob(b.Blob) {
 		item.Status, item.Reason, item.MissingBlobs = ItemNotOnThisServer, ReasonFileMissing, []string{b.Blob}
 		item.Message = "The image was missing when the backup was taken."
-		return item
+		return item, nil
 	}
 	current := strings.TrimSpace(stored[b.Key])
 	switch current {
 	case b.Ref:
-		item.Status, item.Reason = ItemOnThisServer, ReasonSame
+		return p.sameUnlessMissing(ctx, item, []string{b.Blob})
 	case "":
 		item.Status, item.Selectable = ItemNotOnThisServer, true
 	default:
 		item.Status, item.Selectable = ItemDiffers, true
 	}
-	return item
+	return item, nil
 }
 
 // ---- Preview ----
@@ -731,7 +742,11 @@ type RestorePreview struct {
 	CreatedAt     time.Time `json:"created_at"`
 	SameServer    bool      `json:"same_server"`
 	KeyMatches    bool      `json:"key_matches"`
-	MissingBlobs  []string  `json:"missing_blobs"`
+	// Authenticated is set when the backup's manifest verified under this
+	// server's SECRET_KEY; otherwise a restore needs the admin's
+	// confirmation (RestoreRequest.AcceptUnauthenticated).
+	Authenticated bool     `json:"authenticated"`
+	MissingBlobs  []string `json:"missing_blobs"`
 	// Omitted lists items the backup could not carry.
 	Omitted []OmittedItem `json:"omitted"`
 	// NeverRestoredSettings are the server-specific keys and prefixes.
@@ -741,27 +756,31 @@ type RestorePreview struct {
 }
 
 // Preview reads a backup's restore set and compares every item with this
-// server. It writes nothing and takes no lock.
-func (s *Service) Preview(ctx context.Context, id string) (*RestorePreview, error) {
-	return s.preview(ctx, restoreSource{backupID: id})
+// server. It writes nothing and takes no lock. A backup this server cannot
+// authenticate is read only when acceptUnauthenticated confirms it
+// (ErrUnauthenticated).
+func (s *Service) Preview(ctx context.Context, id string, acceptUnauthenticated bool) (*RestorePreview, error) {
+	return s.preview(ctx, restoreSource{backupID: id}, acceptUnauthenticated)
 }
 
 // PreviewUpload is Preview for an uploaded restore set, bound to the digest
-// its completion froze.
-func (s *Service) PreviewUpload(ctx context.Context, id string) (*RestorePreview, error) {
-	return s.preview(ctx, restoreSource{uploadID: id})
+// its completion froze. An upload cannot be authenticated, so it is read
+// only when acceptUnauthenticated confirms it.
+func (s *Service) PreviewUpload(ctx context.Context, id string, acceptUnauthenticated bool) (*RestorePreview, error) {
+	return s.preview(ctx, restoreSource{uploadID: id}, acceptUnauthenticated)
 }
 
-func (s *Service) preview(ctx context.Context, src restoreSource) (*RestorePreview, error) {
-	rs, err := s.previewSet(ctx, src)
+func (s *Service) preview(ctx context.Context, src restoreSource, acceptUnauthenticated bool) (*RestorePreview, error) {
+	rs, authenticated, err := s.previewSet(ctx, src, acceptUnauthenticated)
 	if err != nil {
 		return nil, err
 	}
 	serverID, _ := s.serverID(ctx)
 	p := s.newPlanner(rs, s.opts.Pool)
+	p.authenticated = authenticated
 	out := &RestorePreview{BackupID: src.backupID, UploadID: src.uploadID, Digest: rs.Digest, FormatVersion: rs.Index.Version, ServerID: rs.Index.ServerID,
 		ServerName: rs.Index.ServerName, SiloVersion: rs.Index.SiloVersion, CreatedAt: rs.Index.CreatedAt,
-		SameServer: rs.Index.ServerID == serverID, KeyMatches: p.keyMatches, MissingBlobs: append([]string{}, rs.MissingBlobs...),
+		SameServer: rs.Index.ServerID == serverID, KeyMatches: p.keyMatches, Authenticated: authenticated, MissingBlobs: append([]string{}, rs.MissingBlobs...),
 		Omitted:               append([]OmittedItem{}, rs.Index.Omitted...),
 		NeverRestoredSettings: ServerSpecificSettings(),
 		Libraries:             []LibraryMapping{}, Sections: []PreviewSection{}}
@@ -826,6 +845,12 @@ func (s *Service) preview(ctx context.Context, src restoreSource) (*RestorePrevi
 			}
 			section.Items = append(section.Items, items...)
 		}
+		for _, e := range rs.Unusable {
+			if e.Section == spec.id {
+				section.Items = append(section.Items, PreviewItem{ID: e.ID, Kind: e.Kind, Label: e.Label, Status: ItemNotOnThisServer,
+					Reason: ReasonUnreadable, Message: e.Message, Requires: []string{}, MissingBlobs: []string{}})
+			}
+		}
 		out.Sections = append(out.Sections, section)
 	}
 	return out, nil
@@ -859,7 +884,11 @@ func (p *planner) planCollectionsSection(ctx context.Context, libMap map[int]int
 		return nil, err
 	}
 	for _, b := range p.rs.Collections.Branding {
-		out = append(out, p.planBranding(stored, b))
+		item, err := p.planBranding(ctx, stored, b)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, item)
 	}
 	return out, nil
 }

@@ -10,11 +10,27 @@ import (
 	"io"
 	"strings"
 	"testing"
+
+	"github.com/Silo-Server/silo-server/internal/secret"
 )
 
 func testArchiveKey(t *testing.T, seed string) *ArchiveKey {
 	t.Helper()
-	key, err := NewArchiveKey([]byte(seed + strings.Repeat("k", 40)))
+	key, err := NewArchiveKey(testMasterKey(seed))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return key
+}
+
+// testMasterKey is the SECRET_KEY testArchiveKey and seedManifestKey derive
+// from.
+func testMasterKey(seed string) []byte { return []byte(seed + strings.Repeat("k", 40)) }
+
+// seedManifestKey is the manifest key of testArchiveKey's server.
+func seedManifestKey(t *testing.T, seed string) []byte {
+	t.Helper()
+	key, err := secret.BackupManifestKey(testMasterKey(seed))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -143,7 +159,10 @@ func TestFetchSourceChecksSpaceAndScope(t *testing.T) {
 	if err != nil || len(objects.opened) != 1 || objects.opened[0] != DumpName+EncryptedSuffix {
 		t.Fatalf("database-only fetch = %v, opened %v", err, objects.opened)
 	}
-	if err := src.Validate(ctx, ValidateOptions{KeyCheck: key.Check}); err != nil {
+	if err := m.sign(seedManifestKey(t, "server-a")); err != nil {
+		t.Fatal(err)
+	}
+	if err := src.Validate(ctx, ValidateOptions{KeyCheck: key.Check, ManifestKey: seedManifestKey(t, "server-a")}); err != nil {
 		t.Fatalf("validating a database-only fetch: %v", err)
 	}
 

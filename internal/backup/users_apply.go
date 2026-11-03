@@ -100,6 +100,21 @@ func validateUserSelection(users []UserSelection) error {
 	return nil
 }
 
+// lockPlanned takes the locks of what a plan compared with this server:
+// the account here (pgstore.LockAccountForImport, as the import takes it),
+// or the access group a new account joins (its row, for share). It reports
+// whether it locked anything.
+func lockPlanned(ctx context.Context, tx pgx.Tx, plan accountPlan) (bool, error) {
+	switch {
+	case plan.localID != 0:
+		return true, pgstore.LockAccountForImport(ctx, tx, plan.localID)
+	case plan.groupID != nil:
+		_, err := tx.Exec(ctx, `SELECT 1 FROM access_groups WHERE id = $1 FOR SHARE`, *plan.groupID)
+		return true, err
+	}
+	return false, nil
+}
+
 // applyAccount restores one selected account in the item's transaction. The
 // account and its profiles are matched again here; a mapping that changed
 // since the preview is left out. An account or profile found here is never
@@ -121,12 +136,28 @@ func (a *applier) applyAccount(ctx context.Context, tx pgx.Tx, sel UserSelection
 	if err != nil {
 		return applied{}, err
 	}
+	// What the plan compared is locked, and the plan made again under the
+	// locks: the account here (its profiles and limits), or the access
+	// group a new account joins, so an admin's change in between is seen.
+	if locked, err := lockPlanned(ctx, tx, plan); err != nil {
+		return applied{}, err
+	} else if locked {
+		if plan, err = planner.plan(ctx, doc); err != nil {
+			return applied{}, err
+		}
+	}
 	item.Label = plan.item.Label
 	if !plan.item.Selectable {
 		return leftOutFor(item, plan.item), nil
 	}
 	if !sameTarget(sel.Target, plan.target(), plan.item.Account.Match) {
 		return leftOut(item, ReasonChanged, "The account this backup account maps to changed since the preview. Open the backup again."), nil
+	}
+	if message, err := missingPrimary(ctx, tx, doc, plan, sel); err != nil || message != "" {
+		if err != nil {
+			return applied{}, err
+		}
+		return leftOut(item, ReasonNeedsPrimary, message), nil
 	}
 	report := &ReportAccount{Profiles: []ReportProfile{}}
 	item.Account = report
@@ -159,8 +190,15 @@ func (a *applier) applyAccount(ctx context.Context, tx pgx.Tx, sel UserSelection
 			r.profiles[pp.entry.ID] = pp.localID
 		}
 	}
+	// The backup's primary profile first, so it takes the first free place
+	// under the account's profile limit: an account without one here gets
+	// it before any other (missingPrimary).
+	profiles := slices.Clone(sel.Profiles)
+	slices.SortStableFunc(profiles, func(a, b ProfileSelection) int {
+		return boolRank(isPrimaryIn(doc, b.Profile)) - boolRank(isPrimaryIn(doc, a.Profile))
+	})
 	var chosen []chosenProfile
-	for _, ps := range sel.Profiles {
+	for _, ps := range profiles {
 		c, ok, err := r.choose(ctx, ps)
 		if err != nil {
 			return applied{}, err
@@ -179,7 +217,64 @@ func (a *applier) applyAccount(ctx context.Context, tx pgx.Tx, sel UserSelection
 	if len(report.Unmatched) > 0 {
 		item.Notes = append(item.Notes, fmt.Sprintf("%d items are not in this server's catalog and were left out.", len(r.items.unmatched)))
 	}
-	return applied{item: accountOutcome(item, report, r.changed)}, nil
+	return applied{item: accountOutcome(item, report, r.changed), after: r.itemsChanged()}, nil
+}
+
+// isPrimaryIn reports whether the document's profile id is its primary.
+func isPrimaryIn(doc *UserDocument, id string) bool {
+	return slices.ContainsFunc(doc.Profiles, func(p ProfileEntry) bool { return p.ID == id && p.IsPrimary })
+}
+
+func boolRank(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+// missingPrimary says why sel cannot restore the account, or "": an
+// account with no primary profile here, a new one included, needs the
+// backup's primary profile restored with any of its others, since only a
+// primary profile manages a household (adds, edits, and removes its
+// profiles) and a restore never makes another profile primary.
+func missingPrimary(ctx context.Context, q queryer, doc *UserDocument, plan accountPlan, sel UserSelection) (string, error) {
+	if len(sel.Profiles) == 0 {
+		return "", nil
+	}
+	var primary *ProfileEntry
+	for i := range doc.Profiles {
+		if doc.Profiles[i].IsPrimary {
+			primary = &doc.Profiles[i]
+		}
+	}
+	if primary == nil || slices.ContainsFunc(sel.Profiles, func(p ProfileSelection) bool { return p.Profile == primary.ID }) {
+		return "", nil
+	}
+	if plan.localID > 0 {
+		var has bool
+		if err := q.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM user_profiles WHERE user_id = $1 AND is_primary)`, plan.localID).Scan(&has); err != nil {
+			return "", fmt.Errorf("checking the account's primary profile: %w", err)
+		}
+		if has {
+			return "", nil
+		}
+	}
+	return fmt.Sprintf("Restore its primary profile, %q, with it: the account has none here, and only a primary profile manages the household.", primary.Name), nil
+}
+
+// itemsChanged tells the server, after the item commits, which items each
+// profile's restored data names (RestoreTargets.ItemsChanged).
+func (r *accountRestore) itemsChanged() func(context.Context) {
+	notify := r.a.s.targets.ItemsChanged
+	if notify == nil || len(r.resolved) == 0 {
+		return nil
+	}
+	userID, resolved := r.plan.localID, r.resolved
+	return func(context.Context) {
+		for profileID, items := range resolved {
+			notify(userID, profileID, items.Resolved())
+		}
+	}
 }
 
 // accountOutcome is restored when anything changed, else left out with the
@@ -245,6 +340,9 @@ type accountRestore struct {
 	// profiles maps the account's source profile ids to profiles here.
 	profiles map[string]string
 	changed  bool
+	// resolved records, by local profile id, the items each profile's
+	// imported data names, for RestoreTargets.ItemsChanged after commit.
+	resolved map[string]*userdata.RecordingItems
 }
 
 // chosenProfile is a profile whose data the restore merges.
@@ -380,9 +478,14 @@ func (r *accountRestore) importTarget(ctx context.Context, c chosenProfile) (use
 	if err != nil {
 		return userdata.Target{}, err
 	}
+	recorded := &userdata.RecordingItems{Inner: items}
+	if r.resolved == nil {
+		r.resolved = map[string]*userdata.RecordingItems{}
+	}
+	r.resolved[c.plan.localID] = recorded
 	target := userdata.Target{
 		Owner:      userdata.Owner{UserID: r.plan.localID, ProfileID: c.plan.localID},
-		SameServer: r.sameServer, Items: items, Now: a.s.opts.Now().UTC(),
+		SameServer: r.sameServer, Items: recorded, Now: a.s.opts.Now().UTC(),
 		Library: mapIn(a.libraryMap()),
 		Profile: func(id string) (string, bool) { local, ok := r.profiles[id]; return local, ok },
 		WriteBlob: func(ctx context.Context, store, from, to string) error {
@@ -390,11 +493,12 @@ func (r *accountRestore) importTarget(ctx context.Context, c chosenProfile) (use
 		},
 		HasBlob:            a.rs.HasBlob,
 		PluginInstallation: a.pluginInstallation(ctx, r.tx),
+		Unverified:         a.rs.unverified,
 	}
 	if a.adminCollections == nil {
 		a.adminCollections = map[string]string{}
 	}
-	target.Collection = newCollectionMap(a.planner(r.tx), r.tx, a.libraryMap(), r.sameServer, a.adminCollections, r.doc).lookup(target)
+	target.Collections = newCollectionMap(a.planner(r.tx), r.tx, a.libraryMap(), r.sameServer, a.adminCollections, r.doc).lookup(target)
 	return target, nil
 }
 

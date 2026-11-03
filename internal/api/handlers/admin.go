@@ -510,7 +510,7 @@ func toAdminUserResponse(u *models.User, group *access.GroupPolicy) AdminUserVie
 			DownloadAllowed:            effective.DownloadAllowed,
 			DownloadTranscodeAllowed:   effective.DownloadTranscodeAllowed,
 			RequestsAllowed:            effective.RequestsAllowed,
-			Permissions:                append([]string{}, effective.Permissions...),
+			Permissions:                auth.PolicyPermissions(effective),
 		},
 		CreatedAt: u.CreatedAt,
 		UpdatedAt: u.UpdatedAt,
@@ -1306,7 +1306,7 @@ func (h *AdminHandler) HandleImpersonateUser(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	writeJSON(w, http.StatusOK, buildLoginResponse(pair, effectiveUser, effectiveDownloadAllowed(r.Context(), effectiveUser, h.groupPolicyProvider()), impersonator))
+	writeJSON(w, http.StatusOK, buildLoginResponse(pair, effectiveUser, effectiveAccountPolicy(r.Context(), effectiveUser, h.groupPolicyProvider()), impersonator))
 }
 
 // HandleListSessions handles GET /admin/sessions.
@@ -2737,12 +2737,14 @@ const codeInternalError = "internal_error"
 // ApplyAdminSettingsInTx writes values through the admin settings write path
 // (the same normalization, validation, and settings lock) inside the caller's
 // transaction. Nothing is published until the caller runs publish after its
-// transaction commits; a rollback leaves nothing to announce.
-func (h *AdminHandler) ApplyAdminSettingsInTx(ctx context.Context, tx pgx.Tx, values map[string]string) (AdminSettingsUpdateResult, func(context.Context), error) {
+// transaction commits; a rollback leaves nothing to announce. A non-nil
+// guard runs only under the settings lock, with the stored values read
+// there: a read outside the caller's transaction could wait on it.
+func (h *AdminHandler) ApplyAdminSettingsInTx(ctx context.Context, tx pgx.Tx, values map[string]string, guard func(AdminSettingsSnapshot) error) (AdminSettingsUpdateResult, func(context.Context), error) {
 	if tx == nil {
 		return AdminSettingsUpdateResult{}, nil, errors.New("a transaction is required")
 	}
-	return h.updateAdminSettings(ctx, tx, values, nil)
+	return h.updateAdminSettings(ctx, tx, values, guard)
 }
 
 // updateAdminSettings validates and writes values, in tx when it is set and
@@ -2766,7 +2768,7 @@ func (h *AdminHandler) updateAdminSettings(ctx context.Context, tx pgx.Tx, value
 		return fail(&APIError{Status: http.StatusBadRequest, Code: "bad_request", Message: "A settings update may contain at most 250 values"})
 	}
 
-	if guard != nil {
+	if guard != nil && tx == nil {
 		stored, err := h.SettingsRepo.GetAll(ctx)
 		if err != nil {
 			return fail(err)

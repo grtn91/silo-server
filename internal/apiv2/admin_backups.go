@@ -38,7 +38,7 @@ type AdminBackupService interface {
 	DownloadLinks(ctx context.Context, id, scope string, ttl time.Duration) ([]backup.ObjectLink, error)
 	OpenObject(context.Context, string, string) (io.ReadCloser, int64, error)
 	// Preview compares a backup's restore set with this server.
-	Preview(ctx context.Context, id string) (*backup.RestorePreview, error)
+	Preview(ctx context.Context, id string, acceptUnauthenticated bool) (*backup.RestorePreview, error)
 	// StartRestore queues a backup_restore job for the chosen items.
 	StartRestore(ctx context.Context, userID int, req backup.RestoreRequest) (*models.AdminJob, error)
 
@@ -51,7 +51,7 @@ type AdminBackupService interface {
 	DeleteUpload(ctx context.Context, id string) error
 	// PreviewUpload compares a complete upload's restore set with this
 	// server.
-	PreviewUpload(ctx context.Context, id string) (*backup.RestorePreview, error)
+	PreviewUpload(ctx context.Context, id string, acceptUnauthenticated bool) (*backup.RestorePreview, error)
 }
 
 // adminBackupLinkTTL matches the job artifact links.
@@ -118,7 +118,7 @@ type AdminBackupOmitted struct {
 type AdminBackup struct {
 	ID           string                   `json:"id" doc:"The backup folder name: UTC start time and kind"`
 	Kind         string                   `json:"kind" enum:"nightly,manual,before-restore"`
-	Status       string                   `json:"status" enum:"complete,complete_with_warnings,in_progress,incomplete" doc:"complete: manifest written, checksums recorded, table of contents readable; it does not claim a restore was tested. complete_with_warnings: some referenced files were missing when copied, or the restore set left items out (restore_set_omitted). in_progress: being written now. incomplete: no manifest and nothing running; deleted after 24 hours"`
+	Status       string                   `json:"status" enum:"complete,complete_with_warnings,in_progress,incomplete,unverified" doc:"complete: manifest written, checksums recorded, table of contents readable; it does not claim a restore was tested. complete_with_warnings: some referenced files were missing when copied, or the restore set left items out (restore_set_omitted). in_progress: being written now. incomplete: no manifest and nothing running; deleted after 24 hours. unverified: this server cannot authenticate the manifest (another SECRET_KEY, none recorded, or changed since it was written); a restore needs confirmation, and one whose manifest names this key but does not verify shows no details and cannot be restored"`
 	CreatedAt    Instant                  `json:"created_at"`
 	CompletedAt  *Instant                 `json:"completed_at,omitempty"`
 	SizeBytes    int64                    `json:"size_bytes"`
@@ -131,7 +131,8 @@ type AdminBackup struct {
 	Objects           []AdminBackupObject  `json:"objects"`
 	Encrypted         bool                 `json:"encrypted" doc:"Whether the objects are stored encrypted with a key derived from SECRET_KEY. The manifest is never encrypted"`
 	KeyCheck          string               `json:"key_check,omitempty" doc:"Check value of the SECRET_KEY the backup was taken with: 16 hex digits in groups of 4"`
-	KeyMatches        bool                 `json:"key_matches" doc:"Whether key_check is this server's. An encrypted backup that does not match cannot be previewed, restored, or downloaded decrypted here"`
+	KeyMatches        bool                 `json:"key_matches" doc:"Whether key_check is this server's. Settings and credentials the backup holds encrypted cannot be read with another key, and an encrypted backup that does not match cannot be previewed, restored, or downloaded decrypted here"`
+	Clean             bool                 `json:"clean" doc:"Whether this copy counts as a clean copy for rotation: complete, with every file, and verified under this server's SECRET_KEY. Rotation always keeps the newest clean copy, even beyond backup.keep"`
 }
 
 // AdminBackupActive is the operation holding the cluster-wide backup lock,
@@ -230,6 +231,8 @@ func backupProblem(err error) error {
 		return NewProblem(TypeConflict, "This backup has no restore set: it was taken before selective restore existed.")
 	case errors.Is(err, backup.ErrRestoreSetTooNew):
 		return NewProblem(TypeConflict, backup.ErrRestoreSetTooNew.Error())
+	case errors.Is(err, backup.ErrUnauthenticated):
+		return NewProblem(TypeBackupUnauthenticated, backup.ErrUnauthenticated.Message)
 	case errors.Is(err, backup.ErrDigestMismatch):
 		return NewProblem(TypeRestoreSetChanged, "The backup changed since it was previewed. Open it again.")
 	case errors.As(err, new(*backup.InvalidRestoreSetError)):
@@ -377,7 +380,7 @@ func adminBackupListOf(l backup.Listing) AdminBackupList {
 			CompletedAt: instantPtr(b.CompletedAt), SizeBytes: b.SizeBytes, SiloVersion: b.SiloVersion, Location: b.Location, BlobCount: b.BlobCount,
 			MissingBlobs: make([]AdminBackupMissingBlob, 0, len(b.MissingBlobs)), Objects: make([]AdminBackupObject, 0, len(b.Objects)),
 			RestoreSetOmitted: adminBackupOmittedOf(b.RestoreSetOmitted),
-			Encrypted:         b.Encrypted, KeyCheck: b.KeyCheck, KeyMatches: b.KeyMatches,
+			Encrypted:         b.Encrypted, KeyCheck: b.KeyCheck, KeyMatches: b.KeyMatches, Clean: b.Clean,
 		}
 		for _, m := range b.MissingBlobs {
 			item.MissingBlobs = append(item.MissingBlobs, AdminBackupMissingBlob{Store: m.Store, Key: m.Key, Source: m.Source})

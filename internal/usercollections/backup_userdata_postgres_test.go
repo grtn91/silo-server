@@ -50,11 +50,11 @@ func TestCollectionImportRemapsLibrariesDB(t *testing.T) {
 	doc := collectionsDocument{Collections: []personalCollection{
 		{ID: "c1", Name: "Remapped", Type: "smart", WatchFilter: "all", MediaFilter: "all", Items: []string{}, SharedWith: []string{}, Group: group,
 			QueryDefinition: json.RawMessage(`{"library_ids":[7,8],"match":"all","groups":[]}`), SortConfig: json.RawMessage(`{}`),
-			DisplayQueryDefinition: json.RawMessage(`{"filter_library_id":7}`), SourceConfig: json.RawMessage(`{"mode":"tmdb","library_ids":[7]}`)},
+			DisplayQueryDefinition: json.RawMessage(`{"match":"all","groups":[{"match":"all","rules":[{"field":"watched","op":"is","value":false}]}]}`), SourceConfig: json.RawMessage(`{"mode":"","library_ids":[7]}`)},
 		{ID: "c2", Name: "Elsewhere", Type: "smart", WatchFilter: "all", MediaFilter: "all", Items: []string{}, SharedWith: []string{},
 			QueryDefinition: json.RawMessage(`{"library_ids":[8],"match":"all","groups":[]}`), SortConfig: json.RawMessage(`{}`), SourceConfig: json.RawMessage(`{}`)},
 		{ID: "c3", Name: "Source elsewhere", Type: "tmdb", WatchFilter: "all", MediaFilter: "all", Items: []string{}, SharedWith: []string{},
-			QueryDefinition: json.RawMessage(`{}`), SortConfig: json.RawMessage(`{}`), SourceConfig: json.RawMessage(`{"mode":"tmdb","library_ids":[8]}`)},
+			QueryDefinition: json.RawMessage(`{}`), SortConfig: json.RawMessage(`{}`), SourceConfig: json.RawMessage(`{"mode":"tmdb_preset","preset":"popular","library_ids":[8]}`)},
 	}}
 	data, _ := json.Marshal(doc)
 	target := userdata.Target{Owner: userdata.Owner{UserID: userID, ProfileID: profile}, Items: sameItems{}, Now: time.Now(),
@@ -81,16 +81,72 @@ func TestCollectionImportRemapsLibrariesDB(t *testing.T) {
 	}
 	var query, display, source, slug string
 	if err := pool.QueryRow(ctx, `
-		SELECT c.query_definition->>'library_ids', c.display_query_definition->>'filter_library_id', c.source_config->>'library_ids', g.slug
+		SELECT c.query_definition->>'library_ids', c.display_query_definition->'groups'->0->'rules'->0->>'field', c.source_config->>'library_ids', g.slug
 		FROM user_personal_collections c JOIN user_collection_groups g ON g.user_id = c.user_id AND g.id = c.group_id
 		WHERE c.user_id = $1 AND c.name = 'Remapped'`, userID).Scan(&query, &display, &source, &slug); err != nil {
 		t.Fatal(err)
 	}
-	if query != "[70001]" || display != "70001" || source != "[70001]" || slug != group.Slug {
+	if query != "[70001]" || display != "watched" || source != "[70001]" || slug != group.Slug {
 		t.Fatalf("restored definitions query %s display %s source %s group %s", query, display, source, slug)
 	}
 	var others int
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM user_personal_collections WHERE user_id = $1 AND name <> 'Remapped'`, userID).Scan(&others); err != nil || others != 0 {
 		t.Fatalf("collections that lost their scope were created: %d, %v", others, err)
+	}
+}
+
+// TestCarriedCollectionsMapToTheImportingProfileDB: importing profile A's
+// collections into profile B on the same account maps A's collection to
+// B's copy, never to A's original; and a collection the document does not
+// carry maps on this server only when B can see it.
+func TestCarriedCollectionsMapToTheImportingProfileDB(t *testing.T) {
+	dsn := os.Getenv("SILO_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("SILO_TEST_DATABASE_URL is not set")
+	}
+	ctx := t.Context()
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	b := make([]byte, 4)
+	_, _ = rand.Read(b)
+	sfx := hex.EncodeToString(b)
+	var userID int
+	if err := pool.QueryRow(ctx, `INSERT INTO users (username, email, password_hash, role, permissions) VALUES ($1::text, $1::text || '@example.test', 'h', 'user', '{}') RETURNING id`, "ucmap-"+sfx).Scan(&userID); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _, _ = pool.Exec(context.Background(), `DELETE FROM users WHERE id = $1`, userID) })
+	a, bProfile := "pa-"+sfx, "pb-"+sfx
+	for _, p := range []string{a, bProfile} {
+		if _, err := pool.Exec(ctx, `INSERT INTO user_profiles (id, user_id, name, is_primary) VALUES ($1, $2, $1, $3)`, p, userID, p == a); err != nil {
+			t.Fatal(err)
+		}
+	}
+	create := func(profile, name string) string {
+		t.Helper()
+		var id string
+		if err := pool.QueryRow(ctx, `INSERT INTO user_personal_collections (id, user_id, profile_id, creator_profile_id, name, collection_type, native)
+			VALUES (gen_random_uuid()::text, $1, $2, $2, $3, 'manual', true) RETURNING id`, userID, profile, name).Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	original := create(a, "Mine")
+	private := create(a, "Private")
+	copied := create(bProfile, "Mine") // what the import created for B
+	target := userdata.Target{Owner: userdata.Owner{UserID: userID, ProfileID: bProfile}, SameServer: true}
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	got, ok, err := MapCarried(ctx, tx, target, map[string]Carried{original: {Name: "Mine"}}, original)
+	if err != nil || !ok || got != copied {
+		t.Fatalf("A's collection maps to %q (%v, %v), want B's copy %q", got, ok, err, copied)
+	}
+	if got, ok, err := MapCarried(ctx, tx, target, nil, private); err != nil || ok {
+		t.Fatalf("A's private collection maps to %q (%v, %v), want it dropped", got, ok, err)
 	}
 }

@@ -36,7 +36,7 @@ func (c S3Config) Valid() bool {
 // Client opens an S3 client for c.
 func (c S3Config) Client() *s3client.Client {
 	return s3client.NewClient(s3client.BucketConfig{
-		Role: "backup", Endpoint: c.Endpoint, Region: c.Region, Bucket: c.Bucket,
+		Role: OperationBackup, Endpoint: c.Endpoint, Region: c.Region, Bucket: c.Bucket,
 		KeyPrefix: c.KeyPrefix, AccessKey: c.AccessKey, SecretKey: c.SecretKey, PathStyle: c.PathStyle,
 	})
 }

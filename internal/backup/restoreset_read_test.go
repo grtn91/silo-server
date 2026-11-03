@@ -8,10 +8,20 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"maps"
+	"path"
+	"path/filepath"
+	"runtime"
+	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
+	"github.com/Silo-Server/silo-server/internal/artworkkey"
+	"github.com/Silo-Server/silo-server/internal/backup/jsonsize"
 	"github.com/Silo-Server/silo-server/internal/backup/userdata"
 )
 
@@ -187,8 +197,436 @@ func TestReadRestoreSetAcceptsAValidArchive(t *testing.T) {
 	if family := rs.blobFamily("profile-avatars/5/p1/original.webp"); len(family) != 2 {
 		t.Fatalf("avatar variants not kept with their original: %v", family)
 	}
-	if archive, err := rs.pluginArchive("tmdb"); err != nil || string(archive) != "PK-not-really-a-zip" {
-		t.Fatalf("plugin archive not extracted: %q %v", archive, err)
+	// A plugin archive is checked and never kept: nothing installs it.
+	if kept, _ := filepath.Glob(filepath.Join(rs.dir, "archive-*")); len(kept) != 0 {
+		t.Fatalf("plugin archive kept on disk: %v", kept)
+	}
+}
+
+// TestRestoreExtractsOnlyTheSelectedItemsFiles: a restore writes to the
+// temporary directory only the files its selected items need, and refuses
+// to start when they would not fit there.
+func TestRestoreExtractsOnlyTheSelectedItemsFiles(t *testing.T) {
+	index, entries := testRestoreSet()
+	data := buildTar(t, index, entries)
+	planned, err := ReadRestoreSet(context.Background(), bytes.NewReader(data), ReadOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const poster, collectionImage = "library-posters/3.jpg", "collection-images/c1/poster/w300.abcd.jpg"
+	for sel, want := range map[string][]string{
+		SectionLibraries:   {poster},
+		SectionCollections: {"collection-images/c1/poster/original.abcd.jpg", collectionImage},
+	} {
+		got := slices.Sorted(maps.Keys(selectedBlobs(planned, map[string][]string{sel: {"3", collectionItemID("c1")}})))
+		if !slices.Equal(got, want) {
+			t.Fatalf("selecting %s extracts %v, want %v", sel, got, want)
+		}
+	}
+
+	keep := selectedBlobs(planned, map[string][]string{SectionLibraries: {"3"}})
+	rs, err := ReadRestoreSet(context.Background(), bytes.NewReader(data), ReadOptions{ExtractDir: t.TempDir(), Extract: func(key string) bool { return keep[key] }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rs.Cleanup()
+	if f, _, err := rs.openBlob(poster); err != nil {
+		t.Fatalf("selected file not extracted: %v", err)
+	} else {
+		_ = f.Close()
+	}
+	if _, _, err := rs.openBlob(collectionImage); !errors.Is(err, ErrNotFound) || !rs.HasBlob(collectionImage) {
+		t.Fatalf("unselected file: %v, carried %v; want it read, not extracted", err, rs.HasBlob(collectionImage))
+	}
+
+	if err := checkTempSpace(t.TempDir(), planned, keep); err != nil {
+		t.Fatalf("a small restore: %v", err)
+	}
+	planned.blobSizes[poster] = 1 << 60
+	if err := checkTempSpace(t.TempDir(), planned, keep); !errors.Is(err, ErrNotEnoughTempSpace) {
+		t.Fatalf("a restore larger than the free space = %v, want ErrNotEnoughTempSpace", err)
+	}
+}
+
+// TestRestoreExtractsOnlyReferencedFiles: a selected collection extracts
+// its poster and the variants stored beside it, nothing else under its
+// directory; the reader refuses an original with more variants than a
+// ladder has, so a set cannot pad one with filler.
+func TestRestoreExtractsOnlyReferencedFiles(t *testing.T) {
+	const original = "collection-images/c1/poster/original.r1.jpg"
+	rs := &RestoreSet{blobs: map[string]string{}}
+	for _, key := range []string{original, "collection-images/c1/poster/w300.r1.jpg", "collection-images/c1/poster/w500.r1.jpg",
+		"collection-images/c1/poster/w300.r0.jpg", "collection-images/c1/filler/0.jpg", "collection-images/c1/backdrop/original.r1.jpg"} {
+		rs.blobs[key] = ""
+	}
+	rs.Collections.Collections = []CollectionEntry{{ID: "c1", Poster: original}}
+	got := slices.Sorted(maps.Keys(selectedBlobs(rs, map[string][]string{SectionCollections: {collectionItemID("c1")}})))
+	want := []string{original, "collection-images/c1/poster/w300.r1.jpg", "collection-images/c1/poster/w500.r1.jpg"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("selecting the collection extracts %v, want %v", got, want)
+	}
+
+	index, entries := testRestoreSet()
+	for i := range maxLadderVariants + 1 {
+		key := fmt.Sprintf("collection-images/c1/poster/w%d.abcd.jpg", 1000+i)
+		entries = append(entries, testEntry{name: "blobs/" + key, data: []byte("x")})
+	}
+	if _, err := ReadRestoreSet(context.Background(), bytes.NewReader(buildTar(t, index, entries)), ReadOptions{}); err == nil ||
+		!strings.Contains(err.Error(), "variants of") {
+		t.Fatalf("an original with %d variants: %v, want it refused", maxLadderVariants+1, err)
+	}
+}
+
+// TestReaderFindsVariantsInConstantTime: originals of many revisions in
+// one directory, each with its variants, are read without scanning the
+// directory's originals once per variant.
+func TestReaderFindsVariantsInConstantTime(t *testing.T) {
+	const originals = 10_000
+	index, entries := testRestoreSet()
+	for i := range index.Sections {
+		if index.Sections[i].ID != SectionCollections {
+			continue
+		}
+		for r := range originals {
+			key := fmt.Sprintf("collection-images/c1/poster/original.r%d.jpg", r)
+			index.Sections[i].Blobs = append(index.Sections[i].Blobs, key)
+			entries = append(entries, testEntry{name: "blobs/" + key, data: []byte("o")},
+				testEntry{name: fmt.Sprintf("blobs/collection-images/c1/poster/w1.r%d.jpg", r), data: []byte("v")},
+				testEntry{name: fmt.Sprintf("blobs/collection-images/c1/poster/w2.r%d.jpg", r), data: []byte("v")})
+		}
+	}
+	data := buildTar(t, index, entries)
+	started := time.Now()
+	rs, err := ReadRestoreSet(context.Background(), bytes.NewReader(data), ReadOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := len(rs.blobFamily("collection-images/c1/poster/original.r7.jpg")); got != 3 {
+		t.Fatalf("family of one original = %d keys, want it and its two variants", got)
+	}
+	if elapsed := time.Since(started); elapsed > 20*time.Second {
+		t.Fatalf("reading %d originals with their variants took %v", originals, elapsed)
+	}
+}
+
+// TestArtworkFamiliesAreLinear: 20,000 keys in one directory, named like
+// originals and legacy variants, are grouped into families in one pass,
+// each kept to the ladder's size, so the index holds about one reference
+// per key.
+func TestArtworkFamiliesAreLinear(t *testing.T) {
+	rs := &RestoreSet{blobs: map[string]string{}}
+	const dir = "collection-images/c1/poster/"
+	rs.blobs[dir+"original.jpg"] = ""
+	for i := range 20_000 {
+		for _, name := range []string{"original.%d", "original.r%d.jpg", "w%d.jpg"} {
+			rs.blobs[dir+fmt.Sprintf(name, i)] = ""
+		}
+	}
+	started := time.Now()
+	x := rs.lookup()
+	if elapsed := time.Since(started); elapsed > 5*time.Second {
+		t.Fatalf("indexing took %v", elapsed)
+	}
+	members := 0
+	for _, keys := range x.variants {
+		members += len(keys)
+	}
+	if got := len(x.variants[dir+"original.jpg"]); got != maxLadderVariants || members > len(rs.blobs) {
+		t.Fatalf("legacy family of %d, %d members in all for %d keys; want it capped and about one per key", got, members, len(rs.blobs))
+	}
+}
+
+// TestSelectedBlobsIsLinear: choosing the files of every collection of a set
+// at the archive's entry limit classifies each file once. A scan per
+// selected collection would take billions of prefix checks here and run
+// past the test timeout.
+func TestSelectedBlobsIsLinear(t *testing.T) {
+	const collections, perCollection = 20_000, maxRestoreSetEntries / 20_000
+	rs := &RestoreSet{blobs: make(map[string]string, maxRestoreSetEntries)}
+	selection := make([]string, 0, collections)
+	for i := range collections {
+		id := strconv.Itoa(i)
+		poster := collectionImagePrefix + id + "/poster/original.r1.jpg"
+		rs.Collections.Collections = append(rs.Collections.Collections, CollectionEntry{ID: id, Poster: poster})
+		selection = append(selection, collectionItemID(id))
+		rs.blobs[poster] = ""
+		for j := 1; j < perCollection; j++ {
+			rs.blobs[fmt.Sprintf("%s%s/poster/w%d.r1.jpg", collectionImagePrefix, id, j)] = ""
+		}
+	}
+	keep := selectedBlobs(rs, map[string][]string{SectionCollections: selection[:collections/2]})
+	if len(keep) != collections/2*perCollection {
+		t.Fatalf("kept %d files, want %d", len(keep), collections/2*perCollection)
+	}
+	if keep[collectionImagePrefix+strconv.Itoa(collections-1)+"/poster/w1.r1.jpg"] {
+		t.Fatal("kept a file of a collection not selected")
+	}
+}
+
+// TestReadRestoreSetBoundsWhatDocumentsDecodeTo: a short document of
+// empty entries, here 100,000 empty collections or account profiles, is
+// refused before it is decoded, without allocating what it would decode to.
+func TestReadRestoreSetBoundsWhatDocumentsDecodeTo(t *testing.T) {
+	empties := strings.Repeat(`{},`, 99_999) + `{}`
+	for name, bomb := range map[string][]byte{
+		collectionsDocumentName: []byte(`{"collections":[` + empties + `],"item_artwork":[],"branding":[]}`),
+		"users/5.json":          []byte(`{"account":{"id":5},"profiles":[` + empties + `],"items":[]}`),
+	} {
+		t.Run(name, func(t *testing.T) {
+			index, entries := testRestoreSet()
+			for i := range entries {
+				if entries[i].name == name {
+					entries[i].data = bomb
+				}
+			}
+			for i := range index.Sections {
+				for j, f := range index.Sections[i].Files {
+					if f.Path == name {
+						sum := sha256.Sum256(bomb)
+						index.Sections[i].Files[j] = FileDigest{Path: f.Path, Size: int64(len(bomb)), SHA256: hex.EncodeToString(sum[:])}
+					}
+				}
+			}
+			data := buildTar(t, index, entries)
+			var before, after runtime.MemStats
+			runtime.GC()
+			runtime.ReadMemStats(&before)
+			started := time.Now()
+			_, err := ReadRestoreSet(context.Background(), bytes.NewReader(data), ReadOptions{})
+			elapsed := time.Since(started)
+			runtime.ReadMemStats(&after)
+			if !errors.Is(err, jsonsize.ErrTooLarge) {
+				t.Fatalf("%d bytes of empty entries: %v, want jsonsize.ErrTooLarge", len(bomb), err)
+			}
+			// What reading the archive itself takes, a few times its size,
+			// far below the tens of megabytes the entries would decode to.
+			if allocated := after.TotalAlloc - before.TotalAlloc; allocated > 8<<20 {
+				t.Fatalf("reading allocated %d bytes", allocated)
+			}
+			if elapsed > 5*time.Second {
+				t.Fatalf("refusing took %v", elapsed)
+			}
+		})
+	}
+}
+
+// setDocument replaces a document of a test restore set, with its digest
+// and its section's item count.
+func setDocument(index *RestoreSetIndex, entries []testEntry, name string, data []byte, count int) {
+	for i := range entries {
+		if entries[i].name == name {
+			entries[i].data = data
+		}
+	}
+	sum := sha256.Sum256(data)
+	for i := range index.Sections {
+		for j, f := range index.Sections[i].Files {
+			if f.Path == name {
+				index.Sections[i].Files[j] = FileDigest{Path: name, Size: int64(len(data)), SHA256: hex.EncodeToString(sum[:])}
+				index.Sections[i].Count = count
+			}
+		}
+	}
+}
+
+// TestUnusableEntriesAreCappedPerSection: a section of 500,000 malformed
+// entries lists the first maxUnusableListed and counts the rest in one
+// more, so a preview never builds an item for each.
+func TestUnusableEntriesAreCappedPerSection(t *testing.T) {
+	const bad = maxArtworkEntries
+	index, entries := testRestoreSet()
+	setDocument(&index, entries, homeSectionsDocumentName, mustJSON(HomeSectionsDocument{Sections: []HomeSectionEntry{}}), 0)
+	for i := range index.Sections {
+		if index.Sections[i].ID == SectionCollections {
+			index.Sections[i].Blobs = []string{}
+		}
+	}
+	entries = slices.DeleteFunc(entries, func(e testEntry) bool { return strings.HasPrefix(e.name, "blobs/collection-images/") })
+	malformed := `{"content_id":"m","title":"` + strings.Repeat("t", 40) + `"}`
+	doc := `{"collections":[],"item_artwork":[` + strings.Repeat(malformed+",", bad-1) + malformed + `],"branding":[]}`
+	setDocument(&index, entries, collectionsDocumentName, []byte(doc), bad)
+	rs, err := ReadRestoreSet(context.Background(), bytes.NewReader(buildTar(t, index, entries)), ReadOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	listed := 0
+	for _, e := range rs.Unusable {
+		if e.Section == SectionCollections {
+			listed++
+		}
+	}
+	last := rs.Unusable[len(rs.Unusable)-1]
+	if listed != maxUnusableListed+1 || last.Label != fmt.Sprintf("%d more entries", bad-maxUnusableListed) {
+		t.Fatalf("listed %d unusable entries, the last %+v; want %d and a count of the rest", listed, last, maxUnusableListed+1)
+	}
+}
+
+// TestValidEntriesAreCappedPerSection: a set of 400,000 valid item
+// artwork entries is refused when read, quickly, rather than previewed as
+// 400,000 items.
+func TestValidEntriesAreCappedPerSection(t *testing.T) {
+	index, entries := testRestoreSet()
+	setDocument(&index, entries, homeSectionsDocumentName, mustJSON(HomeSectionsDocument{Sections: []HomeSectionEntry{}}), 0)
+	for i := range index.Sections {
+		if index.Sections[i].ID == SectionCollections {
+			index.Sections[i].Blobs = []string{}
+		}
+	}
+	entries = slices.DeleteFunc(entries, func(e testEntry) bool { return strings.HasPrefix(e.name, "blobs/collection-images/") })
+	const n = 400_000
+	var doc strings.Builder
+	doc.WriteString(`{"collections":[],"branding":[],"item_artwork":[`)
+	for i := range n {
+		if i > 0 {
+			doc.WriteByte(',')
+		}
+		fmt.Fprintf(&doc, `{"target_type":"movie","content_id":"m%d","image_type":"poster","path":"","source":"","thumbhash":"","title":"","parent_content_id":""}`, i)
+	}
+	doc.WriteString(`]}`)
+	setDocument(&index, entries, collectionsDocumentName, []byte(doc.String()), n)
+	started := time.Now()
+	_, err := ReadRestoreSet(context.Background(), bytes.NewReader(buildTar(t, index, entries)), ReadOptions{})
+	if err == nil || !strings.Contains(err.Error(), "item artwork entries") {
+		t.Fatalf("400,000 artwork entries: %v, want them refused", err)
+	}
+	if elapsed := time.Since(started); elapsed > 10*time.Second {
+		t.Fatalf("refusing took %v", elapsed)
+	}
+}
+
+// TestEveryEntryHasOneSizeBound: every kind of entry a restore writes is
+// left out, as unusable, when it holds more than an editor accepts in one
+// request (maxRestoredEntryBytes); the rest of the set stays readable.
+func TestEveryEntryHasOneSizeBound(t *testing.T) {
+	big := strings.Repeat("x", maxRestoredEntryBytes)
+	library := 3
+	noCollections := func(d CollectionsDocument) CollectionsDocument {
+		if d.Collections == nil {
+			d.Collections = []CollectionEntry{}
+		}
+		if d.ItemArtwork == nil {
+			d.ItemArtwork = []ItemArtworkEntry{}
+		}
+		d.Branding = []BrandingEntry{}
+		return d
+	}
+	cases := map[string]struct {
+		document string
+		doc      func(entries []testEntry) any
+	}{
+		SectionSettings: {settingsDocumentName, func([]testEntry) any {
+			return SettingsDocument{Settings: []SettingEntry{{Key: "branding.server_name", Value: big}}}
+		}},
+		SectionLibraries: {librariesDocumentName, func([]testEntry) any {
+			return LibrariesDocument{Libraries: []LibraryEntry{{ID: 3, Name: big, Type: "movies", Paths: []string{"/media/movies"}, TrailerKinds: []string{}}}}
+		}},
+		SectionPlugins: {"plugins/tmdb/plugin.json", func(entries []testEntry) any {
+			var doc PluginDocument
+			for _, e := range entries {
+				if e.name == "plugins/tmdb/plugin.json" {
+					_ = json.Unmarshal(e.data, &doc)
+				}
+			}
+			doc.Configs = []PluginConfigEntry{{Key: "global", Value: json.RawMessage(`"` + big + `"`)}}
+			return doc
+		}},
+		KindCollection: {collectionsDocumentName, func([]testEntry) any {
+			return noCollections(CollectionsDocument{Collections: []CollectionEntry{
+				{ID: "c1", LibraryID: 3, Libraries: []CollectionLib{{LibraryID: 3}}, Title: "Favorites", Description: big}}})
+		}},
+		KindTemplateCollection: {collectionsDocumentName, func([]testEntry) any {
+			return noCollections(CollectionsDocument{TemplateCollections: []TemplateCollectionEntry{{ID: "t1", BundleID: "core_defaults",
+				TemplateID: "tmdb_popular_movies", ManagementKey: TemplateManagementKey("core_defaults", "tmdb_popular_movies", 3), LibraryID: 3,
+				Title: "Popular", Description: big}}})
+		}},
+		KindItemArtwork: {collectionsDocumentName, func([]testEntry) any {
+			return noCollections(CollectionsDocument{ItemArtwork: []ItemArtworkEntry{{TargetType: "movie", ContentID: "m1", ImageType: artworkkey.ImagePoster, Thumbhash: big}}})
+		}},
+		SectionHomeSections: {homeSectionsDocumentName, func([]testEntry) any {
+			return HomeSectionsDocument{Sections: []HomeSectionEntry{{ID: "s2", Scope: "library", LibraryID: &library, SectionType: "recently_added",
+				Title: "Picks", Config: json.RawMessage(`{"x":"` + big + `"}`)}}}
+		}},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			index, entries := testRestoreSet()
+			if c.document == collectionsDocumentName {
+				// The page sections name the backup's collections, and its
+				// images are theirs.
+				setDocument(&index, entries, homeSectionsDocumentName, mustJSON(HomeSectionsDocument{Sections: []HomeSectionEntry{}}), 0)
+				for i := range index.Sections {
+					if index.Sections[i].ID == SectionCollections {
+						index.Sections[i].Blobs = []string{}
+					}
+				}
+				entries = slices.DeleteFunc(entries, func(e testEntry) bool { return strings.HasPrefix(e.name, "blobs/collection-images/") })
+			}
+			setDocument(&index, entries, c.document, mustJSON(c.doc(entries)), 1)
+			rs, err := ReadRestoreSet(context.Background(), bytes.NewReader(buildTar(t, index, entries)), ReadOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !slices.ContainsFunc(rs.Unusable, func(e UnusableEntry) bool { return e.Message == msgEntryTooLarge }) {
+				t.Fatalf("an oversized entry was kept; unusable: %+v", rs.Unusable)
+			}
+		})
+	}
+}
+
+// TestReadRestoreSetChecksBeforeDecoding: an index that does not match the
+// manifest's digest is refused before it is decoded, a failed archive check
+// stops the read before any document is decoded, and documents larger than
+// a restore set may hold are refused from the index alone.
+func TestReadRestoreSetChecksBeforeDecoding(t *testing.T) {
+	ctx := context.Background()
+	index, entries := testRestoreSet()
+	data := buildTar(t, index, entries)
+	sum := sha256.Sum256(mustJSON(index))
+	if _, err := ReadRestoreSet(ctx, bytes.NewReader(data), ReadOptions{IndexSHA256: hex.EncodeToString(sum[:])}); err != nil {
+		t.Fatalf("matching index digest: %v", err)
+	}
+	if _, err := ReadRestoreSet(ctx, bytes.NewReader(data), ReadOptions{IndexSHA256: strings.Repeat("0", 64)}); err == nil || !strings.Contains(err.Error(), "does not match the digest its manifest records") {
+		t.Fatalf("another index digest = %v", err)
+	}
+
+	// A document that would fail to decode: the archive check runs first.
+	bIndex, bEntries := testRestoreSet()
+	for i := range bEntries {
+		if bEntries[i].name == settingsDocumentName {
+			bEntries[i].data = []byte("{not json")
+		}
+	}
+	resyncDigests(&bIndex, bEntries)
+	refused := errors.New("the archive is not the one its manifest records")
+	if _, err := ReadRestoreSet(ctx, bytes.NewReader(buildTar(t, bIndex, bEntries)), ReadOptions{Verify: func() error { return refused }}); !errors.Is(err, refused) {
+		t.Fatalf("read with a failing archive check = %v, want the check's error", err)
+	}
+
+	for name, change := range map[string]func(*RestoreSetIndex){
+		"documents over the budget": func(index *RestoreSetIndex) {
+			for i := range index.Sections {
+				for j := range index.Sections[i].Files {
+					if path.Base(index.Sections[i].Files[j].Path) != pluginArchiveName {
+						index.Sections[i].Files[j].Size = maxRestoreSetDocument
+					}
+				}
+			}
+		},
+		"an oversized plugin document": func(index *RestoreSetIndex) {
+			for i := range index.Sections {
+				for j := range index.Sections[i].Files {
+					if path.Base(index.Sections[i].Files[j].Path) == pluginDocumentName {
+						index.Sections[i].Files[j].Size = maxPluginDocument + 1
+					}
+				}
+			}
+		},
+	} {
+		index, entries := testRestoreSet()
+		change(&index)
+		if _, err := ReadRestoreSet(ctx, bytes.NewReader(buildTar(t, index, entries)), ReadOptions{}); err == nil || !strings.Contains(err.Error(), restoreSetIndexName) {
+			t.Fatalf("%s: %v, want the index refused", name, err)
+		}
 	}
 }
 
@@ -247,14 +685,9 @@ func TestReadRestoreSetRefusesHostileArchives(t *testing.T) {
 		"blob key outside prefixes":    section(SectionLibraries, func(s *SectionIndex) { s.Blobs = append(s.Blobs, "profile-avatars/a.jpg") }),
 		"server id with a slash":       func(i *RestoreSetIndex, _ *[]testEntry) { i.ServerID = "../x" },
 		"not a restore set":            func(i *RestoreSetIndex, _ *[]testEntry) { i.Format = "something-else" },
-		"relative library path": replace("libraries.json", func(e *testEntry) {
-			e.data = mustJSON(LibrariesDocument{Libraries: []LibraryEntry{{ID: 3, Name: "a", Type: "movies", Paths: []string{"media/../etc"}}}})
-		}),
 		"document points at an unlisted blob": replace("libraries.json", func(e *testEntry) {
 			e.data = mustJSON(LibrariesDocument{Libraries: []LibraryEntry{{ID: 3, Name: "a", Type: "movies", Paths: []string{"/a"}, Poster: "library-posters/other.jpg"}}})
 		}),
-		"branding entry for another setting": brandingCase(BrandingEntry{Key: "setup.completed", Ref: "evil.example", Blob: "branding/mark/evil.example"}),
-		"branding ref with a path":           brandingCase(BrandingEntry{Key: "branding.mark_ref", Ref: "../x.webp", Blob: "branding/x.webp"}),
 		"plugin document names another plugin": replace("plugins/tmdb/plugin.json", func(e *testEntry) {
 			var doc PluginDocument
 			_ = json.Unmarshal(e.data, &doc)
@@ -303,18 +736,35 @@ func TestReadRestoreSetRefusesHostileUserDocuments(t *testing.T) {
 	}
 	refuseAll(t, map[string]func(*RestoreSetIndex, *[]testEntry){
 		"users in a version 1 set": func(i *RestoreSetIndex, _ *[]testEntry) { i.Version = 1 },
-		"user document of another account": replace("users/5.json", func(e *testEntry) {
-			e.data = mustJSON(testUserDocument(6, "upload:profile-avatars/5/p1/original.webp"))
-		}),
 		"an owner flag in a user document": replace("users/5.json", func(e *testEntry) {
 			e.data = bytes.Replace(e.data, []byte(`"role":"user"`), []byte(`"role":"user","is_owner":true`), 1)
+		}),
+		"avatar not listed": userCase(func(d *UserDocument) { d.Profiles[0].Avatar = "upload:profile-avatars/5/p9/original.webp" }),
+	})
+	// A document whose own values no restore could write leaves that
+	// account out, listed, and the rest of the set readable.
+	for name, edit := range map[string]func(*RestoreSetIndex, *[]testEntry){
+		"user document of another account": replace("users/5.json", func(e *testEntry) {
+			e.data = mustJSON(testUserDocument(6, "upload:profile-avatars/5/p1/original.webp"))
 		}),
 		"an unknown role":            userCase(func(d *UserDocument) { d.Account.Role = "owner" }),
 		"unknown profile data":       userCase(func(d *UserDocument) { d.Profiles[0].Data["passwords"] = json.RawMessage(`{}`) }),
 		"repeated profile id":        userCase(func(d *UserDocument) { d.Profiles = append(d.Profiles, d.Profiles[0]) }),
-		"avatar not listed":          userCase(func(d *UserDocument) { d.Profiles[0].Avatar = "upload:profile-avatars/5/p9/original.webp" }),
 		"avatar outside the avatars": userCase(func(d *UserDocument) { d.Profiles[0].Avatar = "upload:library-posters/3.jpg" }),
-	})
+	} {
+		t.Run(name, func(t *testing.T) {
+			index, entries := testRestoreSet()
+			edit(&index, &entries)
+			resyncDigests(&index, entries)
+			rs, err := ReadRestoreSet(context.Background(), bytes.NewReader(buildTar(t, index, entries)), ReadOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(rs.Users) != 0 || len(rs.Unusable) != 1 || rs.Unusable[0].Section != SectionUsers {
+				t.Fatalf("users %d, unusable %+v", len(rs.Users), rs.Unusable)
+			}
+		})
+	}
 }
 
 // brandingCase puts one branding entry, its blob listed and present, into an
@@ -428,17 +878,6 @@ func TestReadRestoreSetReadsEveryFormatVersion(t *testing.T) {
 		}, true},
 		{"version 2 with home sections", 2, func(i *RestoreSetIndex, e *[]testEntry) { dropTemplates(i, e) }, false},
 		{"version 2 with template collections", 2, func(i *RestoreSetIndex, e *[]testEntry) { dropSection(i, e, SectionHomeSections) }, false},
-		{"a section carrying a collection its configuration does not name", 3, func(i *RestoreSetIndex, e *[]testEntry) {
-			for j := range *e {
-				if (*e)[j].name == homeSectionsDocumentName {
-					var doc HomeSectionsDocument
-					_ = json.Unmarshal((*e)[j].data, &doc)
-					doc.Sections[1].Config = json.RawMessage(`{"library_collection_id":"c1"}`)
-					(*e)[j].data = mustJSON(doc)
-				}
-			}
-			resyncDigests(i, *e)
-		}, false},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			index, entries := testRestoreSet()
@@ -495,5 +934,173 @@ func TestPendingDecodesFollowTheComparison(t *testing.T) {
 	}
 	if r, ok := d.take(&docs[1].Profiles[1], userdata.WatchHistory); !ok || r.err == nil {
 		t.Fatalf("d: err %v, ok %v; want its decode error", r.err, ok)
+	}
+}
+
+// TestReadRestoreSetLeavesOutUnusableEntries: an entry holding a value no
+// restore could write is left out and listed, and the rest of the set stays
+// readable; nothing it names is written.
+func TestReadRestoreSetLeavesOutUnusableEntries(t *testing.T) {
+	editDocument := func(name string, into any, edit func()) func(*RestoreSetIndex, *[]testEntry) {
+		return func(_ *RestoreSetIndex, entries *[]testEntry) {
+			for j := range *entries {
+				if (*entries)[j].name == name {
+					_ = json.Unmarshal((*entries)[j].data, into)
+					edit()
+					(*entries)[j].data = mustJSON(into)
+				}
+			}
+		}
+	}
+	var libraries LibrariesDocument
+	var sections HomeSectionsDocument
+	var collections CollectionsDocument
+	huge := strings.Repeat("x", maxRestoredEntryBytes)
+	for name, c := range map[string]struct {
+		edit    func(*RestoreSetIndex, *[]testEntry)
+		section string
+		gone    func(*RestoreSet) bool
+	}{
+		"relative library path": {editDocument("libraries.json", &libraries, func() { libraries.Libraries[0].Paths = []string{"media/../etc"} }),
+			SectionLibraries, func(rs *RestoreSet) bool { return len(rs.Libraries.Libraries) == 0 }},
+		"branding entry for another setting": {brandingCase(BrandingEntry{Key: "setup.completed", Ref: "evil.example", Blob: "branding/mark/evil.example"}),
+			SectionCollections, func(rs *RestoreSet) bool { return len(rs.Collections.Branding) == 0 }},
+		"branding ref with a path": {brandingCase(BrandingEntry{Key: "branding.mark_ref", Ref: "../x.webp", Blob: "branding/x.webp"}),
+			SectionCollections, func(rs *RestoreSet) bool { return len(rs.Collections.Branding) == 0 }},
+		"a section carrying a collection its configuration does not name": {editDocument(homeSectionsDocumentName, &sections, func() {
+			sections.Sections[1].Config = json.RawMessage(`{"library_collection_id":"c1"}`)
+		}), SectionHomeSections, func(rs *RestoreSet) bool { return len(rs.HomeSections.Sections) == 1 }},
+		// No editor writes more for one collection in one request.
+		"a collection description larger than a request": {editDocument(collectionsDocumentName, &collections, func() { collections.Collections[0].Description = huge }),
+			SectionCollections, func(rs *RestoreSet) bool { return len(rs.Collections.Collections) == 0 }},
+		"a section configuration larger than a request": {editDocument(homeSectionsDocumentName, &sections, func() {
+			sections.Sections[0].Config = json.RawMessage(`{"library_collection_id":"c1","pad":"` + huge + `"}`)
+		}), SectionHomeSections, func(rs *RestoreSet) bool { return len(rs.HomeSections.Sections) == 1 }},
+	} {
+		t.Run(name, func(t *testing.T) {
+			index, entries := testRestoreSet()
+			c.edit(&index, &entries)
+			resyncDigests(&index, entries)
+			rs, err := ReadRestoreSet(context.Background(), bytes.NewReader(buildTar(t, index, entries)), ReadOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(rs.Unusable) != 1 || rs.Unusable[0].Section != c.section || !c.gone(rs) {
+				t.Fatalf("unusable = %+v", rs.Unusable)
+			}
+		})
+	}
+}
+
+// A PAX sparse entry would read as a regular file of its logical size, with
+// holes filled from nothing; the reader refuses it before reading on.
+func TestReadRestoreSetRefusesSparseEntries(t *testing.T) {
+	index, entries := testRestoreSet()
+	const name = "blobs/library-posters/3.jpg"
+	sparseMap := []byte("1\n0\n1\n")
+	for i := range entries {
+		if entries[i].name == name {
+			entries[i].data = append(append(sparseMap, make([]byte, 512-len(sparseMap))...), 'x')
+		}
+	}
+	data := withPAXRecords(t, buildTar(t, index, entries), name, map[string]string{"GNU.sparse.major": "1", "GNU.sparse.minor": "0",
+		"GNU.sparse.name": name, "GNU.sparse.realsize": strconv.Itoa(1 << 30)})
+	_, err := ReadRestoreSet(context.Background(), bytes.NewReader(data), ReadOptions{ExtractDir: t.TempDir()})
+	if err == nil || !strings.Contains(err.Error(), "sparse") {
+		t.Fatalf("read = %v, want a refused sparse file", err)
+	}
+}
+
+// withPAXRecords puts a PAX extended header with records ahead of the entry
+// named name: archive/tar's writer will not write GNU sparse records.
+func withPAXRecords(t *testing.T, archive []byte, name string, records map[string]string) []byte {
+	t.Helper()
+	var body []byte
+	for _, key := range slices.Sorted(maps.Keys(records)) {
+		rec := " " + key + "=" + records[key] + "\n"
+		n := len(rec) + 1
+		for len(strconv.Itoa(n))+len(rec) != n {
+			n = len(strconv.Itoa(n)) + len(rec)
+		}
+		body = append(body, strconv.Itoa(n)+rec...)
+	}
+	header := make([]byte, 512)
+	copy(header, "PaxHeaders/x")
+	copy(header[100:], "0000644\x00")
+	copy(header[124:], fmt.Sprintf("%011o\x00", len(body)))
+	copy(header[136:], "00000000000\x00")
+	header[156] = 'x'
+	copy(header[257:], "ustar\x0000")
+	copy(header[148:], "        ")
+	sum := 0
+	for _, b := range header {
+		sum += int(b)
+	}
+	copy(header[148:], fmt.Sprintf("%06o\x00 ", sum))
+	block := slices.Concat(header, body)
+	block = append(block, make([]byte, (512-len(body)%512)%512)...)
+	for off := 0; off+512 <= len(archive); off += 512 {
+		if bytes.Equal(bytes.TrimRight(archive[off:off+100], "\x00"), []byte(name)) && string(archive[off+257:off+262]) == "ustar" {
+			return append(append(append([]byte{}, archive[:off]...), block...), archive[off:]...)
+		}
+	}
+	t.Fatalf("no header for %s", name)
+	return nil
+}
+
+// An account left out of a restore set is recorded with fields the reader
+// accepts, however long its name or error: one long username must not make
+// the whole index unreadable.
+func TestOmittedAccountsStayReadable(t *testing.T) {
+	long := strings.Repeat("é", 400) // 800 bytes, over maxAccountField
+	cases := []struct {
+		name    string
+		account AccountEntry
+		err     error
+	}{
+		{"long username", AccountEntry{ID: 1, Username: long}, errors.New("boom")},
+		{"long email", AccountEntry{ID: 2, Email: long + "@example.com"}, errors.New("boom")},
+		{"long error", AccountEntry{ID: 3, Username: "a"}, errors.New(strings.Repeat("x", 3*maxOmittedText))},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var b restoreSetBuild
+			b.omitFailed(sectionSpec{id: SectionUsers}, tc.account, &exportError{part: "ratings", err: fmt.Errorf("reading ratings: %w", tc.err)})
+			if err := validateOmitted(b.index.Omitted); err != nil {
+				t.Fatalf("omitted %+v: %v", b.index.Omitted, err)
+			}
+			if !utf8.ValidString(b.index.Omitted[0].Label) || b.index.Omitted[0].Label == "" {
+				t.Fatalf("label %q is not valid text", b.index.Omitted[0].Label)
+			}
+		})
+	}
+}
+
+// TestReadRestoreSetRefusesExpandingHeaders: a restore set whose first
+// header is an old-GNU sparse entry with 50,000 extension blocks is
+// refused at that header, without expanding them.
+func TestReadRestoreSetRefusesExpandingHeaders(t *testing.T) {
+	var b bytes.Buffer
+	tw := tar.NewWriter(&b)
+	_ = tw.WriteHeader(&tar.Header{Name: restoreSetIndexName, Mode: 0o644, Size: 0, Typeflag: tar.TypeReg})
+	raw := b.Bytes()[:512]
+	raw[156] = 'S'
+	copy(raw[148:156], "        ")
+	sum := 0
+	for _, c := range raw {
+		sum += int(c)
+	}
+	copy(raw[148:156], fmt.Sprintf("%06o\x00 ", sum))
+	archive := append(slices.Clone(raw), bytes.Repeat(append(make([]byte, 511), 1), 50_000)...)
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	_, err := ReadRestoreSet(context.Background(), bytes.NewReader(archive), ReadOptions{})
+	runtime.ReadMemStats(&after)
+	if !errors.Is(err, errTarShape) {
+		t.Fatalf("a sparse header: %v, want errTarShape", err)
+	}
+	if allocated := after.TotalAlloc - before.TotalAlloc; allocated > 4<<20 {
+		t.Fatalf("refusing allocated %d bytes", allocated)
 	}
 }

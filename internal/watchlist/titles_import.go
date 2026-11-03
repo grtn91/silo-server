@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -22,16 +23,6 @@ import (
 // title's lock, may be writing too.
 func EnsureTitlesInTx(ctx context.Context, tx pgx.Tx, snaps []Snapshot, now time.Time) error {
 	return eachTitle(snaps, func(snap Snapshot) error { return ensureTitle(ctx, tx, snap, now) })
-}
-
-// LockTitlesInTx locks, in EnsureTitlesInTx's order, the titles snaps name
-// that this server already has, and creates none: an untrusted document's
-// snapshot is never written to a title other accounts read.
-func LockTitlesInTx(ctx context.Context, tx pgx.Tx, snaps []Snapshot) error {
-	return eachTitle(snaps, func(snap Snapshot) error {
-		_, _, err := lockTitleByTMDB(ctx, tx, snap.MediaType, snap.TMDBID)
-		return err
-	})
 }
 
 // eachTitle runs fn once per title snaps name, in media type and TMDB id
@@ -80,33 +71,33 @@ func ensureTitle(ctx context.Context, tx pgx.Tx, snap Snapshot, now time.Time) e
 	return fmt.Errorf("creating watchlist title: lost the race to create it %d times", maxAddAttempts)
 }
 
-// LinkExistingTitleInTx adds a title to the profile's watchlist only when
-// this server already has it, and writes nothing from snap to the shared
-// title: an untrusted document's snapshot could carry any metadata. A title
-// no entry references has a stale snapshot, so its provider check is moved
-// up instead. found is false when the server has no such title.
-func LinkExistingTitleInTx(ctx context.Context, tx pgx.Tx, userID int, profileID string, snap Snapshot, addedAt, now time.Time) (found, inserted bool, err error) {
-	if snap.MediaType != mediaTypeMovie && snap.MediaType != mediaTypeSeries || snap.TMDBID <= 0 {
-		return false, false, fmt.Errorf("watchlist: invalid title %s/%d", snap.MediaType, snap.TMDBID)
-	}
-	titleID, found, err := lockTitleByTMDB(ctx, tx, snap.MediaType, snap.TMDBID)
-	if err != nil || !found {
-		return false, false, err
-	}
-	if _, err := tx.Exec(ctx, `
-		UPDATE watchlist_titles SET next_check_at = least(next_check_at, $2)
-		WHERE id = $1 AND NOT EXISTS (SELECT 1 FROM user_watchlist_titles WHERE title_id = $1)`, titleID, now); err != nil {
-		return true, false, fmt.Errorf("scheduling watchlist title check: %w", err)
-	}
-	tag, err := tx.Exec(ctx, `
-		INSERT INTO user_watchlist_titles (user_id, profile_id, title_id, added_at)
-		VALUES ($1, $2, $3, $4)
-		ON CONFLICT (user_id, profile_id, title_id) DO NOTHING`, userID, profileID, titleID, addedAt)
+// ProfileTitlesInTx lists, in one read, the titles a profile's own
+// watchlist holds, as "<media type>:<TMDB ID>" for every TMDB id each has
+// had. It reads only that profile's entries, so it says nothing about any
+// other account's watchlist: an untrusted import (a profile's own export)
+// links no title the profile does not already list
+// (watchlist.BackupData.Import).
+func ProfileTitlesInTx(ctx context.Context, tx pgx.Tx, userID int, profileID string) (map[string]bool, error) {
+	rows, err := tx.Query(ctx, `
+		SELECT a.media_type || ':' || a.provider_id FROM user_watchlist_titles u
+		JOIN watchlist_title_aliases a ON a.title_id = u.title_id
+		WHERE u.user_id = $1 AND u.profile_id = $2 AND a.provider = 'tmdb'`, userID, profileID)
 	if err != nil {
-		return true, false, fmt.Errorf("adding watchlist title entry: %w", err)
+		return nil, err
 	}
-	return true, tag.RowsAffected() > 0, nil
+	keys, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]bool, len(keys))
+	for _, k := range keys {
+		out[k] = true
+	}
+	return out, nil
 }
+
+// TitleKey is a snapshot's key in ProfileTitlesInTx.
+func (snap Snapshot) TitleKey() string { return snap.MediaType + ":" + strconv.Itoa(snap.TMDBID) }
 
 // AddSnapshotInTx puts a title on a profile's watchlist in the caller's
 // transaction, as AddSnapshot does: the title holding the TMDB ID, current

@@ -100,11 +100,21 @@ export function deleteBackupUpload(context: ProfileRequestContextSnapshot, uploa
   );
 }
 
-export function getUploadRestoreSet(context: ProfileRequestContextSnapshot, uploadId: string) {
+/**
+ * An upload carries no manifest this server signed, so it's read only once
+ * `acceptUnauthenticated` confirms it; without it the server answers 409
+ * `backup_unauthenticated`.
+ */
+export function getUploadRestoreSet(
+  context: ProfileRequestContextSnapshot,
+  uploadId: string,
+  acceptUnauthenticated = false,
+) {
   return readAsAdmin(context, () =>
     v2("GET /api/v2/admin/backups/uploads/{upload_id}/restore-set", {
       profileContext: context,
       path: { upload_id: uploadId },
+      query: acceptUnauthenticated ? { accept_unauthenticated: true } : undefined,
       timeoutMs: RESTORE_SET_TIMEOUT_MS,
     }),
   );
@@ -115,12 +125,13 @@ export function startUploadRestore(
   uploadId: string,
   digest: string,
   selection: RestoreSelection,
+  acceptUnauthenticated = false,
 ) {
   return readAsAdmin(context, () =>
     v2("POST /api/v2/admin/backups/uploads/{upload_id}/restore", {
       profileContext: context,
       path: { upload_id: uploadId },
-      body: { digest, selection },
+      body: { digest, selection, accept_unauthenticated: acceptUnauthenticated || undefined },
       retryAuthentication: false,
     }),
   );

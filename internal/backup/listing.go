@@ -76,6 +76,9 @@ type Summary struct {
 	Encrypted  bool   `json:"encrypted"`
 	KeyCheck   string `json:"key_check,omitempty"`
 	KeyMatches bool   `json:"key_matches"`
+	// Clean is whether rotation protects this copy as its newest clean one
+	// may be: complete, every blob, verified (folder.cleanCopy).
+	Clean bool `json:"clean"`
 }
 
 // Warning is one condition the dashboard shows about backups.
@@ -206,6 +209,7 @@ func (s *Service) list(ctx context.Context) (Listing, error) {
 	for _, f := range folders {
 		summary := Summary{ID: f.id, Kind: f.kind, CreatedAt: f.at, SizeBytes: f.size, MissingBlobs: []MissingBlob{}, RestoreSetOmitted: []OmittedItem{}, Objects: []ObjectEntry{},
 			Location: t.Location(folderPrefix(serverID, f.id))}
+		summary.Clean = f.cleanCopy()
 		switch {
 		case f.manifest != nil:
 			s.fromManifest(&summary, f.manifest)
@@ -214,6 +218,8 @@ func (s *Service) list(ctx context.Context) (Listing, error) {
 			if listing.LastSuccessAt == nil || completed.After(*listing.LastSuccessAt) {
 				listing.LastSuccessAt = &completed
 			}
+		case f.tampered:
+			summary.Status = StatusUnverified
 		case listing.Active != nil && listing.Active.Operation == OperationBackup && listing.Active.BackupID == f.id:
 			summary.Status = StatusInProgress
 		default:
@@ -250,6 +256,9 @@ func otherServerIDs(objects []blobstore.ObjectInfo, serverID string) []string {
 func (s *Service) fromManifest(summary *Summary, m *Manifest) {
 	completed := m.CompletedAt
 	summary.Status, summary.CompletedAt, summary.SiloVersion = m.Status(), &completed, m.SiloVersion
+	if !m.authenticated && s.opts.ManifestKey != nil {
+		summary.Status = StatusUnverified
+	}
 	summary.SizeBytes, summary.MissingBlobs, summary.Objects, summary.BlobCount = m.Size(), m.MissingBlobs, m.Objects, m.Blobs.Count
 	summary.Encrypted, summary.KeyCheck, summary.KeyMatches = m.Encrypted, m.KeyCheck, m.KeyCheck != "" && m.KeyCheck == s.opts.KeyCheck
 	if m.RestoreSet != nil && m.RestoreSet.Omitted != nil {

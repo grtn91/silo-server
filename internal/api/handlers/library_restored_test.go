@@ -67,9 +67,9 @@ func TestLibraryRestoredReportsFailedSetupDB(t *testing.T) {
 	if err := h.LibraryRestored(ctx, folder.ID); err == nil {
 		t.Fatal("a failed first scan was reported as success")
 	}
-	seeded := countSections()
-	if seeded == 0 {
-		t.Fatal("the other steps did not run")
+	// Sections wait for the restore's own (LibrarySectionsRestored).
+	if n := countSections(); n != 0 {
+		t.Fatalf("the library's set-up seeded %d sections before the restore wrote its own", n)
 	}
 	if err := h.LibraryRestored(ctx, folder.ID); err != nil {
 		t.Fatalf("retry = %v", err)
@@ -77,8 +77,18 @@ func TestLibraryRestoredReportsFailedSetupDB(t *testing.T) {
 	if len(queue.queued) != 1 || queue.queued[0] != folder.ID {
 		t.Fatalf("queued scans = %v", queue.queued)
 	}
+	if err := h.LibrarySectionsRestored(ctx, folder.ID); err != nil {
+		t.Fatal(err)
+	}
+	seeded := countSections()
+	if seeded == 0 {
+		t.Fatal("no default sections were seeded")
+	}
+	if err := h.LibrarySectionsRestored(ctx, folder.ID); err != nil {
+		t.Fatal(err)
+	}
 	if n := countSections(); n != seeded {
-		t.Fatalf("retry seeded sections again: %d, then %d", seeded, n)
+		t.Fatalf("seeding again added sections: %d, then %d", seeded, n)
 	}
 }
 
@@ -206,5 +216,49 @@ func TestRestoredPluginJoinsChainsOnlyFromItsManifestDB(t *testing.T) {
 	}
 	if _, has := chainHas(t, pool, folder.ID, restored); !has {
 		t.Fatal("the retry did not add the restored provider")
+	}
+}
+
+// TestRestoredEntriesMeetTheEditorChecks: a backup restore offers a library
+// or an admin collection only when the editor's create command would accept
+// it, with the same checks and the editor's message.
+func TestRestoredEntriesMeetTheEditorChecks(t *testing.T) {
+	collections := &LibraryCollectionHandler{}
+	schedule, badSchedule := "0 4 * * *", "every tuesday"
+	for name, tc := range map[string]struct {
+		in catalog.CreateLibraryCollectionInput
+		ok bool
+	}{
+		"manual collection":       {in: catalog.CreateLibraryCollectionInput{Title: "Favorites", SyncSchedule: &schedule}, ok: true},
+		"no title":                {in: catalog.CreateLibraryCollectionInput{Title: "  "}},
+		"unknown visibility":      {in: catalog.CreateLibraryCollectionInput{Title: "Favorites", Visibility: "public"}},
+		"rules that do not parse": {in: catalog.CreateLibraryCollectionInput{Title: "Smart", CollectionType: collectionTypeSmart, QueryDefinition: []byte(`[1]`)}},
+		"invalid sync schedule":   {in: catalog.CreateLibraryCollectionInput{Title: "Favorites", SyncSchedule: &badSchedule}},
+		"managed with no key":     {in: catalog.CreateLibraryCollectionInput{Title: "Favorites", ManagementMode: collectionManagementModeSection}},
+	} {
+		err := collections.CheckRestoredCollection(tc.in)
+		if tc.ok != (err == nil) {
+			t.Errorf("%s: CheckRestoredCollection = %v, want ok %v", name, err, tc.ok)
+		}
+		if err != nil && errors.As(err, new(*APIError)) {
+			t.Errorf("%s: the refusal is an API error, not the editor's message: %v", name, err)
+		}
+	}
+
+	libraries := &LibraryHandler{}
+	valid := catalog.CreateFolderInput{Paths: []string{"/media/movies"}, Type: "movies", Name: "Movies"}
+	if err := libraries.CheckRestoredLibrary(valid); err != nil {
+		t.Errorf("a library the editor accepts: %v", err)
+	}
+	for name, change := range map[string]func(*catalog.CreateFolderInput){
+		"no name":                   func(in *catalog.CreateFolderInput) { in.Name = "" },
+		"unknown metadata language": func(in *catalog.CreateFolderInput) { in.MetadataLanguage = "xx-not-a-language" },
+		"seek previews, no storage": func(in *catalog.CreateFolderInput) { in.TrickplayEnabled = true },
+	} {
+		in := valid
+		change(&in)
+		if err := libraries.CheckRestoredLibrary(in); err == nil {
+			t.Errorf("%s: CheckRestoredLibrary accepted it", name)
+		}
 	}
 }

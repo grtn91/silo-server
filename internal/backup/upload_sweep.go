@@ -151,8 +151,23 @@ func (s *Service) deleteDueUploads(ctx context.Context, held Held) (ids, warning
 	if held == nil {
 		return ids, warnings
 	}
+	warnings = append(warnings, reopenAbandonedChecks(ctx, held)...)
 	checked, more := s.deleteDueCheckedUploads(ctx, held)
 	return append(ids, checked...), append(warnings, more...)
+}
+
+// reopenAbandonedChecks returns uploads a check abandoned to waiting for a
+// completion. A check runs only under the lock the caller holds, so an
+// upload still checking was left by a server that stopped or lost the lock
+// mid-check: it is fully received, and the Uploaded backups list offers it
+// as "Check again". One left over UploadExpiry is deleted instead.
+func reopenAbandonedChecks(ctx context.Context, held Held) []string {
+	if _, err := held.Exec(ctx, `UPDATE backup_uploads SET status = 'uploading', updated_at = now()
+		WHERE status = 'checking' AND updated_at < now() - make_interval(secs => $1)
+		  AND updated_at >= now() - make_interval(secs => $2)`, abandonedCheckAfter.Seconds(), UploadExpiry.Seconds()); err != nil {
+		return []string{"reopening abandoned upload checks: " + err.Error()}
+	}
+	return nil
 }
 
 // deleteDueCheckedUploads deletes due checking and complete sessions, which
@@ -209,12 +224,17 @@ func errorWarnings(what string, err error) []string {
 // uploads does not take the lock (and make a nightly backup skip) for
 // nothing. It returns nil, and no error, when nothing is due or the lock is
 // busy.
+// abandonedCheckAfter is how long an upload may stay checking before the
+// sweep takes it for a check its server abandoned: longer than any check
+// runs (its timeout), and the check holds the lock throughout.
+const abandonedCheckAfter = 30 * time.Minute
+
 func (s *Service) lockForUploadSweep(ctx context.Context) (Held, error) {
 	var due bool
 	if err := s.opts.Pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM backup_uploads WHERE
 			(status = 'checking' AND updated_at < now() - make_interval(secs => $1))
 			OR (status = 'complete' AND updated_at < now() - make_interval(secs => $2)))`,
-		UploadExpiry.Seconds(), CompletedUploadExpiry.Seconds()).Scan(&due); err != nil || !due {
+		abandonedCheckAfter.Seconds(), CompletedUploadExpiry.Seconds()).Scan(&due); err != nil || !due {
 		return nil, err
 	}
 	held, err := s.opts.Locker.TryLock(ctx)

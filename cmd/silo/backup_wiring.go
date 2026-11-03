@@ -16,6 +16,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/catalog"
 	"github.com/Silo-Server/silo-server/internal/config"
 	"github.com/Silo-Server/silo-server/internal/nodeconfig"
+	"github.com/Silo-Server/silo-server/internal/secret"
 	"github.com/Silo-Server/silo-server/internal/serveridentity"
 )
 
@@ -29,6 +30,10 @@ func newBackupService(pool *pgxpool.Pool, bc *config.BootstrapConfig, settings *
 	if err != nil {
 		log.Fatalf("backup archive key: %v", err)
 	}
+	manifestKey, err := secret.BackupManifestKey(bc.SecretKey)
+	if err != nil {
+		log.Fatalf("backup manifest key: %v", err)
+	}
 	return backup.New(backup.Options{
 		Pool:                pool,
 		DatabaseURL:         bc.DatabaseURL,
@@ -41,6 +46,7 @@ func newBackupService(pool *pgxpool.Pool, bc *config.BootstrapConfig, settings *
 		ServerID:            serveridentity.New(settings).ServerID,
 		KeyCheck:            archiveKey.Check,
 		ArchiveKey:          archiveKey,
+		ManifestKey:         manifestKey,
 		Cipher:              deps.SecretCipher,
 		UserStoreBackend:    func() string { return deps.CurrentConfig().UserDB.Backend },
 		AllowUnratedContent: config.NewUnratedContentPolicy(settings).AllowUnratedContent,
@@ -63,7 +69,7 @@ type backupRestoreExecutor struct{ svc *backup.Service }
 
 func (e backupRestoreExecutor) ExecuteBackupRestore(ctx context.Context, run adminjob.BackupRestoreRun) (any, error) {
 	return e.svc.ExecuteRestore(ctx, backup.RestoreRun{
-		Payload: run.Payload,
+		JobID: run.JobID, Payload: run.Payload,
 		Fenced: func(ctx context.Context, fn func(pgx.Tx) (backup.FencedUpdate, error)) error {
 			return run.Fenced(ctx, func(tx pgx.Tx) (adminjob.FencedUpdate, error) {
 				update, err := fn(tx)

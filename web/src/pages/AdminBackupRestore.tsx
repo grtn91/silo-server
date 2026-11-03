@@ -162,7 +162,8 @@ export default function AdminBackupRestore() {
   const backups = useAdminBackups();
   const uploads = useAdminBackupUploads(fromUpload);
   const jobs = useRestoreJobs();
-  const preview = useRestoreSet(jobId ? null : source);
+  const [openUnverified, setOpenUnverified] = useState(false);
+  const preview = useRestoreSet(jobId ? null : source, openUnverified);
   const job = useRestoreJob(jobId);
   const start = useStartRestore(source);
   const cancel = useCancelRestore();
@@ -170,6 +171,7 @@ export default function AdminBackupRestore() {
   const [chosen, setChosen] = useState<Set<string>>(new Set());
   const [dataTypes, setDataTypes] = useState<ReadonlySet<RestoreDataTypeId>>(DEFAULT_DATA_TYPES);
   const [refusal, setRefusal] = useState<RestoreRefusal | null>(null);
+  const [acceptUnauthenticated, setAcceptUnauthenticated] = useState(false);
 
   const set = preview.data;
   const index = useMemo(() => (set ? indexItems(set) : new Map<string, IndexEntry>()), [set]);
@@ -222,7 +224,11 @@ export default function AdminBackupRestore() {
     if (!set) return;
     setRefusal(null);
     start.mutate(
-      { digest: set.digest, selection: selectionRequest(set, selection, dataTypes) },
+      {
+        digest: set.digest,
+        selection: selectionRequest(set, selection, dataTypes),
+        acceptUnauthenticated: !set.authenticated && acceptUnauthenticated,
+      },
       {
         onSuccess: (started) => {
           setReviewing(false);
@@ -284,6 +290,31 @@ export default function AdminBackupRestore() {
         <Skeleton className="h-32 w-full rounded-xl" />
       </div>
     );
+  } else if (
+    preview.error instanceof V2ProblemError &&
+    preview.error.problemType === "backup_unauthenticated"
+  ) {
+    body = (
+      <div role="alert" className="surface-panel space-y-3 rounded-2xl p-6">
+        <p className="font-medium">This server can&apos;t verify this backup.</p>
+        <p className="text-muted-foreground text-sm">
+          It was uploaded, or written under a different SECRET_KEY, or by a version of Silo that
+          didn&apos;t record what checking it needs. Anyone who could change the file could have
+          changed what it restores. Open it only if you trust where it came from. Settings that
+          connect to outside services and plugin settings are never restored from it.
+        </p>
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={() => {
+            setOpenUnverified(true);
+            setAcceptUnauthenticated(true);
+          }}
+        >
+          Open it anyway
+        </Button>
+      </div>
+    );
   } else if (preview.isError || !set) {
     body = (
       <div role="alert" className="surface-panel space-y-3 rounded-2xl p-6">
@@ -304,6 +335,8 @@ export default function AdminBackupRestore() {
         dataTypes={dataTypes}
         onBack={leaveReview}
         onRestore={restore}
+        acceptUnauthenticated={acceptUnauthenticated}
+        onAcceptUnauthenticated={setAcceptUnauthenticated}
         pending={start.isPending}
         refusal={refusal}
         onOpenRunning={(running) => {

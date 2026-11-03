@@ -164,9 +164,14 @@ func (u *userPlanner) planPending(ctx context.Context, plan *accountPlan) error 
 		return err
 	}
 	profiles := map[string]string{}
+	// created are the profiles this restore can create, by backup id.
+	created := map[string]string{}
 	for _, pp := range plan.profiles {
-		if pp.localID != "" {
+		switch {
+		case pp.localID != "":
 			profiles[pp.entry.ID] = pp.localID
+		case pp.preview.Selectable:
+			created[pp.entry.ID] = pp.entry.Name
 		}
 	}
 	for i := range plan.profiles {
@@ -185,6 +190,13 @@ func (u *userPlanner) planPending(ctx context.Context, plan *accountPlan) error 
 			continue
 		}
 		if total == 0 {
+			if names := sharesWith(pp.entry, created); len(names) > 0 {
+				// Sharing is restored from the owner's collections, so the
+				// owner stays selectable for the profiles it shares with.
+				pp.preview.Message = "The profile is on this server and keeps its PIN and access. Restore it together with " +
+					strings.Join(names, ", ") + " to share its collections with them again."
+				continue
+			}
 			pp.preview.Status, pp.preview.Reason, pp.preview.Selectable = ItemOnThisServer, ReasonSame, false
 			pp.preview.Message = "The profile and the data the backup has for it are already on this server."
 			continue
@@ -203,6 +215,27 @@ func (u *userPlanner) planPending(ctx context.Context, plan *accountPlan) error 
 		plan.item.Message = "The account, its profiles, and the data the backup has for them are already on this server."
 	}
 	return nil
+}
+
+// sharesWith names, in order, the profiles of created (backup id to name)
+// that a profile's personal collections are shared with.
+func sharesWith(e *ProfileEntry, created map[string]string) []string {
+	raw, ok := e.Data[userdata.Collections]
+	t, found := userdata.Find(userDataTypes, userdata.Collections)
+	if !ok || !found || len(created) == 0 {
+		return nil
+	}
+	sum, err := t.Validate(raw)
+	if err != nil {
+		return nil
+	}
+	var names []string
+	for _, id := range sum.Profiles {
+		if name, ok := created[id]; ok && !slices.Contains(names, name) {
+			names = append(names, name)
+		}
+	}
+	return names
 }
 
 // profilePending counts one matched profile's pending changes per data
@@ -232,7 +265,7 @@ func (u *userPlanner) profilePending(ctx context.Context, plan *accountPlan, pp 
 		Library: mapIn(u.libMap),
 		Profile: func(id string) (string, bool) { local, ok := profiles[id]; return local, ok },
 	}
-	target.Collection = newCollectionMap(p.planner, p.tx, u.libMap, u.sameServer, p.adminCollections, plan.doc).previewLookup(target)
+	target.Collections = newCollectionMap(p.planner, p.tx, u.libMap, u.sameServer, p.adminCollections, plan.doc).previewLookup(target)
 	for j := range pp.preview.DataTypes {
 		dt := &pp.preview.DataTypes[j]
 		t, ok := userdata.Find(userDataTypes, dt.ID)

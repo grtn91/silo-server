@@ -59,6 +59,12 @@ var TypePreparedFileExpired = ProblemType{"prepared_file_expired", http.StatusCo
 // restore set no longer has; preview the backup again.
 var TypeRestoreSetChanged = ProblemType{"restore_set_changed", http.StatusConflict, "Restore set changed"}
 
+// TypeBackupUnauthenticated: this server cannot authenticate the backup's
+// manifest (another SECRET_KEY, or a build that did not record what checking
+// it needs), so it reads the backup only with the admin's confirmation
+// (accept_unauthenticated).
+var TypeBackupUnauthenticated = ProblemType{"backup_unauthenticated", http.StatusConflict, "Backup not authenticated"}
+
 // ProblemType is one entry of the shared problem catalog.
 type ProblemType struct {
 	// ID is the stable identifier and the final path segment of the type URI.
@@ -92,6 +98,7 @@ var (
 	TypeTokenRefreshRequired                          = ProblemType{"token_refresh_required", http.StatusUnauthorized, "Token refresh required"}
 	TypePermissionDenied                              = ProblemType{"permission_denied", http.StatusForbidden, "Permission denied"}
 	TypeProfileVerificationRequired                   = ProblemType{"profile_verification_required", http.StatusForbidden, "Profile verification required"}
+	TypePushInstallationKeyMismatch                   = ProblemType{"push_installation_key_mismatch", http.StatusForbidden, "Push installation key mismatch"}
 	TypePasswordChangeRequired                        = ProblemType{"password_change_required", http.StatusForbidden, "Password change required"}
 	TypeNotFound                                      = ProblemType{"not_found", http.StatusNotFound, "Not found"}
 	TypeMethodNotAllowed                              = ProblemType{"method_not_allowed", http.StatusMethodNotAllowed, "Method not allowed"}
@@ -113,7 +120,7 @@ var (
 	TypeCapabilityUnsupported                         = ProblemType{"capability_unsupported", http.StatusNotImplemented, "Capability unsupported"}
 	TypeDependencyUnavailable                         = ProblemType{"dependency_unavailable", http.StatusServiceUnavailable, "Dependency unavailable"}
 	TypeClientUpgradeRequired                         = ProblemType{"client_upgrade_required", http.StatusGone, "Client upgrade required"}
-	catalog                                           = []ProblemType{TypeRangeNotSatisfiable, TypeDeviceLoginExpired, TypeUnsupportedSource, TypeMalformedRequest, TypeInvalidCursor, TypeAuthenticationRequired, TypeInvalidToken, TypeSessionExpired, TypePermissionDenied, TypeProfileVerificationRequired, TypeNotFound, TypeMethodNotAllowed, TypeNotAcceptable, TypeRequestTimeout, TypeConflict, TypeIdempotencyConflict, TypeJobNotCancelable, TypeCapabilityDisabled, TypeCapabilityNotConfigured, TypePreconditionFailed, TypePayloadTooLarge, TypeUnsupportedMediaType, TypeValidationFailed, TypePreconditionRequired, TypeRateLimited, TypeInternalError, TypeCapabilityUnsupported, TypeDependencyUnavailable, TypeClientUpgradeRequired, TypeSyncResetRequired, TypeSnapshotRequestConflict, TypeProgressSnapshotTooLarge, TypePlaybackInstallationChanged, TypePlaybackSessionEnded, TypePlaybackProgressConflict, TypePasswordChangeRequired, TypeNotPermitted, TypeAccountRequired, TypeLocalLoginDisabled, TypeProviderPasswordExpired, TypeEmailInUse, TypeIdentityLinkedElsewhere, TypeProviderAlreadyEnabled, TypeBreakGlassRequired, TypeLastSignInMethod, TypeProviderUnavailable, TypeInvalidGrant, TypeAccountDisabled, TypeLocalPasswordRequired, TypeAlreadyLinked, TypeTokenRefreshRequired, TypeNetworkIdentityRequired, TypePreparedFileExpired, TypeRestoreSetChanged, TypeUploadLimitReached}
+	catalog                                           = []ProblemType{TypeRangeNotSatisfiable, TypeDeviceLoginExpired, TypeUnsupportedSource, TypeMalformedRequest, TypeInvalidCursor, TypeAuthenticationRequired, TypeInvalidToken, TypeSessionExpired, TypePermissionDenied, TypeProfileVerificationRequired, TypePushInstallationKeyMismatch, TypeNotFound, TypeMethodNotAllowed, TypeNotAcceptable, TypeRequestTimeout, TypeConflict, TypeIdempotencyConflict, TypeJobNotCancelable, TypeCapabilityDisabled, TypeCapabilityNotConfigured, TypePreconditionFailed, TypePayloadTooLarge, TypeUnsupportedMediaType, TypeValidationFailed, TypePreconditionRequired, TypeRateLimited, TypeInternalError, TypeCapabilityUnsupported, TypeDependencyUnavailable, TypeClientUpgradeRequired, TypeSyncResetRequired, TypeSnapshotRequestConflict, TypeProgressSnapshotTooLarge, TypePlaybackInstallationChanged, TypePlaybackSessionEnded, TypePlaybackProgressConflict, TypePasswordChangeRequired, TypeNotPermitted, TypeAccountRequired, TypeLocalLoginDisabled, TypeProviderPasswordExpired, TypeEmailInUse, TypeIdentityLinkedElsewhere, TypeProviderAlreadyEnabled, TypeBreakGlassRequired, TypeLastSignInMethod, TypeProviderUnavailable, TypeInvalidGrant, TypeAccountDisabled, TypeLocalPasswordRequired, TypeAlreadyLinked, TypeTokenRefreshRequired, TypeNetworkIdentityRequired, TypePreparedFileExpired, TypeRestoreSetChanged, TypeBackupUnauthenticated, TypeUploadLimitReached}
 	defaultTypeByStatus                               = map[int]ProblemType{}
 	problemContentType                                = "application/problem+json"
 	_                               error             = (*Problem)(nil)

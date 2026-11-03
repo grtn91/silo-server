@@ -91,24 +91,7 @@ func (h *LibraryHandler) ListLibraries(ctx context.Context) ([]LibraryView, erro
 // CreateLibrary creates a library, seeds its sections and provider chain,
 // and queues its first scan.
 func (h *LibraryHandler) CreateLibrary(ctx context.Context, req LibraryCreateRequest) (LibraryView, error) {
-	if len(req.Paths) == 0 || req.Type == "" || req.Name == "" {
-		return LibraryView{}, apiError(http.StatusBadRequest, "bad_request", "Paths, type, and name are required")
-	}
-	paths, err := normalizeLibraryPaths(req.Paths)
-	if err != nil {
-		return LibraryView{}, err
-	}
-	req.Paths = paths
-	if req.MetadataLanguage != "" && !validMetadataLanguages[req.MetadataLanguage] {
-		return LibraryView{}, fieldError("metadata_language", "Invalid metadata_language; must be a valid ISO 639-1 code")
-	}
-	if req.ChapterThumbnailsEnabled && h.ArtworkStore == nil {
-		return LibraryView{}, fieldError("chapter_thumbnails_enabled", "Chapter thumbnails require configured artwork storage")
-	}
-	if req.TrickplayEnabled && h.ArtworkStore == nil {
-		return LibraryView{}, fieldError("trickplay_enabled", "Seek previews require configured artwork storage")
-	}
-	if err := validateBoxSetSettings(req.Type, &req.BoxSetsEnabled, &req.BoxSetMinMovies); err != nil {
+	if err := h.normalizeNewLibrary(&req); err != nil {
 		return LibraryView{}, err
 	}
 
@@ -150,6 +133,18 @@ func (h *LibraryHandler) LibraryRestored(ctx context.Context, id int) error {
 		return err
 	}
 	return h.setUpNewLibrary(ctx, folder)
+}
+
+// LibrarySectionsRestored seeds a restored library's default and home
+// sections where none exist. A restore runs it after it wrote the saved
+// sections it carries, so a default renamed before the backup is not
+// seeded again beside it.
+func (h *LibraryHandler) LibrarySectionsRestored(ctx context.Context, id int) error {
+	folder, err := h.folderRepo.GetByID(ctx, id)
+	if err != nil {
+		return err
+	}
+	return errors.Join(h.seedSections(ctx, folder)...)
 }
 
 // afterLibraryCreated is the work that follows a new library in the editor,
@@ -214,9 +209,10 @@ func (h *LibraryHandler) queueInitialScan(ctx context.Context, folder *models.Me
 	return nil
 }
 
-// setUpNewLibrary runs every step that follows a restored library and
-// returns the steps that failed, joined. A failed step does not stop the
-// others. A provider chain already set is left alone.
+// setUpNewLibrary runs every step that follows a restored library but its
+// sections (LibrarySectionsRestored) and returns the steps that failed,
+// joined. A failed step does not stop the others. A provider chain already
+// set is left alone.
 func (h *LibraryHandler) setUpNewLibrary(ctx context.Context, folder *models.MediaFolder) error {
 	var errs []error
 	h.pokeRealtimeMonitor()
@@ -227,7 +223,6 @@ func (h *LibraryHandler) setUpNewLibrary(ctx context.Context, folder *models.Med
 		h.syncBoxSets()
 	}
 
-	errs = append(errs, h.seedSections(ctx, folder)...)
 	if err := h.seedChain(ctx, folder.ID, folder.Type); err != nil {
 		errs = append(errs, err)
 	}
@@ -1223,6 +1218,42 @@ type RawMatchBacklogEntryView = libraryRawMatchBacklogEntryResponse
 
 // ProviderChainEntryInput is one entry of a set-chain command.
 type ProviderChainEntryInput = chainEntryInput
+
+// normalizeNewLibrary validates and normalizes a library the create command
+// takes: its required fields, folders, metadata language, the features that
+// need artwork storage, and box set settings.
+func (h *LibraryHandler) normalizeNewLibrary(req *LibraryCreateRequest) error {
+	if len(req.Paths) == 0 || req.Type == "" || req.Name == "" {
+		return apiError(http.StatusBadRequest, "bad_request", "Paths, type, and name are required")
+	}
+	paths, err := normalizeLibraryPaths(req.Paths)
+	if err != nil {
+		return err
+	}
+	req.Paths = paths
+	if req.MetadataLanguage != "" && !validMetadataLanguages[req.MetadataLanguage] {
+		return fieldError("metadata_language", "Invalid metadata_language; must be a valid ISO 639-1 code")
+	}
+	if req.ChapterThumbnailsEnabled && h.ArtworkStore == nil {
+		return fieldError("chapter_thumbnails_enabled", "Chapter thumbnails require configured artwork storage")
+	}
+	if req.TrickplayEnabled && h.ArtworkStore == nil {
+		return fieldError("trickplay_enabled", "Seek previews require configured artwork storage")
+	}
+	return validateBoxSetSettings(req.Type, &req.BoxSetsEnabled, &req.BoxSetMinMovies)
+}
+
+// CheckRestoredLibrary applies the library create command's checks
+// (normalizeNewLibrary) to a library a backup restore creates, so a restore
+// stores nothing the editor would refuse.
+func (h *LibraryHandler) CheckRestoredLibrary(in catalog.CreateFolderInput) error {
+	return restoreCheckError(h.normalizeNewLibrary(&LibraryCreateRequest{
+		Paths: in.Paths, Type: in.Type, Name: in.Name, MetadataLanguage: in.MetadataLanguage,
+		ChapterThumbnailsEnabled: in.ChapterThumbnailsEnabled, IntroDetectionEnabled: in.IntroDetectionEnabled,
+		TrailerKinds: in.TrailerKinds, RealtimeMonitoring: in.RealtimeMonitoring, TrickplayEnabled: in.TrickplayEnabled,
+		BoxSetsEnabled: in.BoxSetsEnabled, BoxSetMinMovies: in.BoxSetMinMovies, BoxSetsInSearch: in.BoxSetsInSearch,
+	}))
+}
 
 // maxLibraryPosterBytes caps a poster upload.
 const maxLibraryPosterBytes = 10 << 20

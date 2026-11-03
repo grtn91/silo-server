@@ -96,6 +96,7 @@ export const BACKUP_STATUS_LABELS: Record<AdminBackupStatus, string> = {
   complete_with_warnings: "Complete with warnings",
   in_progress: "In progress",
   incomplete: "Incomplete",
+  unverified: "Unverified",
 };
 
 /**
@@ -145,9 +146,18 @@ export function activeRestorePath(active: AdminBackupActive): string | null {
   return active.backup_id ? restorePath(active.backup_id) : null;
 }
 
-/** A backup with a manifest: one that can be downloaded and restored. */
+/**
+ * A backup with a manifest: one that can be downloaded and restored. An
+ * unverified one with its objects listed was written under another
+ * SECRET_KEY, and restoring it asks for confirmation; one without was
+ * changed after it was written and is never offered.
+ */
 export function isFinished(backup: AdminBackup): boolean {
-  return backup.status === "complete" || backup.status === "complete_with_warnings";
+  return (
+    backup.status === "complete" ||
+    backup.status === "complete_with_warnings" ||
+    (backup.status === "unverified" && backup.objects.length > 0)
+  );
 }
 
 const DAY_MS = 86_400_000;
@@ -235,7 +245,9 @@ export function retentionPlan(items: readonly AdminBackup[], keep: number): Rete
     .filter((item) => (item.kind === "nightly" || item.kind === "manual") && isFinished(item))
     .sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at));
   const room = Math.max(1, Math.floor(keep)) - 1;
-  const newestClean = newestFirst.find((item) => item.status === "complete")?.id ?? null;
+  // The server decides what a clean copy is (complete, every file,
+  // verified), as rotation does.
+  const newestClean = newestFirst.find((item) => item.clean)?.id ?? null;
   const past = newestFirst.slice(room).map((item) => item.id);
   return {
     kept: [...newestFirst].reverse(),

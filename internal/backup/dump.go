@@ -27,17 +27,18 @@ const (
 // that follows; the tee then drops its copy and the upload continues. When
 // the piped check fails, the check reads the stored object back instead.
 func (s *Service) dump(ctx context.Context, t target, tools Tools, snapshot string, excluded []string, key string) (ObjectEntry, string, error) {
-	conn, env, err := libpqTarget(s.opts.DatabaseURL, "")
+	conn, err := newLibpqConn(s.opts.DatabaseURL)
 	if err != nil {
 		return ObjectEntry{}, "", err
 	}
+	defer conn.Close()
 	args := []string{"--format=custom", "--compress=zstd:3", "--no-password", "--snapshot=" + snapshot}
 	for _, table := range excluded {
 		args = append(args, "--exclude-table-data-and-children=public."+table)
 	}
-	args = append(args, "--dbname="+conn)
+	args = append(args, "--dbname="+conn.Conn)
 	cmd := exec.CommandContext(ctx, tools.PgDump, args...) //nolint:gosec // G204: the discovered pg_dump with arguments built here, no shell
-	cmd.Env = append(os.Environ(), env...)
+	cmd.Env = append(os.Environ(), conn.Env...)
 	stderr := &limitedBuffer{limit: stderrLimit}
 	cmd.Stderr = stderr
 	stdout, err := cmd.StdoutPipe()

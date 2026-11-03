@@ -1,4 +1,5 @@
 import type { AdminBackupUpload, UploadRejectionReason } from "@/api/v2/adminBackupUpload";
+import { StaleApiRequestContextError } from "@/api/client";
 import { V2ProblemError } from "@/api/v2/request";
 
 import { backupDateTime, knownSiloVersion, sourceServerName } from "./backupPresentation";
@@ -83,6 +84,8 @@ export type UploadFailure =
   | { kind: "busy" }
   | { kind: "part_failed"; part: number; partCount: number }
   | { kind: "rejected"; reason: UploadRejectionReason; message: string }
+  | { kind: "signed_out"; part: number; partCount: number }
+  | { kind: "check_failed"; detail: string }
   | { kind: "error"; detail: string };
 
 export type UploadStage = "create" | "part" | "complete";
@@ -93,6 +96,18 @@ export function failureOfError(
   stage: UploadStage,
   { sizeBytes, limitBytes }: { sizeBytes: number; limitBytes: number },
 ): UploadFailure {
+  if (stage === "complete" && retryable(error) && !(error instanceof StaleApiRequestContextError)) {
+    // The file arrived; checking it again needs nothing sent.
+    if (
+      !(error instanceof V2ProblemError) ||
+      error.status !== 409 ||
+      error.problemType !== "conflict"
+    )
+      return {
+        kind: "check_failed",
+        detail: error instanceof V2ProblemError ? error.message : "The server didn't answer.",
+      };
+  }
   if (error instanceof V2ProblemError) {
     if (error.status === 413 && stage === "create")
       return { kind: "too_large", sizeBytes, limitBytes };
@@ -161,6 +176,18 @@ export function failureCopy(failure: UploadFailure): FailureCopy {
       };
     case "rejected":
       return { ...REJECTION_COPY[failure.reason], resumable: false };
+    case "signed_out":
+      return {
+        title: "You were signed out",
+        body: `Sign in again as an administrator in this browser, then continue: the ${failure.part} of ${failure.partCount} parts already sent are kept.`,
+        resumable: true,
+      };
+    case "check_failed":
+      return {
+        title: "The file arrived, but checking it stopped",
+        body: `${failure.detail} Check it again; nothing needs to be sent again.`,
+        resumable: true,
+      };
     case "error":
       return { title: "The upload stopped", body: failure.detail, resumable: false };
   }
@@ -195,6 +222,9 @@ export class PartFailedError extends Error {
  * still being received.
  */
 export function retryable(error: unknown): boolean {
+  // The session the upload started with is gone (signed out, another
+  // profile): every retry would fail the same way.
+  if (error instanceof StaleApiRequestContextError) return false;
   if (!(error instanceof V2ProblemError)) return true;
   return error.status === 408 || error.status === 409 || error.status >= 500;
 }
