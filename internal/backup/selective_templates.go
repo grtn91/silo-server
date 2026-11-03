@@ -370,7 +370,7 @@ func (a *applier) writeTemplateCollection(ctx context.Context, tx pgx.Tx, id str
 	if images.BackdropURL != nil {
 		input.BackdropURL, input.BackdropThumbhash = *images.BackdropURL, *images.BackdropThumbhash
 	}
-	if _, err := catalog.CreateLibraryCollectionInTx(ctx, tx, input); err != nil {
+	if err := a.createCollection(ctx, tx, input, false, &item.Notes); err != nil {
 		return applied{}, err
 	}
 	if _, err := restoreGroups(ctx, tx, newID, asCollection, libMap); err != nil {

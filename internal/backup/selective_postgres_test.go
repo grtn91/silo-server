@@ -1018,6 +1018,57 @@ func TestManagedSectionPointedElsewhereIsRestoredDB(t *testing.T) {
 	}
 }
 
+// TestUnverifiedSectionCollectionHasNoScheduleDB: a section's carried
+// collection that a restore from a backup this server cannot verify creates
+// keeps its source but gets no sync schedule, as every collection the
+// restore creates (applier.createCollection), and the preview says so.
+func TestUnverifiedSectionCollectionHasNoScheduleDB(t *testing.T) {
+	f := newSelectiveFixture(t)
+	ctx, pool := t.Context(), f.pool
+	wirePageTargets(f, new(bool), &[]string{})
+	s := seedPages(t, f)
+	const source, daily = "https://mdblist.com/lists/someone/list", "30 4 * * *"
+	dbExec(t, pool, `UPDATE library_collections SET collection_type = 'mdblist', source_url = $2, sync_schedule = $3 WHERE id = $1`,
+		s.managedCollection, source, daily)
+	backup, err := backupUnderLock(t, f.svc, KindManual)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The section now shows another collection, so the restore creates
+	// the carried one again.
+	repo := catalog.NewLibraryCollectionRepository(pool)
+	ordinary, err := repo.Create(ctx, catalog.CreateLibraryCollectionInput{LibraryID: s.library, Slug: "ordinary-" + s.suffix, Title: "Ordinary " + s.suffix})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dbExec(t, pool, `UPDATE page_sections SET config = jsonb_build_object('library_collection_id', $2::text) WHERE id = $1`, s.managed, ordinary.ID)
+	dbExec(t, pool, `DELETE FROM library_collections WHERE id = $1`, s.managedCollection)
+	f.unverify(t, backup.ID)
+	preview, err := f.svc.Preview(ctx, backup.ID, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := homeSectionItemID(s.managed)
+	if got := previewItem(t, preview, SectionHomeSections, id); !got.Selectable || !strings.Contains(got.Message, "A collection it creates gets no sync schedule") {
+		t.Fatalf("section of an unverified backup = %+v, want its collection's schedule withheld", got)
+	}
+	report := f.restoreRequest(t, RestoreRequest{BackupID: backup.ID, Digest: preview.Digest,
+		Selection: map[string][]string{SectionHomeSections: {id}}, AcceptUnauthenticated: true})
+	got := reportItem(t, report, SectionHomeSections, id)
+	if got.Outcome != OutcomeRestored || !slices.Contains(got.Notes, msgScheduleWithheld) {
+		t.Fatalf("restoring it = %+v", got)
+	}
+	var url string
+	var schedule *string
+	if err := pool.QueryRow(ctx, `SELECT c.source_url, c.sync_schedule FROM page_sections p
+		JOIN library_collections c ON c.id = p.config->>'library_collection_id' WHERE p.id = $1`, s.managed).Scan(&url, &schedule); err != nil {
+		t.Fatal(err)
+	}
+	if url != source || schedule != nil {
+		t.Fatalf("restored collection: source %q, schedule %v; want the source kept and no schedule", url, schedule)
+	}
+}
+
 // TestRestoredLibrarySectionsWaitForTheRestoreDB: a library the restore
 // recreates gets its default sections only after the restore wrote its saved
 // ones, and only where it wrote none. A default renamed before the backup

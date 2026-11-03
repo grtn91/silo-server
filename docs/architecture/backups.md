@@ -608,9 +608,11 @@ grouped by the admin page that edits each key: a key or prefix with its class.
   `unverified_backup`. Nor does it turn on work that sends library data to
   outside services or runs for hours: a new library is created with AI
   translation of metadata, trickplay previews, intro detection, chapter
-  thumbnails, and box sets off (`costlyLibraryOptions`), a new admin
-  collection without its sync schedule, and a template collection keeps
-  this server's source and sync schedule. The preview says what is left
+  thumbnails, and box sets off (`costlyLibraryOptions`); every collection
+  a restore creates (an admin collection, or one a section carries) keeps
+  its source but gets no sync schedule (`applier.createCollection`, which
+  every creation goes through); and a template collection keeps this
+  server's source and sync schedule. The preview says what is left
   off; for a verified backup it names the library options the restore
   turns on.
 
