@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path"
@@ -1347,4 +1348,74 @@ func TestFreshBackupComparesSameDB(t *testing.T) {
 	if compared != len(userDataTypes) {
 		t.Fatalf("compared %d data types, want %d", compared, len(userDataTypes))
 	}
+}
+
+// TestAccountsAndImportOnOneConnectionDB: an account restore of every data
+// type and a profile import run on a pool of one connection, the item's or
+// import's transaction holding it, with a fresh service; any pool use
+// inside either would hang until the deadline.
+func TestAccountsAndImportOnOneConnectionDB(t *testing.T) {
+	_, dsn := testDB(t)
+	cfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.MaxConns = 1
+	pool, err := pgxpool.NewWithConfig(t.Context(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	f := newSelectiveFixtureOn(t, pool, dsn)
+	s := seedUsers(t, f)
+	source, err := backupUnderLock(t, f.svc, KindManual)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.loseUsers(t, &s, source.ID)
+	targets := f.svc.targets
+	f.svc = New(f.svc.opts)
+	f.svc.SetRestoreTargets(targets)
+	preview, err := f.svc.Preview(t.Context(), source.ID, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	main := "pa-main-" + s.suffix
+	selection := []UserSelection{{Account: strconv.Itoa(s.alice), Target: TargetNew,
+		Profiles: []ProfileSelection{{Profile: main, Target: TargetNew, DataTypes: allTypes()}}}}
+	within := func(what string, fn func() error) {
+		t.Helper()
+		done := make(chan error, 1)
+		go func() { done <- fn() }()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("%s: %v", what, err)
+			}
+		case <-time.After(2 * time.Minute):
+			t.Fatalf("%s waited on the pool its own transaction holds", what)
+		}
+	}
+	within("an account restore", func() error {
+		report := f.restoreUsers(t, source.ID, preview.Digest, selection)
+		if got := reportItem(t, report, SectionUsers, strconv.Itoa(s.alice)); got.Outcome != OutcomeRestored {
+			return fmt.Errorf("alice = %+v", got)
+		}
+		return nil
+	})
+	transfer := NewProfileTransfer(pool, func(context.Context) (string, error) { return f.serverID, nil })
+	user := testAccount(t, pool, "onec-"+s.suffix, "h", nil, nil)
+	src, dst := "onec-src-"+s.suffix, "onec-dst-"+s.suffix
+	testProfile(t, pool, user, src, "Src", true, "")
+	testProfile(t, pool, user, dst, "Dst", false, "")
+	dbExec(t, pool, `INSERT INTO user_watch_progress (user_id, profile_id, media_item_id, position_seconds, duration_seconds, updated_at) VALUES ($1, $2, $3, 1, 10, now())`,
+		user, src, s.movies[0])
+	within("a profile import", func() error {
+		data, err := transfer.Export(t.Context(), ProfileImportScope{UserID: user, ProfileID: src})
+		if err != nil {
+			return err
+		}
+		_, err = transfer.Import(t.Context(), ProfileImportScope{UserID: user, ProfileID: dst}, data)
+		return err
+	})
 }

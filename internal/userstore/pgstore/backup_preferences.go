@@ -368,9 +368,23 @@ func seriesCheck(sum *userdata.Summary) func(string) error {
 	}
 }
 
+// maxImportedSettings bounds a document's settings: a profile's own,
+// per-client, per-library, and per-series values together.
+const maxImportedSettings = 20_000
+
 func (doc preferencesDocument) validateSettings(sum *userdata.Summary) error {
+	if len(doc.Settings) > maxImportedSettings {
+		return fmt.Errorf("more than %d settings", maxImportedSettings)
+	}
 	series := seriesCheck(sum)
+	seen := make(map[string]bool, len(doc.Settings))
 	for _, s := range doc.Settings {
+		// One value per identity: a repeat would only be planned again.
+		identity := settingKey(s.Key, s.Scope, s.ClientFamily, s.Library, s.Series)
+		if seen[identity] {
+			return fmt.Errorf("setting %q is listed twice for one scope", s.Key)
+		}
+		seen[identity] = true
 		// Keys and values are checked against this server's settings
 		// contract when imported, so a newer server's settings are left out
 		// rather than refusing the whole document.
@@ -393,8 +407,21 @@ func (doc preferencesDocument) validateSettings(sum *userdata.Summary) error {
 
 func (doc preferencesDocument) validateTracks(sum *userdata.Summary) error {
 	series := seriesCheck(sum)
+	// Each list holds one entry per series, library, or collection, as
+	// the store keeps one row per each; a repeat is refused.
+	once := func(what string) func(key string) error {
+		seen := map[string]bool{}
+		return func(key string) error {
+			if seen[key] {
+				return fmt.Errorf("a %s preference is listed twice", what)
+			}
+			seen[key] = true
+			return nil
+		}
+	}
+	audio, subtitles, libraries, seriesPlayback, sorts := once("audio"), once("subtitle"), once("library playback"), once("series playback"), once("collection sort")
 	for _, a := range doc.Audio {
-		if err := series(a.Series); err != nil {
+		if err := errors.Join(series(a.Series), audio(a.Series)); err != nil {
 			return err
 		}
 		if len(a.Signature) > 0 && !json.Valid(a.Signature) {
@@ -402,7 +429,7 @@ func (doc preferencesDocument) validateTracks(sum *userdata.Summary) error {
 		}
 	}
 	for _, s := range doc.Subtitles {
-		if err := series(s.Series); err != nil {
+		if err := errors.Join(series(s.Series), subtitles(s.Series)); err != nil {
 			return err
 		}
 		if (len(s.Signature) > 0 && !json.Valid(s.Signature)) || !userdata.ValidText(s.ExternalPath, 4096) {
@@ -413,13 +440,19 @@ func (doc preferencesDocument) validateTracks(sum *userdata.Summary) error {
 		if l.Library <= 0 {
 			return errors.New("a library playback preference names no library")
 		}
+		if err := libraries(strconv.Itoa(l.Library)); err != nil {
+			return err
+		}
 	}
 	for _, s := range doc.SeriesPlayback {
-		if err := series(s.Series); err != nil {
+		if err := errors.Join(series(s.Series), seriesPlayback(s.Series)); err != nil {
 			return err
 		}
 	}
 	for _, c := range doc.CollectionSort {
+		if err := sorts(c.Kind + "\x00" + c.Collection); err != nil {
+			return err
+		}
 		if (c.Kind != scopeLibrary && c.Kind != "watchlist" && c.Kind != "favorites") || (c.Order != "" && c.Order != "asc" && c.Order != "desc") ||
 			!userdata.ValidText(c.Field, 64) || !userdata.ValidText(c.Collection, 128) {
 			return errors.New("a collection sort preference is not valid")
@@ -483,7 +516,11 @@ func (PreferencesBackupData) Import(ctx context.Context, tx pgx.Tx, target userd
 		}
 	}
 	navigationDropped, rejected := 0, 0
-	stored := storedSetting(tx, target.UserID)
+	// The profile's stored values are read once, not once per entry.
+	stored, err := storedSettings(ctx, tx, target.Owner)
+	if err != nil {
+		return res, err
+	}
 	for _, s := range doc.Settings {
 		plan, err := planSetting(ctx, tx, target, s, stored)
 		if err != nil {
@@ -623,17 +660,6 @@ func sameJSON(a, b []byte) bool {
 
 // settingLookup reads the value stored here for a setting identity.
 type settingLookup func(ctx context.Context, id userstore.SettingIdentity) (json.RawMessage, bool, error)
-
-// storedSetting reads one value at a time, in the import's transaction.
-func storedSetting(tx pgx.Tx, userID int) settingLookup {
-	return func(ctx context.Context, id userstore.SettingIdentity) (json.RawMessage, bool, error) {
-		current, err := getSettingValue(ctx, tx, userID, id)
-		if err != nil || current == nil {
-			return nil, false, err
-		}
-		return current.Value, true, nil
-	}
-}
 
 // settingKey names a profile's setting value by its identity.
 func settingKey(key, scope, client string, library int, series string) string {

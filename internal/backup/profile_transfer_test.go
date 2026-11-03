@@ -1,11 +1,14 @@
 package backup
 
 import (
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Silo-Server/silo-server/internal/backup/jsonsize"
+	"github.com/Silo-Server/silo-server/internal/backup/userdata"
 )
 
 // TestParseProfileExportRefusesHostileDocuments: a profile import reads an
@@ -117,5 +120,53 @@ func TestRestoredCredentialsAreLockedOutsideTheServersCost(t *testing.T) {
 		doc.Profiles[2].PINHash != "" || doc.lockedCredentials != 2 {
 		t.Fatalf("locked %d: password %q, pins %q %q %q", doc.lockedCredentials, doc.Account.PasswordHash,
 			doc.Profiles[0].PINHash, doc.Profiles[1].PINHash, doc.Profiles[2].PINHash)
+	}
+}
+
+// TestEveryImporterRefusesDuplicates: each data type's document holds one
+// entry per identity, as its export writes it. A document of one entry is
+// accepted; 100,000 copies of it are refused when the document is checked,
+// quickly, before any import plans or writes them, except plays, whose
+// repeats are the same play and collapse to one.
+func TestEveryImporterRefusesDuplicates(t *testing.T) {
+	const at = `"2026-01-01T00:00:00Z"`
+	type doc struct{ head, entry, tail string }
+	docs := map[string]doc{
+		userdata.WatchHistory + " progress": {`{"progress":[`, `{"item":"m1","position_seconds":1,"duration_seconds":2,"completed":false,"updated_at":` + at + `}`, `],"history":[],"hidden":[]}`},
+		userdata.WatchHistory + " plays":    {`{"progress":[],"history":[`, `{"item":"m1","watched_at":` + at + `,"completed":true,"source":"playback"}`, `],"hidden":[]}`},
+		userdata.WatchHistory + " hidden":   {`{"progress":[],"history":[],"hidden":[`, `{"item":"m1","hidden_before":` + at + `,"updated_at":` + at + `,"removed_before":` + at + `}`, `]}`},
+		userdata.Ratings:                    {`{"ratings":[`, `{"item":"m1","rating":4,"rated_at":` + at + `}`, `]}`},
+		userdata.Favorites + " favorites":   {`{"favorites":[`, `{"item":"m1","at":` + at + `}`, `],"watchlist":[],"titles":[]}`},
+		userdata.Favorites + " watchlist":   {`{"favorites":[],"watchlist":[`, `{"item":"m1","at":` + at + `}`, `],"titles":[]}`},
+		userdata.Dismissals:                 {`{"home":[],"not_interested":[`, `{"item":"m1","at":` + at + `}`, `],"dropped_series":[]}`},
+		userdata.Notifications:              {`{"muted_series":[`, `{"series":"s1","muted_at":` + at + `}`, `]}`},
+		userdata.Collections:                {`{"collections":[`, `{"id":"c1","name":"A","type":"manual","watch_filter":"all","media_filter":"all","items":[],"shared_with":[]}`, `]}`},
+		userdata.Preferences:                {`{"settings":[`, `{"key":"playback.quality","scope":"profile","value":"\"auto\""}`, `]}`},
+	}
+	for name, d := range docs {
+		t.Run(name, func(t *testing.T) {
+			id, part, _ := strings.Cut(name, " ")
+			dt, ok := userDataType(id)
+			if !ok {
+				t.Fatalf("no data type %s", id)
+			}
+			if _, err := dt.Validate(json.RawMessage(d.head + d.entry + d.tail)); err != nil {
+				t.Fatalf("one entry: %v", err)
+			}
+			started := time.Now()
+			sum, err := dt.Validate(json.RawMessage(d.head + strings.Repeat(d.entry+",", 99_999) + d.entry + d.tail))
+			if elapsed := time.Since(started); elapsed > 5*time.Second {
+				t.Fatalf("checking took %v", elapsed)
+			}
+			if part == "plays" {
+				if err != nil || sum.Count != 1 {
+					t.Fatalf("100,000 copies of one play = %d (%v), want them collapsed to one", sum.Count, err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("100,000 copies of one entry were accepted")
+			}
+		})
 	}
 }

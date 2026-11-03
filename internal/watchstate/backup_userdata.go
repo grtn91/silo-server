@@ -3,6 +3,7 @@ package watchstate
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"slices"
 	"sort"
@@ -239,16 +240,30 @@ func decodeWatchHistory(data json.RawMessage) (watchHistoryDocument, userdata.Su
 			return doc, sum, fmt.Errorf("progress of %q is not valid", e.Item)
 		}
 	}
+	// A play at the same second of the same item is the same play (the
+	// witness index keys plays this way): repeats collapse here, before
+	// anything plans or writes them.
+	plays := map[string]bool{}
+	history := doc.History[:0]
 	for _, e := range doc.History {
-		if err := add(e.Item); err != nil {
-			return doc, sum, err
-		}
 		if e.WatchedAt.IsZero() || !validWatchSource(e.Source) || (e.Duration != nil && *e.Duration < 0) {
 			return doc, sum, fmt.Errorf("a play of %q is not valid", e.Item)
 		}
-	}
-	for _, e := range doc.Hidden {
+		key := e.Item + "\x00" + e.WatchedAt.UTC().Truncate(time.Second).Format(time.RFC3339)
+		if plays[key] {
+			sum.Count--
+			continue
+		}
+		plays[key] = true
 		if err := add(e.Item); err != nil {
+			return doc, sum, err
+		}
+		history = append(history, e)
+	}
+	doc.History = history
+	hidden := userdata.Distinct{}
+	for _, e := range doc.Hidden {
+		if err := errors.Join(add(e.Item), hidden.Add("history hides", e.Item)); err != nil {
 			return doc, sum, err
 		}
 		if !e.HiddenBefore.Valid {

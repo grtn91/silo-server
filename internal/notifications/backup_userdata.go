@@ -93,7 +93,11 @@ func decodeNotifications(data json.RawMessage) (notificationsDocument, userdata.
 	if err := userdata.CheckEntries("muted series", len(doc.Muted)); err != nil {
 		return doc, sum, err
 	}
+	muted := userdata.Distinct{}
 	for _, m := range doc.Muted {
+		if err := muted.Add("muted series", m.Series); err != nil {
+			return doc, sum, err
+		}
 		if !userdata.ValidContentID(m.Series) {
 			return doc, sum, fmt.Errorf("muted series %q is not valid", m.Series)
 		}
