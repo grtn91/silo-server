@@ -69,19 +69,16 @@ func (l PGLoader) Load(ctx context.Context, dbURL, dumpPath string) error {
 // a superuser loads a dump into a database where a superuser created the
 // extensions only without them; nothing reads them.
 func (l PGLoader) restoreList(ctx context.Context, dumpPath string) (string, error) {
-	cmd := exec.CommandContext(ctx, l.Tools.PgRestore, "--list", dumpPath) //nolint:gosec // G204: the discovered pg_restore with arguments built here, no shell
-	stderr := &limitedBuffer{limit: stderrLimit}
-	cmd.Stderr = stderr
-	toc, err := cmd.Output()
+	toc, err := l.toc(ctx, dumpPath)
 	if err != nil {
-		return "", fmt.Errorf("pg_restore --list failed: %w: %s", err, strings.TrimSpace(stderr.String()))
+		return "", err
 	}
 	f, err := os.CreateTemp("", "silo-restore-list-*")
 	if err != nil {
 		return "", err
 	}
 	var kept strings.Builder
-	for line := range strings.Lines(string(toc)) {
+	for line := range strings.Lines(toc) {
 		if !strings.Contains(line, " COMMENT - EXTENSION ") {
 			kept.WriteString(line)
 		}
@@ -95,6 +92,88 @@ func (l PGLoader) restoreList(ctx context.Context, dumpPath string) (string, err
 		return "", err
 	}
 	return f.Name(), nil
+}
+
+// toc is the dump's table of contents (pg_restore --list).
+func (l PGLoader) toc(ctx context.Context, dumpPath string) (string, error) {
+	cmd := exec.CommandContext(ctx, l.Tools.PgRestore, "--list", dumpPath) //nolint:gosec // G204: the discovered pg_restore with arguments built here, no shell
+	stderr := &limitedBuffer{limit: stderrLimit}
+	cmd.Stderr = stderr
+	out, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("pg_restore --list failed: %w: %s", err, strings.TrimSpace(stderr.String()))
+	}
+	return string(out), nil
+}
+
+// Extensions lists the extensions the dump creates: its "EXTENSION - <name>"
+// entries.
+func (l PGLoader) Extensions(ctx context.Context, dumpPath string) ([]string, error) {
+	toc, err := l.toc(ctx, dumpPath)
+	if err != nil {
+		return nil, err
+	}
+	var names []string
+	for line := range strings.Lines(toc) {
+		if _, rest, ok := strings.Cut(line, " EXTENSION - "); ok && !strings.HasPrefix(strings.TrimSpace(line), ";") {
+			if fields := strings.Fields(rest); len(fields) > 0 {
+				names = append(names, fields[0])
+			}
+		}
+	}
+	return names, nil
+}
+
+// ErrExtensionNeedsSuperuser refuses a swap whose role cannot create an
+// extension the backup needs in the new database.
+var ErrExtensionNeedsSuperuser = errors.New("the database role cannot create an extension the backup needs")
+
+func (c *PGControl) CheckExtensions(ctx context.Context, names []string) error {
+	if len(names) == 0 {
+		return nil
+	}
+	var super bool
+	if err := c.Conn.QueryRow(ctx, `SELECT rolsuper FROM pg_roles WHERE rolname = current_user`).Scan(&super); err != nil {
+		return err
+	}
+	rows, err := c.Conn.Query(ctx, `
+		SELECT n.name, a.name IS NOT NULL, coalesce(v.trusted, false)
+		FROM unnest($1::text[]) AS n(name)
+		LEFT JOIN pg_available_extensions a ON a.name = n.name
+		LEFT JOIN pg_available_extension_versions v ON v.name = a.name AND v.version = a.default_version
+		ORDER BY n.name`, names)
+	if err != nil {
+		return err
+	}
+	type extension struct {
+		name             string
+		available, trust bool
+	}
+	found, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (extension, error) {
+		var e extension
+		return e, row.Scan(&e.name, &e.available, &e.trust)
+	})
+	if err != nil {
+		return err
+	}
+	var missing, untrusted []string
+	for _, e := range found {
+		switch {
+		case !e.available:
+			missing = append(missing, e.name)
+		case !e.trust && !super:
+			untrusted = append(untrusted, e.name)
+		}
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("the backup needs the PostgreSQL extensions %s, which this PostgreSQL server does not have; install them first", strings.Join(missing, ", "))
+	}
+	if len(untrusted) > 0 {
+		return fmt.Errorf("%w: the restored database is new, and only a superuser can create %s in it. "+
+			"Run the restore with a DATABASE_URL role that is a superuser, or use separate mode (--into) into a database where a superuser created them",
+			ErrExtensionNeedsSuperuser, strings.Join(untrusted, ", "))
+	}
+	return nil
 }
 
 func (l PGLoader) Superuser(ctx context.Context, dbURL string) (bool, error) {
