@@ -45,6 +45,14 @@ var interruptedWork = []struct{ table, sql string }{
 	// server has, if any (InterruptWork).
 	{"storage_transition_checkpoints", `DELETE FROM storage_transition_checkpoints WHERE $1 <> ''`},
 	{"storage_transition_cursors", `DELETE FROM storage_transition_cursors WHERE $1 <> ''`},
+	// Stores kept outside Postgres whose bookkeeping is in it. The search
+	// engine's index holds the live catalog, not the restored one, and its
+	// change events are not in the dump: without its state the indexer
+	// rebuilds the index from the restored catalog when Silo starts.
+	{"catalog_search_index_state", `DELETE FROM catalog_search_index_state WHERE $1 <> ''`},
+	// Recommendations are rebuilt from the restored history and ratings,
+	// with the live server's embedding settings.
+	{"user_taste_profiles", `UPDATE user_taste_profiles SET stale_at = now() WHERE stale_at IS NULL AND $1 <> ''`},
 }
 
 // InterruptWork ends, in the restored database dbURL, the work interrupted
@@ -115,7 +123,8 @@ func interruptWork(ctx context.Context, loader DatabaseLoader, dbURL, liveURL st
 		return fmt.Errorf("ending the backup's unfinished work: %w", err)
 	}
 	if len(changed) > 0 {
-		_, _ = fmt.Fprintf(out, "Ended the work that was queued or running when the backup was taken (%s): none of it runs by itself after the restore.\n",
+		_, _ = fmt.Fprintf(out, "Ended the work that was queued or running when the backup was taken, and marked what is rebuilt from the restored data (%s): "+
+			"none of it runs by itself after the restore, and the search index and recommendations are rebuilt when Silo starts.\n",
 			strings.Join(changed, ", "))
 	}
 	return nil

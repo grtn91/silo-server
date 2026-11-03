@@ -974,6 +974,15 @@ canceled since the backup stays canceled and a staged target is never
 revived. Leases and claims in other queues (match queues, enrichment and
 trickplay state) are local work a server reclaims when they expire.
 
+Stores kept outside Postgres whose bookkeeping is in it are rebuilt from the
+restored data: the search index state is deleted, so the indexer rebuilds
+the search engine's index from the restored catalog when Silo starts (its
+change events are not in the dump), and every taste profile is marked
+stale, so recommendations are rebuilt with the live server's embedding
+settings. Files the catalog points at (artwork, trickplay, chapter images)
+are restored with it. A selective restore needs neither: catalog writes
+queue search index events through triggers, as every other write does.
+
 ### Accounts roll back
 
 A full restore is a rollback of the accounts, by maintainer decision: every

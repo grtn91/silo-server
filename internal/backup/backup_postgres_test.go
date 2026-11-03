@@ -753,6 +753,11 @@ func checkInterruptedWork(t *testing.T, loader PGLoader, pool *pgxpool.Pool, dsn
 	if _, err := pool.Exec(ctx, `DELETE FROM server_settings WHERE key = $1`, config.StorageTransitionTargetKey); err != nil {
 		t.Fatal(err)
 	}
+	// The search engine's index as the backup knew it.
+	if _, err := restored.Exec(ctx, `INSERT INTO catalog_search_index_state (provider, active_index_uid, schema_version, updated_at)
+		VALUES ('meilisearch', 'silo_catalog_then', 1, now()) ON CONFLICT (provider) DO UPDATE SET active_index_uid = EXCLUDED.active_index_uid`); err != nil {
+		t.Fatal(err)
+	}
 	changed, err := loader.InterruptWork(ctx, into, dsn)
 	if err != nil {
 		t.Fatal(err)
@@ -764,9 +769,12 @@ func checkInterruptedWork(t *testing.T, loader PGLoader, pool *pgxpool.Pool, dsn
 		}
 		return s
 	}
-	var staged int
+	var staged, indexes int
 	if err := restored.QueryRow(ctx, `SELECT count(*) FROM server_settings WHERE key = $1`, config.StorageTransitionTargetKey).Scan(&staged); err != nil {
 		t.Fatal(err)
+	}
+	if err := restored.QueryRow(ctx, `SELECT count(*) FROM catalog_search_index_state`).Scan(&indexes); err != nil || indexes != 0 {
+		t.Fatalf("search index state %d (%v), want none so the index is rebuilt", indexes, err)
 	}
 	if status(queued) != adminjob.StatusCancelled || status(done) != adminjob.StatusCompleted || staged != 0 || len(changed) == 0 {
 		t.Fatalf("queued job %s, finished job %s, staged targets %d, changed %v; want it ended, history kept, no target",
