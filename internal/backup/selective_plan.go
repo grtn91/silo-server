@@ -496,9 +496,7 @@ func (p *planner) planCollection(ctx context.Context, c CollectionEntry, libMap 
 		return plan, nil
 	case match == "":
 		plan.item.Status, plan.item.Selectable = ItemNotOnThisServer, true
-		if c.SyncSchedule != nil && *c.SyncSchedule != "" && !p.authenticated {
-			plan.item.Message = "Restored without its sync schedule: a backup this server cannot verify does not make a collection fetch from outside services on a schedule."
-		}
+		plan.item.Message = p.scheduleNote("It is restored with", c.SyncSchedule)
 		for _, id := range c.Items {
 			if known[id] {
 				plan.missing = append(plan.missing, id)
