@@ -455,8 +455,9 @@ devices are refused); canonical relative paths with no empty, `.`, or `..`
 segment, backslash, or NUL; no duplicate paths, sections, or item ids;
 `restore-set.json` first; every other file listed in the index with its size
 and digest, and every listed file present; blobs only under their section's
-prefixes and only keys the section references, or variants stored in a
-referenced artwork original's directory; documents that decode strictly
+prefixes and only keys the section references, or variants stored beside a
+referenced artwork original (in its directory and of its revision, or both
+without one; at most 16 per original); documents that decode strictly
 (unknown fields and trailing data refused) and match the index counts; and
 limits on entries (200,000), document size (64 MiB for the collections and
 account documents, 32 MiB for the index, 8 MiB for `libraries.json` and
@@ -781,10 +782,15 @@ the type its extension serves, and the kind's processing
 WebP by its bytes, and a source `imageutil.CheckImage` accepts. A blob that
 fails fails its item with `ErrRestoredFileRefused`; other items go on.
 
-The job extracts only the blobs its selected items write (`selectedBlobs`),
-sizing them from the preview's read of the same restore set, and refuses to
-start (`ErrNotEnoughTempSpace`) unless the temporary directory has their size
-plus 1 GB free. The rest of the archive is read, checked, and discarded.
+The job extracts only the blobs its selected items write (`selectedBlobs`):
+the exact keys the apply step reads (a library's poster, a branding asset,
+an item artwork's family, a collection's uploaded poster and backdrop with
+their families), never a prefix. It sizes them from the preview's read of the
+same restore set, and refuses to start (`ErrNotEnoughTempSpace`) for more
+than 50,000 files, or unless the temporary directory has their size plus
+1 GB free and a free inode for each plus 10,000. The rest of the archive is
+read, checked, and discarded. Reading the set and extracting stop when the
+job is canceled; once the first item runs, a cancel stops between items.
 
 Before its first item, a restore records each store's identity
 (`blobstore.RecordIdentity`), which a store opened with settings would do on

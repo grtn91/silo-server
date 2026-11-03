@@ -230,12 +230,14 @@ type restoreSetParser struct {
 	// with the section that references them.
 	files map[string]FileDigest
 	blobs map[string]sectionSpec
-	// ladderDirs are the image directories of referenced artwork originals;
-	// the variants stored beside an original may ride along with it.
-	ladderDirs map[string]sectionSpec
-	opts       ReadOptions
-	seen       map[string]bool
-	documents  map[string][]byte
+	// originals are the referenced artwork originals by directory; the
+	// variants stored beside one (ladderSibling) may ride along with it, at
+	// most maxLadderVariants of them, counted in variants.
+	originals map[string][]string
+	variants  map[string]int
+	opts      ReadOptions
+	seen      map[string]bool
+	documents map[string][]byte
 	// decoded is what the documents decoded so far take (jsonsize).
 	decoded int64
 	// logical sums the entries' sizes as their headers state them.
@@ -375,7 +377,8 @@ func (p *restoreSetParser) readIndex(data []byte) error {
 	p.rs.Index = index
 	p.files = map[string]FileDigest{}
 	p.blobs = map[string]sectionSpec{}
-	p.ladderDirs = map[string]sectionSpec{}
+	p.originals = map[string][]string{}
+	p.variants = map[string]int{}
 	sectionsSeen := map[string]bool{}
 	// documents sums the listed documents' sizes.
 	var documents int64
@@ -427,7 +430,7 @@ func (p *restoreSetParser) readIndex(data []byte) error {
 			p.blobs[key] = spec
 			if strings.HasPrefix(path.Base(key), artworkkey.OriginalVariant+".") {
 				if dir := artworkkey.Directory(key); dir != "" {
-					p.ladderDirs[dir] = spec
+					p.originals[dir] = append(p.originals[dir], key)
 				}
 			}
 		}
@@ -435,13 +438,29 @@ func (p *restoreSetParser) readIndex(data []byte) error {
 	return nil
 }
 
-// blob accepts a referenced key, or a variant stored in a referenced
-// original's directory, under its section's prefixes.
+// variant finds the referenced original key is a variant of
+// (ladderSibling), and counts it against maxLadderVariants.
+func (p *restoreSetParser) variant(key string) (sectionSpec, bool, error) {
+	for _, original := range p.originals[artworkkey.Directory(key)] {
+		if !ladderSibling(original, key) {
+			continue
+		}
+		if p.variants[original]++; p.variants[original] > maxLadderVariants {
+			return sectionSpec{}, false, fmt.Errorf("blob %q: more than %d variants of %q", key, maxLadderVariants, original)
+		}
+		return p.blobs[original], true, nil
+	}
+	return sectionSpec{}, false, nil
+}
+
+// blob accepts a referenced key, or a variant stored beside a referenced
+// original (ladderSibling), under its section's prefixes.
 func (p *restoreSetParser) blob(key string, h *tar.Header, tr io.Reader) error {
 	spec, ok := p.blobs[key]
 	if !ok {
-		if dir := artworkkey.Directory(key); dir != "" && path.Dir(key)+"/" == dir {
-			spec, ok = p.ladderDirs[dir]
+		var err error
+		if spec, ok, err = p.variant(key); err != nil {
+			return err
 		}
 	}
 	if !ok {
@@ -639,7 +658,7 @@ func (rs *RestoreSet) blobFamily(key string) []string {
 		return out
 	}
 	for _, other := range rs.lookup().blobDirs[dir] {
-		if other != key {
+		if ladderSibling(key, other) {
 			out = append(out, other)
 		}
 	}

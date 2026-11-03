@@ -212,6 +212,35 @@ func TestRestoreExtractsOnlyTheSelectedItemsFiles(t *testing.T) {
 	}
 }
 
+// TestRestoreExtractsOnlyReferencedFiles: a selected collection extracts
+// its poster and the variants stored beside it, nothing else under its
+// directory; the reader refuses an original with more variants than a
+// ladder has, so a set cannot pad one with filler.
+func TestRestoreExtractsOnlyReferencedFiles(t *testing.T) {
+	const original = "collection-images/c1/poster/original.r1.jpg"
+	rs := &RestoreSet{blobs: map[string]string{}}
+	for _, key := range []string{original, "collection-images/c1/poster/w300.r1.jpg", "collection-images/c1/poster/w500.r1.jpg",
+		"collection-images/c1/poster/w300.r0.jpg", "collection-images/c1/filler/0.jpg", "collection-images/c1/backdrop/original.r1.jpg"} {
+		rs.blobs[key] = ""
+	}
+	rs.Collections.Collections = []CollectionEntry{{ID: "c1", Poster: original}}
+	got := slices.Sorted(maps.Keys(selectedBlobs(rs, map[string][]string{SectionCollections: {collectionItemID("c1")}})))
+	want := []string{original, "collection-images/c1/poster/w300.r1.jpg", "collection-images/c1/poster/w500.r1.jpg"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("selecting the collection extracts %v, want %v", got, want)
+	}
+
+	index, entries := testRestoreSet()
+	for i := range maxLadderVariants + 1 {
+		key := fmt.Sprintf("collection-images/c1/poster/w%d.abcd.jpg", 1000+i)
+		entries = append(entries, testEntry{name: "blobs/" + key, data: []byte("x")})
+	}
+	if _, err := ReadRestoreSet(context.Background(), bytes.NewReader(buildTar(t, index, entries)), ReadOptions{}); err == nil ||
+		!strings.Contains(err.Error(), "variants of") {
+		t.Fatalf("an original with %d variants: %v, want it refused", maxLadderVariants+1, err)
+	}
+}
+
 // TestSelectedBlobsIsLinear: choosing the files of every collection of a set
 // at the archive's entry limit classifies each file once. A scan per
 // selected collection would take billions of prefix checks here and run
@@ -222,17 +251,19 @@ func TestSelectedBlobsIsLinear(t *testing.T) {
 	selection := make([]string, 0, collections)
 	for i := range collections {
 		id := strconv.Itoa(i)
-		rs.Collections.Collections = append(rs.Collections.Collections, CollectionEntry{ID: id})
+		poster := collectionImagePrefix + id + "/poster/original.r1.jpg"
+		rs.Collections.Collections = append(rs.Collections.Collections, CollectionEntry{ID: id, Poster: poster})
 		selection = append(selection, collectionItemID(id))
-		for j := range perCollection {
-			rs.blobs[fmt.Sprintf("%s%s/poster/w%d.jpg", collectionImagePrefix, id, j)] = ""
+		rs.blobs[poster] = ""
+		for j := 1; j < perCollection; j++ {
+			rs.blobs[fmt.Sprintf("%s%s/poster/w%d.r1.jpg", collectionImagePrefix, id, j)] = ""
 		}
 	}
 	keep := selectedBlobs(rs, map[string][]string{SectionCollections: selection[:collections/2]})
 	if len(keep) != collections/2*perCollection {
 		t.Fatalf("kept %d files, want %d", len(keep), collections/2*perCollection)
 	}
-	if keep[collectionImagePrefix+strconv.Itoa(collections-1)+"/poster/w0.jpg"] {
+	if keep[collectionImagePrefix+strconv.Itoa(collections-1)+"/poster/w1.r1.jpg"] {
 		t.Fatal("kept a file of a collection not selected")
 	}
 }

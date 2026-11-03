@@ -14,10 +14,11 @@ import (
 )
 
 // selectedBlobs is every blob the selected items of rs can write, which is
-// all a restore extracts: an item artwork's family, a branding asset, a
-// library's poster, and the images of a collection or template collection,
-// which live under its own collection-images/<id>/ directory. Settings,
-// plugins, and page sections write no files.
+// all a restore extracts: exactly the keys the apply step reads. That is an
+// item artwork's family (blobFamily), a branding asset, a library's poster,
+// and a collection's or template collection's uploaded poster and backdrop
+// with their families, under its own collection-images/<id>/ directory
+// (copyCollectionArt). Settings, plugins, and page sections write no files.
 func selectedBlobs(rs *RestoreSet, sel map[string][]string) map[string]bool {
 	type pick struct{ section, id string }
 	chosen := map[pick]bool{}
@@ -45,19 +46,27 @@ func selectedBlobs(rs *RestoreSet, sel map[string][]string) map[string]bool {
 			keep[b.Blob] = true
 		}
 	}
-	images := func(id string) {
-		for _, key := range rs.lookup().collectionBlobs[id] {
-			keep[key] = true
+	images := func(id string, keys ...string) {
+		prefix := collectionImagePrefix + id + "/"
+		for _, key := range keys {
+			if !strings.HasPrefix(key, prefix) {
+				continue
+			}
+			for _, member := range rs.blobFamily(key) {
+				if strings.HasPrefix(member, prefix) {
+					keep[member] = true
+				}
+			}
 		}
 	}
 	for _, c := range rs.Collections.Collections {
 		if has(SectionCollections, collectionItemID(c.ID)) {
-			images(c.ID)
+			images(c.ID, c.Poster, c.Backdrop)
 		}
 	}
 	for _, t := range rs.Collections.TemplateCollections {
 		if has(SectionCollections, t.itemID()) {
-			images(t.ID)
+			images(t.ID, t.Poster, t.Backdrop)
 		}
 	}
 	return keep
@@ -70,15 +79,28 @@ const collectionImagePrefix = "collection-images/"
 // temporary directory it extracts them to.
 var ErrNotEnoughTempSpace = errors.New("not enough free space in the temporary directory to restore")
 
+// maxExtractedFiles bounds the files one restore extracts: each is a file
+// in the temporary directory while the restore runs.
+const maxExtractedFiles = 50_000
+
+// inodeMargin is the free inodes a restore leaves in the temporary
+// directory's file system.
+const inodeMargin = 10_000
+
 // checkTempSpace requires the bytes of the blobs keep, plus freeSpaceMargin,
-// free in dir, where the restore extracts them.
+// free in dir, where the restore extracts them, and a free inode for each
+// file plus inodeMargin; and at most maxExtractedFiles files.
 func checkTempSpace(dir string, rs *RestoreSet, keep map[string]bool) error {
+	if len(keep) == 0 {
+		return nil
+	}
+	if len(keep) > maxExtractedFiles {
+		return fmt.Errorf("%w: the selected items have %d files, more than the %d one restore extracts; select fewer items",
+			ErrNotEnoughTempSpace, len(keep), maxExtractedFiles)
+	}
 	var need uint64
 	for key := range keep {
 		need += uint64(rs.blobSizes[key]) //nolint:gosec // G115: a tar header size the read checked is not negative
-	}
-	if need == 0 {
-		return nil
 	}
 	need += freeSpaceMargin
 	var st unix.Statfs_t
@@ -88,6 +110,12 @@ func checkTempSpace(dir string, rs *RestoreSet, keep map[string]bool) error {
 	if free := blockBytes(st.Bavail, st.Bsize); free < need {
 		return fmt.Errorf("%w: %s free, %s needed (the selected items' files plus 1 GB); free space or select fewer items",
 			ErrNotEnoughTempSpace, formatBytes(free), formatBytes(need))
+	}
+	// A file system that reports no inodes (st.Files 0) allocates them as
+	// it needs them.
+	if inodes := uint64(len(keep)) + inodeMargin; st.Files > 0 && st.Ffree < inodes {
+		return fmt.Errorf("%w: %d files can be created there, %d needed (the selected items' files plus %d); free space or select fewer items",
+			ErrNotEnoughTempSpace, st.Ffree, inodes, inodeMargin)
 	}
 	return nil
 }
