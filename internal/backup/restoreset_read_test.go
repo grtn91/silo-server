@@ -274,6 +274,33 @@ func TestReaderFindsVariantsInConstantTime(t *testing.T) {
 	}
 }
 
+// TestArtworkFamiliesAreLinear: 20,000 keys in one directory, named like
+// originals and legacy variants, are grouped into families in one pass,
+// each kept to the ladder's size, so the index holds about one reference
+// per key.
+func TestArtworkFamiliesAreLinear(t *testing.T) {
+	rs := &RestoreSet{blobs: map[string]string{}}
+	const dir = "collection-images/c1/poster/"
+	rs.blobs[dir+"original.jpg"] = ""
+	for i := range 20_000 {
+		for _, name := range []string{"original.%d", "original.r%d.jpg", "w%d.jpg"} {
+			rs.blobs[dir+fmt.Sprintf(name, i)] = ""
+		}
+	}
+	started := time.Now()
+	x := rs.lookup()
+	if elapsed := time.Since(started); elapsed > 5*time.Second {
+		t.Fatalf("indexing took %v", elapsed)
+	}
+	members := 0
+	for _, keys := range x.variants {
+		members += len(keys)
+	}
+	if got := len(x.variants[dir+"original.jpg"]); got != maxLadderVariants || members > len(rs.blobs) {
+		t.Fatalf("legacy family of %d, %d members in all for %d keys; want it capped and about one per key", got, members, len(rs.blobs))
+	}
+}
+
 // TestSelectedBlobsIsLinear: choosing the files of every collection of a set
 // at the archive's entry limit classifies each file once. A scan per
 // selected collection would take billions of prefix checks here and run

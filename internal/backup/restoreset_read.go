@@ -442,17 +442,23 @@ func (p *restoreSetParser) readIndex(data []byte) error {
 				return fmt.Errorf("%s: blob %q is listed twice", restoreSetIndexName, key)
 			}
 			p.blobs[key] = spec
-			if strings.HasPrefix(path.Base(key), artworkkey.OriginalVariant+".") {
-				if dir := artworkkey.Directory(key); dir != "" {
-					p.originals[key] = true
-					if artworkkey.Revision(key) == "" {
-						p.legacyOriginals[dir] = append(p.legacyOriginals[dir], key)
-					}
-				}
-			}
+			p.noteOriginal(key)
 		}
 	}
 	return nil
+}
+
+// noteOriginal records a referenced key that is an artwork original, whose
+// variants may ride along with it.
+func (p *restoreSetParser) noteOriginal(key string) {
+	dir := artworkkey.Directory(key)
+	if !strings.HasPrefix(path.Base(key), artworkkey.OriginalVariant+".") || dir == "" {
+		return
+	}
+	p.originals[key] = true
+	if artworkkey.Revision(key) == "" && legacyOriginalName(key) {
+		p.legacyOriginals[dir] = append(p.legacyOriginals[dir], key)
+	}
 }
 
 // variant finds the referenced original key is a variant of
@@ -461,7 +467,10 @@ func (p *restoreSetParser) variant(key string) (sectionSpec, bool, error) {
 	// A variant of a revision names its original (artworkkey.OriginalOf);
 	// one without a revision may belong to any legacy original beside it,
 	// of which a directory holds one per image format.
-	candidates := p.legacyOriginals[artworkkey.Directory(key)]
+	var candidates []string
+	if legacyVariantName(key) {
+		candidates = p.legacyOriginals[artworkkey.Directory(key)]
+	}
 	if artworkkey.Revision(key) != "" {
 		candidates = nil
 		if original := artworkkey.OriginalOf(key); p.originals[original] {
@@ -582,7 +591,9 @@ func (p *restoreSetParser) finish() error {
 	sort.Strings(p.rs.MissingBlobs)
 	defer func() {
 		// What the set holds once read: its documents decoded (jsonsize's
-		// estimate) and its blob index, besides the bytes counted as read.
+		// estimate) and its lookup index, built here so its cost is known
+		// before the set is cached, besides the bytes counted as read.
+		p.rs.lookup()
 		p.rs.metadataBytes += p.decoded + int64(len(p.rs.blobs))*blobIndexCost
 	}()
 	for _, si := range p.index.Sections {

@@ -22,8 +22,8 @@ type restoreSetIndex struct {
 	// By backup id: a collection's or template collection's, a section's.
 	collectionIDs, templateIDs, sectionIDs map[string]int
 	// variants lists, by original, the blob keys stored beside it
-	// (ladderSibling), sorted; legacyKeys are, by directory, the blob keys
-	// without a revision.
+	// (ladderSibling), sorted; legacyKeys are, by directory, the legacy
+	// originals (legacyOriginalName).
 	variants   map[string][]string
 	legacyKeys map[string][]string
 	// The backup's entries that count as twins of one another, by what
@@ -103,31 +103,34 @@ func buildRestoreSetIndex(rs *RestoreSet) *restoreSetIndex {
 	for i, doc := range rs.Plugins {
 		first(x.plugins, doc.PluginID, i)
 	}
+	// A family is grouped in one pass: a revision's variants by the
+	// original they name, legacy ones (the writer's legacy names only) by
+	// the legacy originals of their directory, of which there is one per
+	// image format. Each family keeps at most maxLadderVariants members.
 	for key := range rs.blobs {
-		if artworkkey.Revision(key) == "" {
+		switch {
+		case artworkkey.Revision(key) != "":
+			if original := artworkkey.OriginalOf(key); original != key {
+				x.variants[original] = append(x.variants[original], key)
+			}
+		case legacyOriginalName(key):
 			dir := path.Dir(key) + "/"
 			x.legacyKeys[dir] = append(x.legacyKeys[dir], key)
-		} else if original := artworkkey.OriginalOf(key); original != key {
-			x.variants[original] = append(x.variants[original], key)
 		}
 	}
-	// A legacy original's variants are the directory's other keys without
-	// a revision; a directory holds one legacy original per image format,
-	// so each is found once here rather than on every family lookup.
-	for _, keys := range x.legacyKeys {
-		for _, original := range keys {
-			if !strings.HasPrefix(path.Base(original), artworkkey.OriginalVariant+".") {
-				continue
-			}
-			for _, key := range keys {
-				if ladderSibling(original, key) {
-					x.variants[original] = append(x.variants[original], key)
-				}
+	for key := range rs.blobs {
+		if artworkkey.Revision(key) != "" || !legacyVariantName(key) {
+			continue
+		}
+		for _, original := range x.legacyKeys[path.Dir(key)+"/"] {
+			if ladderSibling(original, key) {
+				x.variants[original] = append(x.variants[original], key)
 			}
 		}
 	}
-	for _, keys := range x.variants {
+	for original, keys := range x.variants {
 		slices.Sort(keys)
+		x.variants[original] = keys[:min(len(keys), maxLadderVariants)]
 	}
 	return x
 }

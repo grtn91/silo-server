@@ -166,6 +166,30 @@ func ladderSibling(original, key string) bool {
 	return artworkkey.Revision(key) == ""
 }
 
+// legacyImageExts are the image formats artwork was stored in before keys
+// carried a revision.
+var legacyImageExts = map[string]bool{".jpg": true, ".jpeg": true, ".png": true, ".webp": true}
+
+// legacyOriginalName reports whether key is a legacy artwork original as
+// the writer names one: original.<ext>, with no revision.
+func legacyOriginalName(key string) bool {
+	base := path.Base(key)
+	ext := path.Ext(base)
+	return legacyImageExts[ext] && base == artworkkey.OriginalVariant+ext
+}
+
+// legacyVariantName reports whether key is a legacy ladder variant as the
+// writer names one: w<width>.<ext>, with no revision.
+func legacyVariantName(key string) bool {
+	base := path.Base(key)
+	ext := path.Ext(base)
+	width := strings.TrimSuffix(strings.TrimPrefix(base, "w"), ext)
+	if !legacyImageExts[ext] || !strings.HasPrefix(base, "w") || width == "" {
+		return false
+	}
+	return strings.Trim(width, "0123456789") == ""
+}
+
 // maxLadderVariants bounds the variants a restore set may carry beside one
 // original: the ladder has at most five, and older ladders a few more.
 const maxLadderVariants = 16
