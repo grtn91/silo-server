@@ -105,6 +105,9 @@ type Options struct {
 	// UploadPartWriteTimeout shortens a part's storage write deadline.
 	UploadPartWriteTimeout time.Duration
 	Now                    func() time.Time
+	// Location is the zone nightly slots are on (nightlySlot): the daily
+	// trigger's, time.Local unless set.
+	Location *time.Location
 }
 
 // Service owns taking, listing, and deleting backups.
@@ -137,6 +140,9 @@ type pendingRun struct {
 
 // New builds a Service.
 func New(opts Options) *Service {
+	if opts.Location == nil {
+		opts.Location = time.Local
+	}
 	if opts.Now == nil {
 		opts.Now = time.Now
 	}
@@ -188,8 +194,12 @@ type RunResult struct {
 	Warnings []string      `json:"warnings,omitempty"`
 }
 
-// SkippedBusy is the reason a scheduled run records when the lock is held.
-const SkippedBusy = "skipped: another backup or restore is running"
+// SkippedBusy is the reason a scheduled run records when the lock is held,
+// and SkippedAlreadyDone when another server already backed up its slot.
+const (
+	SkippedBusy        = "skipped: another backup or restore is running"
+	SkippedAlreadyDone = "skipped: tonight's backup already ran on another server"
+)
 
 // StartManual takes the lock and starts the backup task on this process with
 // it, so "Back up now" either starts a backup or answers ErrBusy: there is no
@@ -244,24 +254,48 @@ func (s *Service) takePending() *pendingRun {
 func (s *Service) RunTask(ctx context.Context, progress func(float64, string)) (RunResult, error) {
 	run := s.takePending()
 	if run == nil {
-		kind := KindNightly
-		if taskmanager.StartedManually(ctx) {
-			kind = KindManual
+		var skipped RunResult
+		var err error
+		if run, skipped, err = s.lockScheduled(ctx); run == nil {
+			return skipped, err
 		}
-		held, err := s.opts.Locker.TryLock(ctx)
-		if errors.Is(err, ErrBusy) {
-			return RunResult{Skipped: SkippedBusy}, nil
-		}
-		if err != nil {
-			return RunResult{}, err
-		}
-		run = &pendingRun{held: held, kind: kind}
 	}
 	held, id, kind := run.held, run.id, run.kind
 	defer held.Release(context.WithoutCancel(ctx))
 	ctx, cancel := withLost(ctx, held)
 	defer cancel()
 	return s.Backup(ctx, held, kind, id, progress)
+}
+
+// lockScheduled takes the lock for a run the task manager started: a
+// manual one, or the nightly one, which skips when the lock is held or
+// another server already backed up its slot. A nil run is a skip or an
+// error.
+func (s *Service) lockScheduled(ctx context.Context) (*pendingRun, RunResult, error) {
+	kind := KindNightly
+	if taskmanager.StartedManually(ctx) {
+		kind = KindManual
+	}
+	held, err := s.opts.Locker.TryLock(ctx)
+	if errors.Is(err, ErrBusy) {
+		return nil, RunResult{Skipped: SkippedBusy}, nil
+	}
+	if err != nil {
+		return nil, RunResult{}, err
+	}
+	if kind == KindNightly {
+		// Every API server fires the trigger; under the lock, the first to
+		// finish the slot's backup leaves the others nothing to do.
+		done, err := s.slotBackedUp(ctx, nightlySlot(s.opts.Now(), s.backupTime(ctx), s.opts.Location))
+		if err != nil || done {
+			held.Release(context.WithoutCancel(ctx))
+			if err != nil {
+				return nil, RunResult{}, err
+			}
+			return nil, RunResult{Skipped: SkippedAlreadyDone}, nil
+		}
+	}
+	return &pendingRun{held: held, kind: kind}, RunResult{}, nil
 }
 
 // Backup takes one backup under held, the subsystem lock the caller holds; a
@@ -295,6 +329,9 @@ func (s *Service) backupWith(ctx context.Context, held Held, kind Kind, id strin
 		result, err = s.backup(ctx, prep, kind, started, report, pinned)
 	}
 	last := &LastRun{ID: id, Kind: kind, StartedAt: started, FinishedAt: s.opts.Now(), Status: string(result.Status)}
+	if kind == KindNightly {
+		last.NightlySlot = nightlySlot(started, s.backupTime(ctx), s.opts.Location)
+	}
 	if err != nil {
 		last.Status, last.Error = RunFailed, err.Error()
 	}

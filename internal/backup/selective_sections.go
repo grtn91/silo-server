@@ -372,6 +372,9 @@ func (p *planner) planHomeSections(ctx context.Context, libMap map[int]int, rest
 				plan.item.Message = strings.TrimSpace(plan.item.Message + " " + note)
 			}
 		}
+		if note := p.seasonalNote(e, p.s.opts.Now()); note != "" && plan.item.Selectable {
+			plan.item.Message = strings.TrimSpace(plan.item.Message + " " + note)
+		}
 		out = append(out, plan.item)
 	}
 	return out, nil
@@ -398,8 +401,16 @@ func (a *applier) writeHomeSection(ctx context.Context, tx pgx.Tx, id string) (a
 	if !plan.item.Selectable {
 		return leftOutFor(item, plan.item), nil
 	}
+	seasonal := e.SectionType == string(sections.SectionSeasonalThemed)
+	if seasonal && a.seasonal >= maxRestoredSeasonal {
+		return leftOut(item, ReasonOverRestoreBudget, fmt.Sprintf("This restore already wrote %d seasonal sections, as many as one restore may.", maxRestoredSeasonal)), nil
+	}
+	enabled, note := restoredSectionEnabled(*e, a.rs.unverified, a.s.opts.Now())
+	if note != "" {
+		item.Notes = append(item.Notes, note)
+	}
 	section := &sections.PageSection{Scope: e.Scope, LibraryID: plan.library, Position: e.Position, SectionType: sections.SectionType(e.SectionType),
-		Title: e.Title, Featured: e.Featured, ItemLimit: e.ItemLimit, Enabled: e.Enabled}
+		Title: e.Title, Featured: e.Featured, ItemLimit: e.ItemLimit, Enabled: enabled}
 	create := plan.local == nil
 	if create {
 		if section.ID, err = freeSectionID(ctx, tx, e.ID); err != nil {
@@ -439,6 +450,9 @@ func (a *applier) writeHomeSection(ctx context.Context, tx pgx.Tx, id string) (a
 		return applied{}, err
 	}
 	a.claim(claimSection, section.ID, id)
+	if seasonal {
+		a.seasonal++
+	}
 	item.Outcome = OutcomeRestored
 	if create {
 		item.Message = msgCreated

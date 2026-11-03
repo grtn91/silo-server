@@ -284,7 +284,18 @@ the deletion of a complete upload, and the restore job.
   "Delete" answer 409 when the lock is held.
 - A scheduled run that finds the lock held records
   "skipped: another backup or restore is running". Every API server fires the
-  same daily trigger; one backs up and the others record the skip.
+  same daily trigger; one backs up and the others record the skip. A
+  scheduled run that takes the lock after another server already backed up
+  its slot skips too ("skipped: tonight's backup already ran on another
+  server"): a successful nightly records its slot, the latest `backup.time`
+  at or before it started in its server's local time zone, in
+  `backup_status.last_nightly_slot`, and a scheduled run skips when the
+  recorded slot is later than its own previous slot (the same wall-clock
+  time a calendar day earlier, so each night across a daylight saving
+  change backs up once). Servers in different time zones, or a
+  `backup.time` moved earlier, can cost one night's run, never a second
+  copy. A failed nightly records no slot; manual and
+  before-upgrade backups neither record nor check one.
 - A held lock's session is checked every 10 seconds. If it ends, the work
   holding the lock is canceled (`pg_dump`, uploads, a restore), and the
   incomplete folder it leaves is the sweep's.
@@ -628,9 +639,14 @@ grouped by the admin page that edits each key: a key or prefix with its class.
   a restore creates (an admin collection, or one a section carries) keeps
   its source but gets no sync schedule (`applier.createCollection`, which
   every creation goes through); and a template collection keeps this
-  server's source and sync schedule. The preview says what is left
-  off; for a verified backup it names the library options the restore
-  turns on.
+  server's source and sync schedule; a seasonal section comes back
+  disabled (the seasonal task fetches the MDBList lists of every enabled
+  one). `unverifiedWorkFields` lists every such item field, with where the
+  restore leaves it inactive, and `TestUnverifiedWorkIsClassified` walks
+  it. The preview says what is left off; for a verified backup it names the
+  library options the restore turns on and the lists a seasonal section
+  fetches. One restore writes at most 50 seasonal sections, and a seasonal
+  task run fetches at most 200 lists, taking the rest in turn on later runs.
 - Every collection a restore or import writes from a document stores its
   source as the editors build one (`collectionutil.CanonicalCollectionSource`):
   each list URL the sync fetches (an MDBList collection's, a `tmdb_list`
@@ -1032,7 +1048,8 @@ the restore's or import's own transaction: the transaction already holds a
 connection, and a match that waited on the pool for another would wait
 forever on a pool of one. The matched items' visibility is checked in the
 same one read as the present ones'. A profile export names at most 100,000
-items. An item still unmatched is left out and listed in the report by
+items, its items list and every id its data names together, once each,
+checked before the import opens its transaction and mirrored by export. An item still unmatched is left out and listed in the report by
 title. Items the target profile may not see here are left out
 too and listed as hidden: each profile's data is merged through the canonical
 catalog visibility filter (`catalog.FilterAccessibleContentIDsInTransaction`)
@@ -1106,7 +1123,9 @@ account here has no primary profile, and a restore never makes another
 profile primary; so an account with none here (a new one, always) that
 restores any profile must restore the backup's primary profile with it,
 or it is left out (`needs_primary_profile`): without one, nothing could
-manage the household. The admin page selects the primary profile, locked,
+manage the household. The primary profile is created first, so it takes
+the first free place under the account's profile limit; an account here
+with no primary and no free place is left out in the preview. The admin page selects the primary profile, locked,
 with any other profile of a new account.
 
 **What a matched account would change.** A preview counts, for each data
@@ -1616,7 +1635,9 @@ neither list.
   any field (`access.WiderThan`: libraries, quality, stream and transcode
   caps, profiles, downloads, requests, permissions, with access groups
   applied), a household manager (a primary profile) without a PIN where
-  every live one has a PIN, or, for a profile both sides have, a
+  every live one has a PIN, a profile only the backup has (deleted
+  since, which the credential's holder could select), or, for a profile
+  both sides have, a
   protection or restriction lifted or loosened (its PIN, becoming the
   primary profile, child profile, rating or advisory-age ceiling, library
   restriction, playback-quality ceiling), or a looser request policy
@@ -1670,8 +1691,20 @@ neither list.
   installation, plugin task binding, and plugin catalog (off wins): plugins run as the server, so one
   turned off during an incident stays off, and a sign-in provider's carried
   links then sign no one in. A plugin installation or catalog the backup
-  has and the live server no longer does comes back off, never on. Nothing
-  a full restore does turns a plugin on; the admin does. A row is the live
+  has and the live server no longer does comes back off, never on, and so
+  does every other row with an off-wins switch that was deleted since the
+  backup: a library (disabled, for an admin to turn on deliberately: an
+  account with every library would otherwise see it at once), a personal
+  collection (unshared), an autoscan source, a history import source, a
+  request integration or route, a subtitle or marker provider's sharing, a
+  plugin task binding, an access group's permissions, a profile's
+  notifications. Only account switches roll back as they were
+  (`rollsBack`), since accounts roll back whole. Nothing
+  a full restore does turns a plugin on; the admin does. These switches are
+  set before the credential carry compares authority, so it compares the
+  restored server as it will start; the carry also counts an account with
+  every library as seeing each enabled library of its server, and drops a
+  credential whose account would see a library it cannot see now. A row is the live
   one when its id and username (an account), plugin id, catalog URL, or
   installation and capability (a task binding) match. The command
   lists each switch it kept. Grants through policy rather than a switch

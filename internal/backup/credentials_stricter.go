@@ -30,13 +30,27 @@ type stricterFlag struct {
 	describe string
 	// absentOff also sets the stricter value on a restored row the live
 	// server no longer has (removed after the backup), described by
-	// describeAbsent: it comes back, but never switched on.
+	// describeAbsent: it comes back, but never switched on. It is set for
+	// every flag whose stricter value is off, unless rollsBack says why
+	// such a row comes back as it was.
 	absentOff      bool
 	describeAbsent string
+	rollsBack      string
 }
+
+// whyAccountsRollBack is why account switches roll back with the account:
+// a full restore returns every account as the backup has it, one deleted
+// since included, and says so before the swap (AccountRollback).
+const whyAccountsRollBack = "accounts roll back whole, as the restore reports before the swap"
 
 // columnEnabled is the switch column most flagged tables name.
 const columnEnabled = "enabled"
+
+// Tables more than one flag names.
+const (
+	tableLibraries           = "media_folders"
+	tablePersonalCollections = "user_personal_collections"
+)
 
 // The keys a row is matched by.
 const (
@@ -62,11 +76,11 @@ func flag(table, column string, stricter bool, what string) stricterFlag {
 var stricterFlags = func() []stricterFlag {
 	flags := []stricterFlag{
 		{table: tableUsers, column: columnEnabled, stricter: false, key: accountKey, scope: everyRow,
-			describe: `format('account %s kept disabled', t.username)`},
+			describe: `format('account %s kept disabled', t.username)`, rollsBack: whyAccountsRollBack},
 		{table: tableUsers, column: "break_glass", stricter: false, key: accountKey, scope: everyRow,
-			describe: `format('account %s kept without break-glass sign-in', t.username)`},
+			describe: `format('account %s kept without break-glass sign-in', t.username)`, rollsBack: whyAccountsRollBack},
 		{table: tableUsers, column: "local_password_login_enabled", stricter: false, key: accountKey, scope: everyRow,
-			describe: `format('account %s kept without password sign-in', t.username)`},
+			describe: `format('account %s kept without password sign-in', t.username)`, rollsBack: whyAccountsRollBack},
 		{table: tableUsers, column: "password_change_required", stricter: true, key: accountKey, scope: everyRow,
 			describe: `format('account %s still must change its password', t.username)`},
 		// Plugins run as the server: one an admin turned off stays off (its
@@ -79,8 +93,12 @@ var stricterFlags = func() []stricterFlag {
 			describe: `format('plugin task %s kept off', t.capability_id)`},
 		// A plugin catalog an admin turned off stays off, and one removed
 		// since comes back off, so nothing installs or updates from it.
-		// A library an admin turned off since stays hidden.
-		flag("media_folders", columnEnabled, false, "library"),
+		// A library an admin turned off since stays hidden, and one deleted
+		// since comes back disabled, for an admin to turn on deliberately:
+		// an account with every library would otherwise see it at once.
+		{table: tableLibraries, column: columnEnabled, stricter: false, key: noKey, scope: everyRow,
+			describe: `format('library %s kept disabled', t.name)`, absentOff: true,
+			describeAbsent: `format('library %s restored disabled: removed after the backup', t.name)`},
 		// Autoscan accepts webhooks with a carried token: off, globally or
 		// for one source, stays off.
 		{table: "autoscan_settings", column: columnEnabled, stricter: false, key: noKey, scope: everyRow,
@@ -107,16 +125,21 @@ var stricterFlags = func() []stricterFlag {
 			describe: `format('profile %s kept its library restriction', t.name)`},
 		{table: tableUserProfiles, column: "require_advisory_age", stricter: true, key: profileKey, scope: everyRow,
 			describe: `format('profile %s kept its advisory-age requirement', t.name)`},
-		// A collection its owner stopped sharing stays private.
-		flag("user_personal_collections", "is_shared", false, "personal collection"),
-		flag("user_personal_collections", "include_in_server_collections", false, "personal collection"),
+		// A collection its owner stopped sharing stays private, and one
+		// deleted since comes back unshared.
+		{table: tablePersonalCollections, column: "is_shared", stricter: false, key: noKey, scope: everyRow,
+			describe: `format('personal collection %s kept unshared', t.id)`, absentOff: true,
+			describeAbsent: `format('personal collection %s restored unshared: removed after the backup', t.id)`},
+		{table: tablePersonalCollections, column: "include_in_server_collections", stricter: false, key: noKey, scope: everyRow,
+			describe: `format('personal collection %s kept out of server collections', t.id)`, absentOff: true,
+			describeAbsent: `format('personal collection %s restored out of server collections: removed after the backup', t.id)`},
 	}
 	// Per-account and per-group permissions never widen.
 	for _, column := range []string{"download_allowed", "download_transcode_allowed", "transcode_allowed", "audio_transcode_allowed", "requests_allowed"} {
 		what := strings.ReplaceAll(column, "_", " ")
 		flags = append(flags,
 			stricterFlag{table: tableUsers, column: column, stricter: false, key: accountKey, scope: everyRow,
-				describe: fmt.Sprintf(`format('account %%s kept without %s', t.username)`, what)},
+				describe: fmt.Sprintf(`format('account %%s kept without %s', t.username)`, what), rollsBack: whyAccountsRollBack},
 			stricterFlag{table: "access_groups", column: column, stricter: false, key: `t.name`, scope: everyRow,
 				describe: fmt.Sprintf(`format('access group %%s kept without %s', t.name)`, what)})
 	}
@@ -125,6 +148,18 @@ var stricterFlags = func() []stricterFlag {
 		flags = append(flags, stricterFlag{table: "notification_preferences", column: column, stricter: false,
 			id: `t.user_id::text || ':' || t.profile_id`, key: noKey, scope: everyRow,
 			describe: fmt.Sprintf(`format('notifications of profile %%s kept off (%s)', t.profile_id)`, column)})
+	}
+	// A row removed since the backup comes back with an off switch off,
+	// never on, unless the flag says why it rolls back as it was.
+	for i := range flags {
+		f := &flags[i]
+		if f.stricter || f.rollsBack != "" {
+			continue
+		}
+		f.absentOff = true
+		if f.describeAbsent == "" {
+			f.describeAbsent = fmt.Sprintf(`format('%s %%s restored with %s off: removed after the backup', %s)`, f.table, f.column, f.idOf())
+		}
 	}
 	return flags
 }()

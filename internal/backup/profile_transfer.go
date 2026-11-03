@@ -32,9 +32,10 @@ const (
 	ProfileExportVersion = 1
 	// MaxProfileImportBytes bounds an import's document.
 	MaxProfileImportBytes = 64 << 20
-	// maxProfileItems bounds the items an export names (its items list):
-	// a profile's history, ratings, and lists name a few thousand titles,
-	// tens of thousands at most.
+	// maxProfileItems bounds the items an export names, its items list and
+	// every id its data types name together, once each: a profile's
+	// history, ratings, and lists name a few thousand titles, tens of
+	// thousands at most.
 	maxProfileItems = 100_000
 )
 
@@ -241,7 +242,9 @@ func (t *ProfileTransfer) Export(ctx context.Context, scope ProfileImportScope) 
 	if doc.Items, err = readItemRefs(ctx, tx, items); err != nil {
 		return nil, err
 	}
-	if len(doc.Items) > maxProfileItems {
+	// The count an import checks: every item the data names, once.
+	slices.Sort(items)
+	if len(slices.Compact(items)) > maxProfileItems {
 		return nil, ErrProfileExportTooLarge
 	}
 	out, err := json.Marshal(doc)
@@ -373,15 +376,26 @@ func ParseProfileExport(data []byte) (*ProfileExport, error) {
 		}
 		doc.summaries[id] = sum
 	}
-	if len(doc.Items) > maxProfileItems {
-		return nil, &InvalidProfileExportError{Err: fmt.Errorf("names more than %d items", maxProfileItems)}
-	}
 	seen := map[string]bool{}
 	for _, r := range doc.Items {
 		if !userdata.ValidContentID(r.ContentID) || seen[r.ContentID] {
 			return nil, &InvalidProfileExportError{Err: fmt.Errorf("item %q is not valid or is listed twice", r.ContentID)}
 		}
 		seen[r.ContentID] = true
+	}
+	// Every item the import reads about, once each: the refs and every id
+	// a data type names, which the import resolves in its transaction.
+	named := len(seen)
+	for _, sum := range doc.summaries {
+		for _, id := range sum.Items {
+			if !seen[id] {
+				seen[id] = true
+				named++
+			}
+		}
+	}
+	if named > maxProfileItems {
+		return nil, &InvalidProfileExportError{Err: fmt.Errorf("names more than %d items", maxProfileItems)}
 	}
 	return &doc, nil
 }

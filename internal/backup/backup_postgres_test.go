@@ -599,8 +599,8 @@ func checkStricterSettings(t *testing.T, loader PGLoader, pool *pgxpool.Pool, ds
 // checkStricterFlags: an account an admin disabled since the backup stays
 // disabled after a full restore, with its required password change; every
 // plugin turned off since stays off, a sign-in provider included; a plugin
-// removed since comes back off; each is reported. A plugin on here and in
-// the backup stays on.
+// removed since comes back off, and so does a library deleted since; each
+// is reported. A plugin on here and in the backup stays on.
 func checkStricterFlags(t *testing.T, loader PGLoader, pool *pgxpool.Pool, dsn, into string, restored *pgxpool.Pool, userID int64) {
 	t.Helper()
 	ctx := t.Context()
@@ -646,9 +646,28 @@ func checkStricterFlags(t *testing.T, loader PGLoader, pool *pgxpool.Pool, dsn, 
 	if _, err := restored.Exec(ctx, `INSERT INTO autoscan_settings (id, enabled) VALUES (true, true) ON CONFLICT (id) DO UPDATE SET enabled = true`); err != nil {
 		t.Fatal(err)
 	}
+	// A library, an autoscan source, and a history import source deleted
+	// here since the backup: each comes back off.
+	var library, source, history string
+	if err := restored.QueryRow(ctx, `INSERT INTO media_folders (name, type, enabled) VALUES ('Removed since', 'movies', true) RETURNING id::text`).Scan(&library); err != nil {
+		t.Fatal(err)
+	}
+	if err := restored.QueryRow(ctx, `INSERT INTO autoscan_sources (plugin_id, capability_id, enabled) VALUES ('arr', 'sonarr', true) RETURNING id::text`).Scan(&source); err != nil {
+		t.Fatal(err)
+	}
+	if err := restored.QueryRow(ctx, `INSERT INTO history_import_sources (id, name, source_type, base_url, enabled)
+		VALUES (987654321, 'removed', 'plex', 'http://plex.example', true) RETURNING id::text`).Scan(&history); err != nil {
+		t.Fatal(err)
+	}
 	carried, err := loader.CarryCredentials(ctx, into, dsn)
 	if err != nil {
 		t.Fatal(err)
+	}
+	for table, id := range map[string]string{tableLibraries: library, "autoscan_sources": source, "history_import_sources": history} {
+		var on bool
+		if err := restored.QueryRow(ctx, `SELECT enabled FROM `+table+` WHERE id::text = $1`, id).Scan(&on); err != nil || on {
+			t.Fatalf("restored %s row removed since on %v (%v), want it off", table, on, err)
+		}
 	}
 	var autoscanOn bool
 	if err := restored.QueryRow(ctx, `SELECT enabled FROM autoscan_settings`).Scan(&autoscanOn); err != nil || autoscanOn {
@@ -666,7 +685,9 @@ func checkStricterFlags(t *testing.T, loader PGLoader, pool *pgxpool.Pool, dsn, 
 			enabled, mustChange, providerOn, otherOn, removedOn, runningOn)
 	}
 	for _, want := range []string{"account " + username + " kept disabled", "account " + username + " still must change its password",
-		"plugin sso-provider kept off", "plugin other-plugin kept off", "plugin removed-plugin restored off: removed after the backup"} {
+		"plugin sso-provider kept off", "plugin other-plugin kept off", "plugin removed-plugin restored off: removed after the backup",
+		"library Removed since restored disabled: removed after the backup",
+		"autoscan_sources " + source + " restored with enabled off: removed after the backup"} {
 		if !slices.Contains(carried.Stricter, want) {
 			t.Fatalf("reported %v, want %q", carried.Stricter, want)
 		}
@@ -943,15 +964,18 @@ func checkCarryAutoProvision(t *testing.T, loader PGLoader, pool *pgxpool.Pool, 
 	if err := pool.QueryRow(ctx, `INSERT INTO plugin_auth_bindings (plugin_installation_id, capability_id, auto_provision) VALUES ($1, 'oidc', true) RETURNING id`, installation).Scan(&binding); err != nil {
 		t.Fatal(err)
 	}
-	var allowed bool
-	if err := pool.QueryRow(ctx, `SELECT download_allowed FROM access_groups WHERE is_default`).Scan(&allowed); err != nil {
+	// The default group's stream cap: unlimited (0) in the backup, one
+	// here. A cap is no on/off switch, so the restore does not keep the
+	// live one, and the restored group is wider.
+	var streams int
+	if err := pool.QueryRow(ctx, `SELECT max_streams FROM access_groups WHERE is_default`).Scan(&streams); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		_, _ = pool.Exec(context.Background(), `UPDATE access_groups SET download_allowed = $1 WHERE is_default`, allowed)
+		_, _ = pool.Exec(context.Background(), `UPDATE access_groups SET max_streams = $1 WHERE is_default`, streams)
 	})
-	for db, allow := range map[*pgxpool.Pool]bool{pool: false, restored: true} {
-		if _, err := db.Exec(ctx, `UPDATE access_groups SET download_allowed = $1 WHERE is_default`, allow); err != nil {
+	for db, limit := range map[*pgxpool.Pool]int{pool: 1, restored: 0} {
+		if _, err := db.Exec(ctx, `UPDATE access_groups SET max_streams = $1 WHERE is_default`, limit); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -970,7 +994,7 @@ func checkCarryAutoProvision(t *testing.T, loader PGLoader, pool *pgxpool.Pool, 
 	if err != nil || !limited(carried) || provisions() {
 		t.Fatalf("carried %+v (%v), provisions %v; want the provider kept with account creation off", carried, err, provisions())
 	}
-	if _, err := restored.Exec(ctx, `UPDATE access_groups SET download_allowed = false WHERE is_default`); err != nil {
+	if _, err := restored.Exec(ctx, `UPDATE access_groups SET max_streams = 1 WHERE is_default`); err != nil {
 		t.Fatal(err)
 	}
 	if carried, err = loader.CarryCredentials(ctx, into, dsn); err != nil || limited(carried) || !provisions() {
@@ -980,22 +1004,22 @@ func checkCarryAutoProvision(t *testing.T, loader PGLoader, pool *pgxpool.Pool, 
 
 // checkCarryInvitation: a pending invitation is dropped when the account it
 // would create gets more under the restored data than live (its default
-// group allowed downloads in the backup and does not now), and kept when
-// the policies match.
+// group had no stream cap in the backup and has one now), and kept when the
+// policies match.
 func checkCarryInvitation(t *testing.T, loader PGLoader, pool *pgxpool.Pool, dsn, into string, restored *pgxpool.Pool, tokenHash string) {
 	t.Helper()
 	ctx := t.Context()
 	var id int64
-	var allowed bool
-	if err := pool.QueryRow(ctx, `SELECT i.id, g.download_allowed FROM invitations i, access_groups g WHERE i.token_hash = $1 AND g.is_default`, tokenHash).Scan(&id, &allowed); err != nil {
+	var streams int
+	if err := pool.QueryRow(ctx, `SELECT i.id, g.max_streams FROM invitations i, access_groups g WHERE i.token_hash = $1 AND g.is_default`, tokenHash).Scan(&id, &streams); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		_, _ = pool.Exec(context.Background(), `UPDATE access_groups SET download_allowed = $1 WHERE is_default`, allowed)
+		_, _ = pool.Exec(context.Background(), `UPDATE access_groups SET max_streams = $1 WHERE is_default`, streams)
 	})
-	setDownloads := func(db *pgxpool.Pool, allow bool) {
+	setStreams := func(db *pgxpool.Pool, limit int) {
 		t.Helper()
-		if _, err := db.Exec(ctx, `UPDATE access_groups SET download_allowed = $1 WHERE is_default`, allow); err != nil {
+		if _, err := db.Exec(ctx, `UPDATE access_groups SET max_streams = $1 WHERE is_default`, limit); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1007,14 +1031,14 @@ func checkCarryInvitation(t *testing.T, loader PGLoader, pool *pgxpool.Pool, dsn
 		}
 		return n
 	}
-	setDownloads(pool, false)
-	setDownloads(restored, true)
+	setStreams(pool, 1)
+	setStreams(restored, 0)
 	carried, err := loader.CarryCredentials(ctx, into, dsn)
 	want := fmt.Sprintf("invitation %d", id)
 	if err != nil || !slices.Contains(carried.Dropped, want) || invited() != 0 {
-		t.Fatalf("carried %+v (%v), want %q dropped: its group allowed downloads in the backup", carried, err, want)
+		t.Fatalf("carried %+v (%v), want %q dropped: its group had no stream cap in the backup", carried, err, want)
 	}
-	setDownloads(restored, false)
+	setStreams(restored, 1)
 	if carried, err = loader.CarryCredentials(ctx, into, dsn); err != nil || slices.Contains(carried.Dropped, want) || invited() != 1 {
 		t.Fatalf("carried %+v (%v), want the invitation kept under the same policy", carried, err)
 	}
@@ -1107,7 +1131,18 @@ func checkCarryAuthority(t *testing.T, loader PGLoader, pool *pgxpool.Pool, dsn,
 	t.Cleanup(func() {
 		_, _ = pool.Exec(context.Background(), `DELETE FROM request_user_limits WHERE user_id = $1`, userID)
 	})
-	exec(restored, `INSERT INTO request_settings (id, requests_enabled) VALUES (true, true) ON CONFLICT (id) DO UPDATE SET requests_enabled = true`)
+	// Requests on here too: the restore keeps the stricter of the two
+	// servers' switches before it compares authority.
+	var requestsOn bool
+	if err := pool.QueryRow(ctx, `SELECT coalesce((SELECT requests_enabled FROM request_settings WHERE id), false)`).Scan(&requestsOn); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), `UPDATE request_settings SET requests_enabled = $1 WHERE id`, requestsOn)
+	})
+	for _, db := range []*pgxpool.Pool{pool, restored} {
+		exec(db, `INSERT INTO request_settings (id, requests_enabled) VALUES (true, true) ON CONFLICT (id) DO UPDATE SET requests_enabled = true`)
+	}
 	exec(restored, `INSERT INTO request_user_limits (user_id, limit_mode, approval_mode) VALUES ($1, 'unlimited', 'auto')
 		ON CONFLICT (user_id) DO UPDATE SET limit_mode = 'unlimited', approval_mode = 'auto'`, userID)
 	if carried, err = loader.CarryCredentials(ctx, into, dsn); err != nil {
@@ -1145,6 +1180,11 @@ func checkCarryAuthority(t *testing.T, loader PGLoader, pool *pgxpool.Pool, dsn,
 	keptAs(false, "want the key dropped: the backup's primary profile has no PIN")
 	exec(restored, `UPDATE user_profiles SET pin_hash = 'backup-pin' WHERE id = $1`, profile)
 	keptAs(true, "want the key kept: both primary profiles have a PIN")
+	// A profile deleted here since the backup comes back with it: the key's
+	// holder could select it, so the key is dropped.
+	exec(restored, `INSERT INTO user_profiles (id, user_id, name) VALUES ($1, $2, 'Deleted since')`, profile+"-gone", userID)
+	keptAs(false, "want the key dropped: the backup has a profile this account no longer has")
+	exec(restored, `DELETE FROM user_profiles WHERE id = $1`, profile+"-gone")
 }
 
 // checkAnotherKey: a backup taken with another SECRET_KEY restores only
@@ -1261,6 +1301,11 @@ func TestEveryTableIsClassifiedDB(t *testing.T) {
 		}
 		if !restoredAsBackedUp[f.table] || !boolean {
 			t.Errorf("stricterFlags %s.%s: want a boolean column of a table restored as the backup has it, it is in %q", f.table, f.column, listed[f.table])
+		}
+		// A row removed since the backup comes back with an off-wins switch
+		// off, unless the flag says why it rolls back as it was.
+		if !f.stricter && !f.absentOff && f.rollsBack == "" {
+			t.Errorf("stricterFlags %s.%s: a row removed since the backup would come back on; set absentOff or say why it rolls back", f.table, f.column)
 		}
 	}
 	checkFlagColumnsDecided(t, pool, restoredAsBackedUp)
@@ -1608,40 +1653,15 @@ func TestControlConnectionIsNeverOnTheLiveDatabaseDB(t *testing.T) {
 // come back turned off and are reported. Each side is a database of its
 // own.
 func TestCustomPoliciesComeFromTheLiveServerDB(t *testing.T) {
-	pool, dsn := backuptest.Database(t)
 	ctx := t.Context()
-	open := func() (*pgxpool.Pool, string) {
-		url := createDatabase(t, pool, dsn)
-		db, err := pgxpool.New(ctx, url)
-		if err != nil {
-			t.Fatal(err)
-		}
-		t.Cleanup(db.Close)
-		for _, sql := range []string{
-			`CREATE TABLE users (id integer PRIMARY KEY)`,
-			`CREATE TABLE policy_documents (id bigserial PRIMARY KEY, domain text NOT NULL, name text NOT NULL, enabled boolean NOT NULL DEFAULT false,
-				active_version_id bigint, created_at timestamptz NOT NULL DEFAULT now(), updated_at timestamptz NOT NULL DEFAULT now(), revision bigint NOT NULL DEFAULT 1)`,
-			`CREATE TABLE policy_document_versions (id bigserial PRIMARY KEY, document_id bigint NOT NULL REFERENCES policy_documents(id) ON DELETE CASCADE,
-				version_number integer NOT NULL, rego_source text NOT NULL, source_sha256 text NOT NULL, compiled_ok boolean NOT NULL, compile_error text,
-				created_by_user_id integer REFERENCES users(id) ON DELETE SET NULL, comment text, created_at timestamptz NOT NULL DEFAULT now())`,
-			`ALTER TABLE policy_documents ADD FOREIGN KEY (active_version_id) REFERENCES policy_document_versions(id) ON DELETE SET NULL`,
-		} {
-			if _, err := db.Exec(ctx, sql); err != nil {
-				t.Fatal(err)
-			}
-		}
-		return db, url
-	}
+	// Two migrated databases: the policy tables' ids are GENERATED ALWAYS
+	// identities there, which an insert of explicit ids must override.
+	open := func() (*pgxpool.Pool, string) { return backuptest.Database(t) }
 	policy := func(db *pgxpool.Pool, version int, author *int) {
 		t.Helper()
 		var doc, ver int64
-		if err := db.QueryRow(ctx, `INSERT INTO policy_documents (domain, name, enabled) VALUES ('playback', 'house rules', true) RETURNING id`).Scan(&doc); err != nil {
+		if err := db.QueryRow(ctx, `INSERT INTO policy_documents (domain, name, enabled) VALUES ('scope', 'house rules', true) RETURNING id`).Scan(&doc); err != nil {
 			t.Fatal(err)
-		}
-		if author != nil {
-			if _, err := db.Exec(ctx, `INSERT INTO users (id) VALUES ($1) ON CONFLICT DO NOTHING`, *author); err != nil {
-				t.Fatal(err)
-			}
 		}
 		if err := db.QueryRow(ctx, `INSERT INTO policy_document_versions (document_id, version_number, rego_source, source_sha256, compiled_ok, created_by_user_id)
 			VALUES ($1, $2, 'package x', 'sha', true, $3) RETURNING id`, doc, version, author).Scan(&ver); err != nil {
@@ -1653,7 +1673,10 @@ func TestCustomPoliciesComeFromTheLiveServerDB(t *testing.T) {
 	}
 	live, liveURL := open()
 	restored, restoredURL := open()
-	author := 42
+	var author int
+	if err := live.QueryRow(ctx, `INSERT INTO users (username, password_hash, role, permissions) VALUES ('policy-author', 'h', 'admin', '{}') RETURNING id`).Scan(&author); err != nil {
+		t.Fatal(err)
+	}
 	policy(restored, 1, nil)
 	policy(live, 2, &author) // the live author is not in the restored data
 	if _, err := (PGLoader{}).CarryPolicies(ctx, restoredURL, liveURL); err != nil {

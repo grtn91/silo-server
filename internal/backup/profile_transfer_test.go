@@ -303,4 +303,20 @@ func TestEveryImportedFieldIsBounded(t *testing.T) {
 			t.Errorf("account document %s was accepted", what)
 		}
 	}
+	// A profile export whose data names more items than an import reads,
+	// with an empty items list: refused before the import's transaction.
+	ratings := make([]string, maxProfileItems+1)
+	for i := range ratings {
+		ratings[i] = fmt.Sprintf(`{"item":"m%d","rating":4,"rated_at":%s}`, i, sampleAt)
+	}
+	export := func(ratings []string) []byte {
+		return []byte(`{"format":"` + ProfileExportFormat + `","version":1,"exported_at":` + sampleAt + `,"profile_name":"P","items":[],` +
+			`"data":{"` + userdata.Ratings + `":{"ratings":[` + strings.Join(ratings, ",") + `]}}}`)
+	}
+	if _, err := ParseProfileExport(export(ratings[:10])); err != nil {
+		t.Fatalf("a profile export naming 10 items: %v", err)
+	}
+	if _, err := ParseProfileExport(export(ratings)); err == nil {
+		t.Errorf("a profile export naming %d items in its data was accepted", maxProfileItems+1)
+	}
 }

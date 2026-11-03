@@ -1101,7 +1101,8 @@ func TestEmailLessAccountRestoreDB(t *testing.T) {
 
 // TestNewAccountNeedsItsPrimaryProfileDB: a new account restored with only
 // its non-primary profiles would have no profile to manage its household,
-// so the restore leaves it out until its primary profile comes with them.
+// so the restore leaves it out until its primary profile comes with them;
+// under a limit of one profile, the primary takes the place, chosen last.
 func TestNewAccountNeedsItsPrimaryProfileDB(t *testing.T) {
 	f := newSelectiveFixture(t)
 	ctx := t.Context()
@@ -1113,6 +1114,7 @@ func TestNewAccountNeedsItsPrimaryProfileDB(t *testing.T) {
 	testMovie(t, f.pool, movie, "Primary "+sfx, "", 0)
 	account := emailLessAccount(t, f.pool, "np-"+sfx, "pnp-main-"+sfx, movie)
 	testProfile(t, f.pool, account, "pnp-kid-"+sfx, "Kid", false, "")
+	dbExec(t, f.pool, `UPDATE users SET max_profiles = 1 WHERE id = $1`, account)
 	source, err := backupUnderLock(t, f.svc, KindManual)
 	if err != nil {
 		t.Fatal(err)
@@ -1132,6 +1134,8 @@ func TestNewAccountNeedsItsPrimaryProfileDB(t *testing.T) {
 	if n := countRows(t, f.pool, `SELECT count(*) FROM users WHERE username::text = $1`, "np-"+sfx); n != 0 {
 		t.Fatalf("%d accounts created without a primary profile", n)
 	}
+	// Room for one profile (the account's own limit): the primary takes
+	// it, chosen second.
 	main := ProfileSelection{Profile: "pnp-main-" + sfx, Target: TargetNew, DataTypes: []string{}}
 	report = f.restoreUsers(t, source.ID, preview.Digest, []UserSelection{{Account: id, Target: TargetNew, Profiles: []ProfileSelection{kid, main}}})
 	if got := reportItem(t, report, SectionUsers, id); got.Outcome != OutcomeRestored {
@@ -1140,6 +1144,9 @@ func TestNewAccountNeedsItsPrimaryProfileDB(t *testing.T) {
 	if n := countRows(t, f.pool, `SELECT count(*) FROM user_profiles p JOIN users u ON u.id = p.user_id
 		WHERE u.username::text = $1 AND p.is_primary`, "np-"+sfx); n != 1 {
 		t.Fatalf("restored account has %d primary profiles, want 1", n)
+	}
+	if n := countRows(t, f.pool, `SELECT count(*) FROM user_profiles p JOIN users u ON u.id = p.user_id WHERE u.username::text = $1`, "np-"+sfx); n != 1 {
+		t.Fatalf("restored account has %d profiles under a limit of one, want its primary only", n)
 	}
 }
 

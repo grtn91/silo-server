@@ -1074,7 +1074,7 @@ func TestAuthorityWiderThan(t *testing.T) {
 		{"admin", func(a *accountAuthority) { a.rank = 1 }, true},
 		{"break glass", func(a *accountAuthority) { a.breakGlass = true }, true},
 		{"every library", func(a *accountAuthority) { a.policy.LibraryIDs = nil }, true},
-		{"a profile only the backup has", func(a *accountAuthority) { a.profiles["old"] = profileLimits{} }, false},
+		{"a profile only the backup has", func(a *accountAuthority) { a.profiles["old"] = profileLimits{} }, true},
 		{"not a child", func(a *accountAuthority) {
 			a.profiles["kid"] = with(a.profiles["kid"], func(p *profileLimits) { p.child = false })
 		}, true},
@@ -1259,5 +1259,41 @@ func TestTarGuardRefusesWhatTheWriterNeverMakes(t *testing.T) {
 		if allocated := after.TotalAlloc - before.TotalAlloc; allocated > 1<<20 {
 			t.Fatalf("%s: refusing allocated %d bytes", name, allocated)
 		}
+	}
+}
+
+// TestNightlySlots: each night backs up once, on its server's wall clock
+// across daylight saving changes, and a server in another zone that fires
+// later the same night skips.
+func TestNightlySlots(t *testing.T) {
+	berlin, err := time.LoadLocation("Europe/Berlin")
+	if err != nil {
+		t.Skip(err)
+	}
+	slot := func(at string, loc *time.Location) time.Time {
+		t.Helper()
+		now, err := time.ParseInLocation("2006-01-02 15:04", at, loc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return nightlySlot(now, "03:00", loc)
+	}
+	for _, tc := range []struct {
+		name       string
+		last, slot time.Time
+		done       bool
+	}{
+		{"the night after spring forward", slot("2026-03-28 03:10", berlin), slot("2026-03-29 03:10", berlin), false},
+		{"the night after falling back", slot("2026-10-24 03:10", berlin), slot("2026-10-25 03:10", berlin), false},
+		{"a second run the same night", slot("2026-03-29 03:10", berlin), slot("2026-03-29 04:30", berlin), true},
+		{"a UTC+1 server after a UTC server", slot("2026-01-10 03:05", time.UTC), slot("2026-01-10 03:20", time.FixedZone("UTC+1", 3600)), true},
+		{"a UTC server after a UTC+1 server", slot("2026-01-10 03:05", time.FixedZone("UTC+1", 3600)), slot("2026-01-10 03:20", time.UTC), true},
+	} {
+		if got := slotDone(&tc.last, tc.slot); got != tc.done {
+			t.Errorf("%s: last %v, slot %v: done %v, want %v", tc.name, tc.last, tc.slot, got, tc.done)
+		}
+	}
+	if slotDone(nil, time.Now()) {
+		t.Error("no recorded slot counts as done")
 	}
 }

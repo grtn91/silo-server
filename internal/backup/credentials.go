@@ -472,6 +472,15 @@ func (l PGLoader) CarryCredentials(ctx context.Context, dbURL, liveURL string) (
 	defer func() { _ = conn.Close(context.WithoutCancel(ctx)) }()
 	result := CarriedCredentials{Kept: map[string]int{}}
 	err = pgx.BeginFunc(ctx, conn, func(tx pgx.Tx) error {
+		// The stricter switches first, so the authority the carry compares
+		// is the restored server's as it will start: an account kept
+		// disabled, a library deleted since restored disabled.
+		if liveURL != "" {
+			var err error
+			if result.Stricter, err = keepStricterFlags(ctx, tx, liveState.stricter); err != nil {
+				return err
+			}
+		}
 		if err := carriedOwners(ctx, tx, liveState.authority); err != nil {
 			return err
 		}
@@ -488,11 +497,7 @@ func (l PGLoader) CarryCredentials(ctx context.Context, dbURL, liveURL string) (
 				return fmt.Errorf("%s: %w", table.name, err)
 			}
 		}
-		if liveURL == "" {
-			return nil
-		}
-		result.Stricter, err = keepStricterFlags(ctx, tx, liveState.stricter)
-		return err
+		return nil
 	})
 	return result, err
 }

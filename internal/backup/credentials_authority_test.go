@@ -80,7 +80,7 @@ func TestAuthorityComparisonCoversEveryField(t *testing.T) {
 	}
 
 	// The account's own fields, each compared by widerThan.
-	accountFields := map[string]bool{"rank": true, "enabled": true, "breakGlass": true, "policy": true, "requests": true, "profiles": true}
+	accountFields := map[string]bool{"rank": true, "enabled": true, "breakGlass": true, "policy": true, "requests": true, "libraries": true, "profiles": true}
 	for _, f := range reflect.VisibleFields(reflect.TypeFor[accountAuthority]()) {
 		if !accountFields[f.Name] {
 			t.Errorf("accountAuthority field %s is not compared: add it to widerThan and here", f.Name)
@@ -152,5 +152,10 @@ func TestProfileComparisonCoversEveryField(t *testing.T) {
 	restored := accountAuthority{profiles: map[string]profileLimits{"b": {primary: true}}}
 	if !restored.widerThan(live) {
 		t.Error("widerThan misses a primary profile that lost its PIN")
+	}
+	// A profile deleted here since the backup, however restricted.
+	revived := accountAuthority{profiles: map[string]profileLimits{"a": {primary: true, pin: true}, "b": strict}}
+	if !revived.widerThan(live) {
+		t.Error("widerThan misses a profile only the restored data has")
 	}
 }

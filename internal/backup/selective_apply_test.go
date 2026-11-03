@@ -13,6 +13,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -519,5 +520,59 @@ func TestRestoredLibraryFoldersAreBounded(t *testing.T) {
 		if libraryProblem(e) == "" {
 			t.Errorf("%s was accepted", name)
 		}
+	}
+}
+
+// TestUnverifiedWorkIsClassified: every entry of unverifiedWorkFields
+// names where the restore leaves it inactive, every boolean option of a
+// restored library is either such work or named as none, and each library
+// option and the seasonal section rule leave their work off for a backup
+// this server cannot verify, and on for one it can.
+func TestUnverifiedWorkIsClassified(t *testing.T) {
+	kinds := map[string]bool{KindLibrary: true, KindCollection: true, KindTemplateCollection: true, KindHomeSection: true, KindPlugin: true, KindSettingsPage: true}
+	for _, w := range unverifiedWorkFields {
+		if !kinds[w.kind] || w.field == "" || w.label == "" || w.sets == "" {
+			t.Errorf("unverified work %+v is incomplete", w)
+		}
+		if _, ok := libraryWork[w.field]; ok != (w.kind == KindLibrary) {
+			t.Errorf("library work %q has no reader and clearer, or one without a library entry", w.field)
+		}
+	}
+	notWork := map[string]string{"Enabled": "the library is shown", "RealtimeMonitoring": "watches its own folders", "BoxSetsInSearch": whyShown}
+	for _, f := range reflect.VisibleFields(reflect.TypeFor[LibraryEntry]()) {
+		if f.Type.Kind() != reflect.Bool && f.Type != reflect.TypeFor[*bool]() {
+			continue
+		}
+		tag, _, _ := strings.Cut(f.Tag.Get("json"), ",")
+		if _, work := libraryWork[tag]; !work && notWork[f.Name] == "" {
+			t.Errorf("library option %s is neither unverified work nor named as none", f.Name)
+		}
+	}
+	for field, w := range libraryWork {
+		on := LibraryEntry{}
+		reflect.ValueOf(&on).Elem().FieldByNameFunc(func(name string) bool {
+			f, _ := reflect.TypeFor[LibraryEntry]().FieldByName(name)
+			tag, _, _ := strings.Cut(f.Tag.Get("json"), ",")
+			return tag == field
+		}).SetBool(true)
+		if !w.on(on) || len(costlyLibraryOptions(on)) != 1 {
+			t.Errorf("%s on is not named: %v", field, costlyLibraryOptions(on))
+		}
+		in := withoutCostlyOptions(libraryInput(on))
+		if len(costlyLibraryOptions(LibraryEntry{AutoTranslateMetadata: in.AutoTranslateMetadata, TrickplayEnabled: in.TrickplayEnabled,
+			IntroDetectionEnabled: in.IntroDetectionEnabled, ChapterThumbnailsEnabled: in.ChapterThumbnailsEnabled, BoxSetsEnabled: in.BoxSetsEnabled})) != 0 {
+			t.Errorf("%s is still on for an unverified backup", field)
+		}
+	}
+	seasonal := HomeSectionEntry{SectionType: string(sections.SectionSeasonalThemed), Enabled: true, Config: json.RawMessage(`{}`)}
+	if on, note := restoredSectionEnabled(seasonal, true, time.Now()); on || note == "" {
+		t.Error("a seasonal section of an unverified backup is restored enabled")
+	}
+	if on, _ := restoredSectionEnabled(seasonal, false, time.Now()); !on {
+		t.Error("a seasonal section of a verified backup is restored disabled")
+	}
+	other := HomeSectionEntry{SectionType: string(sections.SectionRecentlyAdded), Enabled: true}
+	if on, _ := restoredSectionEnabled(other, true, time.Now()); !on {
+		t.Error("a section that fetches nothing is restored disabled")
 	}
 }

@@ -27,7 +27,11 @@ type accountAuthority struct {
 	// requests is its request policy (requests.LayeredPolicy): whether and
 	// how often it may request titles, and whether they auto-approve.
 	requests requests.EffectivePolicy
-	profiles map[string]profileLimits
+	// libraries are the libraries it can see: its policy's, or, when that
+	// names none (every library), every enabled library of its server, so
+	// a server with more libraries counts as wider.
+	libraries []int
+	profiles  map[string]profileLimits
 }
 
 // profileLimits are a profile's protections and restrictions: its PIN,
@@ -50,6 +54,13 @@ type profileLimits struct {
 // an account that is not there is left out.
 func readAuthority(ctx context.Context, tx pgx.Tx, ids []int) (map[int]accountAuthority, error) {
 	out := map[int]accountAuthority{}
+	if len(ids) == 0 {
+		return out, nil
+	}
+	var enabled []int
+	if err := tx.QueryRow(ctx, `SELECT coalesce(array_agg(id ORDER BY id), '{}') FROM media_folders WHERE enabled`).Scan(&enabled); err != nil {
+		return nil, fmt.Errorf("reading libraries: %w", err)
+	}
 	for _, id := range ids {
 		user, err := auth.UserInTransaction(ctx, tx, id)
 		if auth.IsNotFound(err) {
@@ -66,6 +77,10 @@ func readAuthority(ctx context.Context, tx pgx.Tx, ids []int) (map[int]accountAu
 		}
 		a := accountAuthority{rank: roleRank(user), enabled: user.Enabled, breakGlass: user.BreakGlass,
 			policy: access.ApplyGroupPolicy(user, group)}
+		a.libraries = enabled
+		if a.policy.LibraryIDs != nil {
+			a.libraries = a.policy.LibraryIDs
+		}
 		if a.requests, err = requestPolicy(ctx, tx, user, a.policy.RequestsAllowed); err != nil {
 			return nil, fmt.Errorf("reading account %d's request policy: %w", id, err)
 		}
@@ -113,19 +128,26 @@ func readProfileLimits(ctx context.Context, tx pgx.Tx, userID int) (map[string]p
 
 // widerThan reports whether restored grants anything live does not: a
 // higher rank, sign-in or break-glass access live lacks, a wider account
-// policy (access.WiderThan), a household manager (a primary profile)
-// without a PIN where every live one has one, or a profile on both sides
-// with a protection or restriction lifted or loosened. A profile only the
-// restored data has is otherwise not compared: the account restores it
-// whatever its credentials.
+// policy (access.WiderThan), a library it can see that live cannot, a
+// household manager (a primary profile) without a PIN where every live one
+// has one, a profile only the restored data has, or a profile on both
+// sides with a protection or restriction lifted or loosened.
 func (restored accountAuthority) widerThan(live accountAuthority) bool {
 	if restored.rank > live.rank || restored.enabled && !live.enabled || restored.breakGlass && !live.breakGlass ||
 		len(access.WiderThan(restored.policy, live.policy)) > 0 || requestsWider(restored.requests, live.requests) ||
 		restored.openManager() && !live.openManager() {
 		return true
 	}
+	for _, id := range restored.libraries {
+		if !slices.Contains(live.libraries, id) {
+			return true
+		}
+	}
+	// A profile only the restored data has (deleted here since) is one a
+	// live credential's holder could select, with whatever protection it
+	// had then: wider.
 	for id, r := range restored.profiles {
-		if l, ok := live.profiles[id]; ok && r.looserThan(l) {
+		if l, ok := live.profiles[id]; !ok || r.looserThan(l) {
 			return true
 		}
 	}
