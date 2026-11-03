@@ -1051,6 +1051,18 @@ that holds a bearer secret or a public capability, each one way:
   every installation of another deployment's backup or a separate
   restore, comes back off and is listed; one only the backup has is off
   by its stricter switch. The trusted proxies are a stricter-of setting.
+- Custom access policies only tighten decisions, so a newer one lost to
+  the backup would widen access: their documents and versions
+  (`liveTables`) are taken from the live server as one unit, with the
+  version each runs (`CarryPolicies`); when the live server has none, and
+  for another deployment's backup or a separate restore, the backup's come
+  back turned off and are listed. The rule across these: what governs
+  access decisions, what the server runs, and what it routes clients
+  through is the live server's or the stricter of the two, never the
+  backup's alone. Access group definitions are the one exception, by the
+  same decision as accounts (see Accounts roll back): their switches are
+  kept at the stricter value (`stricterFlags`) and grants made from them
+  are compared, but their limits roll back with the accounts.
 - Restored with live credentials (`secretScrubbed`): connections to outside
   services that other restored data refers to (history import sources,
   subtitle provider accounts, autoscan targets, request integrations). The

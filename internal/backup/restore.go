@@ -236,6 +236,9 @@ type DatabaseLoader interface {
 	// ServerID reads the server identity (serveridentity.Key) dbURL's
 	// settings hold, or "" when they hold none.
 	ServerID(ctx context.Context, dbURL string) (string, error)
+	// CarryPolicies gives dbURL liveURL's custom access policies ("" for
+	// none), returning the backup's it turned off.
+	CarryPolicies(ctx context.Context, dbURL, liveURL string) ([]string, error)
 	// CarryPluginReleases gives dbURL's plugin installations liveURL's
 	// releases ("" for none), returning those it turned off.
 	CarryPluginReleases(ctx context.Context, dbURL, liveURL string) ([]string, error)
@@ -428,6 +431,9 @@ func RestoreSeparate(ctx context.Context, src *Source, loader DatabaseLoader, op
 		return RestoreReport{}, err
 	}
 	if err := carryPluginReleases(ctx, loader, opts.Into, "", out); err != nil {
+		return RestoreReport{}, err
+	}
+	if err := carryPolicies(ctx, loader, opts.Into, "", out); err != nil {
 		return RestoreReport{}, err
 	}
 	if err := interruptWork(ctx, loader, opts.Into, "", out); err != nil {
