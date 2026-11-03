@@ -897,7 +897,9 @@ notices on the client. `GET /api/v2/admin/backups` therefore returns the
 conditions the dashboard shows as `warnings`: backups turned off, no
 successful backup in the last 48 hours (`no_recent_backup`): the later of
 the status row's `last_success_at` and the newest complete backup at the
-destination, which also covers a status row a full restore left empty; the
+destination whose manifest this server authenticated (anyone who can write
+the destination could set an unverified one's completion time in the
+future), which also covers a status row a full restore left empty; the
 destination missing or unreachable, the SQLite user store, and `pg_dump`
 missing or older than the server. It also carries this server's key check
 value. It also returns the active operation and the latest run from
