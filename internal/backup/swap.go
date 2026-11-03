@@ -292,6 +292,11 @@ func validateForSwap(ctx context.Context, src *Source, loader DatabaseLoader, op
 	if err := src.Validate(ctx, opts.Validate); err != nil {
 		return false, err
 	}
+	// The restored database is created on the live server, and pg_restore
+	// connects to it as the live URL's role.
+	if err := checkLoadRole(ctx, src, loader, opts.LiveURL, opts.Validate, out); err != nil {
+		return false, err
+	}
 	return checkDeployment(ctx, src, loader, opts, out)
 }
 

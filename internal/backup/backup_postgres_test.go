@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
@@ -299,10 +300,51 @@ func TestBackupRestoreRoundTripDB(t *testing.T) {
 		t.Fatalf("restored encrypted setting = %q, %v; want %q", got, err, seed.secretValue)
 	}
 
-	if err := VerifyBackup(ctx, src, loader, into, ValidateOptions{KeyCheck: keyCheck}, io.Discard); err == nil || !strings.Contains(err.Error(), "not empty") {
+	if err := VerifyBackup(ctx, src, loader, into, ValidateOptions{KeyCheck: keyCheck, ManifestKey: manifestKey}, io.Discard); err == nil || !strings.Contains(err.Error(), "not empty") {
 		t.Fatalf("verify into a used database = %v, want refusal", err)
 	}
 	checkAnotherKey(t, src, loader, pool, dsn, seed.secretKey)
+	checkDrillAsOrdinaryRole(t, src, loader, pool, dsn, ValidateOptions{KeyCheck: keyCheck, ManifestKey: manifestKey})
+}
+
+// checkDrillAsOrdinaryRole: a restore drill runs as the role the docs
+// recommend, one that is not a superuser and owns only its scratch
+// database, where a superuser created the extensions.
+func checkDrillAsOrdinaryRole(t *testing.T, src *Source, loader PGLoader, pool *pgxpool.Pool, dsn string, validate ValidateOptions) {
+	t.Helper()
+	ctx := t.Context()
+	exec := func(db *pgxpool.Pool, sql string) {
+		t.Helper()
+		if _, err := db.Exec(ctx, sql); err != nil {
+			t.Fatal(err)
+		}
+	}
+	role := "silo_drill_" + randomHex(t, 4)
+	password := randomHex(t, 16)
+	exec(pool, "CREATE ROLE "+ident(role)+" LOGIN PASSWORD '"+password+"'")
+	t.Cleanup(func() { _, _ = pool.Exec(context.Background(), "DROP ROLE IF EXISTS "+ident(role)) })
+	scratch := createDatabase(t, pool, dsn)
+	name, err := databaseName(scratch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exec(pool, "ALTER DATABASE "+ident(name)+" OWNER TO "+ident(role))
+	super, err := pgxpool.New(ctx, scratch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, ext := range []string{"vector", "citext", "pg_trgm"} {
+		exec(super, "CREATE EXTENSION IF NOT EXISTS "+ext)
+	}
+	super.Close()
+	asRole, err := url.Parse(scratch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	asRole.User = url.UserPassword(role, password)
+	if err := VerifyBackup(ctx, src, loader, asRole.String(), validate, io.Discard); err != nil {
+		t.Fatalf("verify as a role that owns only the scratch database: %v", err)
+	}
 }
 
 // checkManifestTampering: a backup whose manifest was changed after it was
@@ -741,7 +783,7 @@ func checkAnotherKey(t *testing.T, src *Source, loader PGLoader, pool *pgxpool.P
 	into := createDatabase(t, pool, dsn)
 	var out strings.Builder
 	if _, err := RestoreSeparate(ctx, src, loader, SeparateOptions{
-		Validate: ValidateOptions{KeyCheck: "0000-0000-0000-0000", AcceptLostCredentials: true}, Cipher: other,
+		Validate: ValidateOptions{KeyCheck: "0000-0000-0000-0000", AcceptLostCredentials: true, AcceptSuperuser: true}, Cipher: other,
 		Into: into, DatabaseOnly: true, Out: &out,
 	}); err != nil {
 		t.Fatal(err)

@@ -48,7 +48,12 @@ func (l PGLoader) Load(ctx context.Context, dbURL, dumpPath string) error {
 		return err
 	}
 	defer conn.Close()
-	cmd := exec.CommandContext(ctx, l.Tools.PgRestore, "--exit-on-error", "--no-owner", "--no-privileges", "--no-password", "--dbname="+conn.Conn, dumpPath) //nolint:gosec // G204: the discovered pg_restore with arguments built here, no shell
+	list, err := l.restoreList(ctx, dumpPath)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = os.Remove(list) }()
+	cmd := exec.CommandContext(ctx, l.Tools.PgRestore, "--exit-on-error", "--no-owner", "--no-privileges", "--no-password", "--use-list="+list, "--dbname="+conn.Conn, dumpPath) //nolint:gosec // G204: the discovered pg_restore with arguments built here, no shell
 	cmd.Env = append(os.Environ(), conn.Env...)
 	stderr := &limitedBuffer{limit: stderrLimit}
 	cmd.Stderr = stderr
@@ -56,6 +61,51 @@ func (l PGLoader) Load(ctx context.Context, dbURL, dumpPath string) error {
 		return fmt.Errorf("pg_restore failed: %w: %s", err, strings.TrimSpace(stderr.String()))
 	}
 	return nil
+}
+
+// restoreList writes the dump's table of contents, less the comments on
+// extensions, to a new file for pg_restore --use-list, and returns its
+// path. Only an extension's owner may comment on it, so a role that is not
+// a superuser loads a dump into a database where a superuser created the
+// extensions only without them; nothing reads them.
+func (l PGLoader) restoreList(ctx context.Context, dumpPath string) (string, error) {
+	cmd := exec.CommandContext(ctx, l.Tools.PgRestore, "--list", dumpPath) //nolint:gosec // G204: the discovered pg_restore with arguments built here, no shell
+	stderr := &limitedBuffer{limit: stderrLimit}
+	cmd.Stderr = stderr
+	toc, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("pg_restore --list failed: %w: %s", err, strings.TrimSpace(stderr.String()))
+	}
+	f, err := os.CreateTemp("", "silo-restore-list-*")
+	if err != nil {
+		return "", err
+	}
+	var kept strings.Builder
+	for line := range strings.Lines(string(toc)) {
+		if !strings.Contains(line, " COMMENT - EXTENSION ") {
+			kept.WriteString(line)
+		}
+	}
+	_, err = f.WriteString(kept.String())
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		_ = os.Remove(f.Name())
+		return "", err
+	}
+	return f.Name(), nil
+}
+
+func (l PGLoader) Superuser(ctx context.Context, dbURL string) (bool, error) {
+	conn, err := pgx.Connect(ctx, dbURL)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = conn.Close(context.WithoutCancel(ctx)) }()
+	var super bool
+	err = conn.QueryRow(ctx, `SELECT rolsuper FROM pg_roles WHERE rolname = current_user`).Scan(&super)
+	return super, err
 }
 
 func (l PGLoader) ServerID(ctx context.Context, dbURL string) (string, error) {

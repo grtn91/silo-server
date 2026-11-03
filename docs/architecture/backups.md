@@ -109,13 +109,20 @@ path (every Silo that writes manifests signs them):
   it is refused (`ErrManifestTampered`), a missing `mac` included, even with
   `--accept-lost-credentials`.
 - It names another check value, none, or `SECRET_KEY` is not set here: it
-  cannot be authenticated. `silo backup restore` refuses it unless the
-  operator passes `--accept-lost-credentials`, the flag that already accepts
-  a backup taken with another key (whose encrypted settings are lost), and
-  says plainly that the backup cannot be verified; `silo backup verify`
-  warns. A selective restore needs the admin's confirmation
-  (`accept_unauthenticated`) before it reads anything inside the restore
-  set, its preview included, and the listing shows it as `unverified`.
+  cannot be authenticated. `silo backup restore` and `silo backup verify`
+  refuse it unless the operator passes `--accept-lost-credentials`, the flag
+  that already accepts a backup taken with another key (whose encrypted
+  settings are lost), and say plainly that the backup cannot be verified.
+  Its `db.dump` could have been changed by anyone who could write to the
+  backup's storage, and `pg_restore` runs what a crafted archive says with
+  the connecting role's rights (`--no-owner --no-privileges` drop ownership
+  and grants, not arbitrary SQL in other entries). So before loading such a
+  dump, every mode (verify's scratch database, `--into`, and a replace's
+  `DATABASE_URL` role) checks the role and refuses a superuser unless the
+  operator also passes `--accept-superuser` (`checkLoadRole`). A selective
+  restore needs the admin's confirmation (`accept_unauthenticated`) before
+  it reads anything inside the restore set, its preview included, and the
+  listing shows it as `unverified`.
 - A manifest a destination read must also name the folder and server it was
   read from. A folder whose manifest names this key and does not verify is
   listed as `unverified` with no details, cannot be restored or downloaded,
@@ -458,11 +465,21 @@ prefixes and only keys the section references, or variants stored in a
 referenced artwork original's directory; avatars a user document names
 listed for the section; documents that decode strictly
 (unknown fields and trailing data refused) and match the index counts; and
-limits on entries (200,000), document size (64 MiB; 32 MiB for the index,
-16 MiB for `settings.json` and each `plugin.json`), the documents one read
-holds together (256 MiB, checked from the index's listed sizes before any
-document is read), plugin archive and blob size (256 MiB), total bytes
-(32 GiB), and JSON nesting (32). A plugin archive is checked against its
+limits on entries (200,000), document size (64 MiB for the collections and
+account documents, 32 MiB for the index, 8 MiB for `libraries.json` and
+`home-sections.json`, 4 MiB for `settings.json` and each `plugin.json`), the
+documents one read holds together (256 MiB, checked from the index's listed
+sizes before any document is read), plugin archive and blob size (256 MiB),
+total bytes (32 GiB), and JSON nesting (32). What a document decodes to is
+bounded too, before it is decoded: `internal/backup/jsonsize` walks the
+document beside its Go type and adds up what `encoding/json` would allocate
+(each array element at its type's size, doubled for slice growth; map
+entries, pointers, strings, raw values). A document is refused when that is
+over 8 times its size plus 64 KiB, when the set's documents together would
+decode to over 256 MiB, or when one array or object holds over 1,000,000
+elements. A short document of empty elements (`[{},{},…]`) would otherwise
+decode to a whole struct per three bytes; documents Silo writes decode to
+about their size. A plugin archive is checked against its
 digest and discarded, never installed ([Plugins](#plugins)). Readers accept
 every format version up to theirs and refuse a newer one with "This backup is
 from a newer Silo. Upgrade this server first."
@@ -697,8 +714,13 @@ share that page, type, and title, since the title then identifies neither.
 So two such sections restore as two, and a re-run finds each by its id. A matched section that differs lists what a restore replaces
 (title, position, featured, item limit, enabled, configuration, and missing
 items of its managed collection), and a restore replaces its configuration
-as an admin save would. A missing one is created, with its backup id when
-no section here has it, so a profile override naming it by id resolves. The
+as an admin save would. Only a collection the section manages stands for the
+carried one: a managed section pointed at an ordinary collection since the
+backup lists "collection replaced", whatever that collection holds, and the
+restore points it back at its managed collection (the one still here with
+its management key, or a new one). A missing one is created, with its backup
+id when no section here has it, so a profile override naming it by id
+resolves. The
 section editor's checks (`SectionHandler.CheckRestoredSection`: type,
 scope, configuration, recipe) run first, the write locks the collections it
 names as every section writer does (`sections.WriteSectionInTx`), and a
@@ -1484,8 +1506,16 @@ went ahead.
 `silo backup verify --from <backup> --scratch <database URL>` runs the
 validation, restores into an empty scratch database, runs the step 4
 verification (not its connection closing). The validation reads
-`blobs.tar` through. It does not need the right `SECRET_KEY`; with another
-one it warns that encrypted values would be lost.
+`blobs.tar` through. It does not need the right `SECRET_KEY`, but a backup
+this key cannot authenticate needs `--accept-lost-credentials`, as for a
+restore. Connect `--scratch` and `--into` as a role that is not a superuser
+and owns only that database (`CREATE ROLE silo_drill LOGIN; CREATE DATABASE
+silo_drill OWNER silo_drill`, then, as a superuser in that database, `CREATE
+EXTENSION vector`, which only a superuser may create): a dump loaded there
+can then reach nothing else on the server. `pg_restore` loads the dump's
+table of contents less the comments on extensions (`--use-list`), which only
+an extension's owner may write and nothing reads, so such a role can load
+it (`TestBackupRestoreRoundTripDB` verifies as one).
 CI runs the same round trip against PostgreSQL
 (`TestBackupRestoreRoundTripDB`): a seeded database with blobs and an
 encrypted setting is backed up, restored in separate mode, and compared

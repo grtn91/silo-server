@@ -921,6 +921,57 @@ func TestTemplateCollectionsAndHomeSectionsDB(t *testing.T) {
 	checkChangesNothing(t, f.restoreRequest(t, req))
 }
 
+// TestManagedSectionPointedElsewhereIsRestoredDB: a managed section an
+// admin pointed at an ordinary collection after the backup differs from the
+// backup even when that collection holds the same items; restoring it
+// creates the managed collection again, and a second preview finds it the
+// same.
+func TestManagedSectionPointedElsewhereIsRestoredDB(t *testing.T) {
+	f := newSelectiveFixture(t)
+	ctx, pool := t.Context(), f.pool
+	wirePageTargets(f, new(bool), &[]string{})
+	s := seedPages(t, f)
+	source, err := backupUnderLock(t, f.svc, KindManual)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo := catalog.NewLibraryCollectionRepository(pool)
+	ordinary, err := repo.Create(ctx, catalog.CreateLibraryCollectionInput{LibraryID: s.library, Slug: "ordinary-" + s.suffix, Title: "Ordinary " + s.suffix})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, id := range s.items {
+		if err := repo.AddItem(ctx, ordinary.ID, id, i); err != nil {
+			t.Fatal(err)
+		}
+	}
+	dbExec(t, pool, `UPDATE page_sections SET config = jsonb_build_object('library_collection_id', $2::text) WHERE id = $1`, s.managed, ordinary.ID)
+	preview, err := f.svc.Preview(ctx, source.ID, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := homeSectionItemID(s.managed)
+	if got := previewItem(t, preview, SectionHomeSections, id); got.Status != ItemDiffers || !slices.Contains(got.HomeSection.Changes, "collection replaced") {
+		t.Fatalf("section pointed at an ordinary collection = %+v %+v", got, got.HomeSection)
+	}
+	report := f.restoreRequest(t, RestoreRequest{BackupID: source.ID, Digest: preview.Digest, Selection: map[string][]string{SectionHomeSections: {id}}})
+	if got := reportItem(t, report, SectionHomeSections, id); got.Outcome != OutcomeRestored {
+		t.Fatalf("restoring it = %+v", got)
+	}
+	var shown string
+	if err := pool.QueryRow(ctx, `SELECT config->>'library_collection_id' FROM page_sections WHERE id = $1`, s.managed).Scan(&shown); err != nil ||
+		shown == ordinary.ID || countRows(t, pool, `SELECT count(*) FROM library_collections WHERE id = $1 AND management_mode = 'section'`, shown) != 1 {
+		t.Fatalf("restored section shows %q (%v), want a managed collection", shown, err)
+	}
+	again, err := f.svc.Preview(ctx, source.ID, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := previewItem(t, again, SectionHomeSections, id); got.Status != ItemOnThisServer || got.Reason != ReasonSame {
+		t.Fatalf("after the restore = %+v %+v", got, got.HomeSection)
+	}
+}
+
 // TestRestoredLibrarySectionsWaitForTheRestoreDB: a library the restore
 // recreates gets its default sections only after the restore wrote its saved
 // ones, and only where it wrote none. A default renamed before the backup

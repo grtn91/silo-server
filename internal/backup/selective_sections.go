@@ -264,6 +264,18 @@ func (p *planner) sectionChanges(ctx context.Context, plan sectionPlan, libMap m
 		}
 		collection = resolved
 	}
+	if e.Collection != nil && collection != "" {
+		// Only a collection the section manages stands for the carried
+		// one, as the restore finds it (managedCollectionOf): one the
+		// section was pointed at since is replaced by the carried one.
+		managed, err := managedCollectionOf(ctx, p.q, local)
+		if err != nil {
+			return nil, err
+		}
+		if managed == "" {
+			return append(changes, "collection replaced"), nil
+		}
+	}
 	config, ok := remapSectionConfig(e.Config, libMap, collection)
 	if !ok || !jsonEqual(config, local.Config) {
 		changes = append(changes, "configuration")
@@ -456,7 +468,15 @@ func (a *applier) restoreManagedCollection(ctx context.Context, tx pgx.Tx, e Hom
 			items = append(items, id)
 		}
 	}
+	// The section owns the collection through its management fields, which
+	// may name the section's id.
+	rename := func(s string) string { return strings.ReplaceAll(s, e.ID, sectionID) }
 	existing, err := managedCollectionOf(ctx, tx, plan.local)
+	if err == nil && existing == "" {
+		// The section was pointed elsewhere, and the collection it managed
+		// is still here: its management key is unique, so it is the one.
+		existing, err = managedCollectionByKey(ctx, tx, rename(c.ManagementKey))
+	}
 	if err != nil {
 		return "", err
 	}
@@ -492,9 +512,6 @@ func (a *applier) restoreManagedCollection(ctx context.Context, tx pgx.Tx, e Hom
 	if err != nil {
 		return "", err
 	}
-	// The section owns the collection through its management fields, which
-	// may name the section's id.
-	rename := func(s string) string { return strings.ReplaceAll(s, e.ID, sectionID) }
 	if _, err := catalog.CreateLibraryCollectionInTx(ctx, tx, catalog.CreateLibraryCollectionInput{
 		ID: newID, LibraryID: scope[0], LibraryIDs: scope, Slug: slug, Title: c.Title, Description: c.Description,
 		CollectionType: c.CollectionType, Visibility: c.Visibility, SortOrder: c.SortOrder, Featured: c.Featured,
@@ -511,7 +528,7 @@ func (a *applier) restoreManagedCollection(ctx context.Context, tx pgx.Tx, e Hom
 }
 
 // managedCollectionOf is the collection the section here manages, or "".
-func managedCollectionOf(ctx context.Context, tx pgx.Tx, local *sections.PageSection) (string, error) {
+func managedCollectionOf(ctx context.Context, tx queryer, local *sections.PageSection) (string, error) {
 	if local == nil {
 		return "", nil
 	}
@@ -525,6 +542,19 @@ func managedCollectionOf(ctx context.Context, tx pgx.Tx, local *sections.PageSec
 		return "", nil
 	}
 	return existing, err
+}
+
+// managedCollectionByKey is the section-managed collection with key, or "".
+func managedCollectionByKey(ctx context.Context, tx queryer, key string) (string, error) {
+	if key == "" {
+		return "", nil
+	}
+	var id string
+	err := tx.QueryRow(ctx, `SELECT id FROM library_collections WHERE management_mode = $1 AND management_key = $2`, managementSection, key).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", nil
+	}
+	return id, err
 }
 
 func libraryIDsOf(libs []CollectionLib) []int {

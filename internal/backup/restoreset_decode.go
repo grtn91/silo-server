@@ -23,10 +23,7 @@ func (p *restoreSetParser) document(name string, into any) (bool, error) {
 	if !ok {
 		return false, nil
 	}
-	if err := checkJSONDepth(data); err != nil {
-		return false, fmt.Errorf("%s: %w", name, err)
-	}
-	if err := decodeStrict(data, into); err != nil {
+	if err := p.decode(data, into); err != nil {
 		return false, fmt.Errorf("%s: %w", name, err)
 	}
 	return true, nil

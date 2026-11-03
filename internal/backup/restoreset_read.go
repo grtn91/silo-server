@@ -18,6 +18,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/Silo-Server/silo-server/internal/artworkkey"
+	"github.com/Silo-Server/silo-server/internal/backup/jsonsize"
 	"github.com/Silo-Server/silo-server/internal/blobstore"
 )
 
@@ -32,14 +33,20 @@ var ErrNoRestoreSet = errors.New("this backup has no restore set")
 // destination can be written by something other than this server. These
 // limits bound what reading one can cost.
 const (
-	maxRestoreSetEntries  = 200_000
-	maxRestoreSetPath     = 1024
+	maxRestoreSetEntries = 200_000
+	maxRestoreSetPath    = 1024
+	// maxRestoreSetDocument bounds the documents that grow with a library:
+	// collections (item lists and item artwork) and accounts (a profile's
+	// watch history).
 	maxRestoreSetDocument = 64 << 20
-	// maxRestoreSetIndex, maxSettingsDocument, and maxPluginDocument bound
-	// the documents that never need more than a few megabytes.
+	// maxRestoreSetIndex bounds the index, which lists every file. The
+	// other limits bound documents that hold a few kilobytes a server
+	// (settings, libraries, page sections) or a plugin's configuration,
+	// with a wide margin.
 	maxRestoreSetIndex  = 32 << 20
-	maxSettingsDocument = 16 << 20
-	maxPluginDocument   = 16 << 20
+	maxSettingsDocument = 4 << 20
+	maxPluginDocument   = 4 << 20
+	maxSmallDocument    = 8 << 20
 	// maxRestoreSetMetadata bounds the index and documents one read holds
 	// in memory together, as the preview cache bounds what it keeps
 	// (maxCachedRestoreSetBytes). The index lists every document's size, so
@@ -49,6 +56,16 @@ const (
 	maxRestoreSetBlob      = 256 << 20
 	maxRestoreSetTotal     = 32 << 30
 	maxRestoreSetJSONDepth = 32
+	// A document is refused before decoding when what it decodes to
+	// (jsonsize) would be over decodedPerByte times its size plus
+	// decodedSlack, or would take a set's decoded documents over
+	// maxRestoreSetDecoded: a short document of empty elements decodes to
+	// whole structs. A document Silo writes decodes to about its size.
+	decodedPerByte       = 8
+	decodedSlack         = 64 << 10
+	maxRestoreSetDecoded = maxRestoreSetMetadata
+	// maxJSONElements bounds one array or object of a document.
+	maxJSONElements = 1_000_000
 	// maxRestoreSetTrailer bounds the bytes after the tar end marker.
 	maxRestoreSetTrailer = 1 << 20
 )
@@ -223,6 +240,8 @@ type restoreSetParser struct {
 	opts       ReadOptions
 	seen       map[string]bool
 	documents  map[string][]byte
+	// decoded is what the documents decoded so far take (jsonsize).
+	decoded int64
 	// logical sums the entries' sizes as their headers state them.
 	logical int64
 }
@@ -307,6 +326,8 @@ func documentLimit(name string) int64 {
 		return maxSettingsDocument
 	case path.Base(name) == pluginDocumentName:
 		return maxPluginDocument
+	case name == librariesDocumentName || name == homeSectionsDocumentName:
+		return maxSmallDocument
 	}
 	return maxRestoreSetDocument
 }
@@ -332,7 +353,7 @@ func (p *restoreSetParser) readIndex(data []byte) error {
 		Format  string `json:"format"`
 		Version int    `json:"version"`
 	}
-	if err := checkJSONDepth(data); err != nil {
+	if _, err := jsonsize.Check(data, &head, decodeLimits(len(data))); err != nil {
 		return fmt.Errorf("%s: %w", restoreSetIndexName, err)
 	}
 	if err := json.Unmarshal(data, &head); err != nil {
@@ -348,7 +369,7 @@ func (p *restoreSetParser) readIndex(data []byte) error {
 		return fmt.Errorf("%s: version %d is not valid", restoreSetIndexName, head.Version)
 	}
 	var index RestoreSetIndex
-	if err := decodeStrict(data, &index); err != nil {
+	if err := p.decode(data, &index); err != nil {
 		return fmt.Errorf("%s: %w", restoreSetIndexName, err)
 	}
 	if !validServerID(index.ServerID) {
@@ -568,8 +589,28 @@ func allowedRestoreSetKey(key string) bool {
 	return canonicalArchivePath(key) && blobstore.ValidateKey(key) == nil && !strings.HasPrefix(key, RootPrefix)
 }
 
+// decodeLimits bound decoding a document of n bytes on its own.
+func decodeLimits(n int) jsonsize.Limits {
+	return jsonsize.Limits{Depth: maxRestoreSetJSONDepth, Elements: maxJSONElements, Bytes: decodedPerByte*int64(n) + decodedSlack}
+}
+
+// decode decodes one of the set's documents strictly (decodeStrict), first
+// checking what it decodes to against its own bound and what the set's
+// documents decoded so far leave of maxRestoreSetDecoded.
+func (p *restoreSetParser) decode(data []byte, into any) error {
+	limits := decodeLimits(len(data))
+	limits.Bytes = min(limits.Bytes, maxRestoreSetDecoded-p.decoded)
+	size, err := jsonsize.Check(data, into, limits)
+	if err != nil {
+		return err
+	}
+	p.decoded += size
+	return decodeStrict(data, into)
+}
+
 // decodeStrict decodes one JSON value, refusing unknown fields and trailing
-// data: within a format version every field is known.
+// data: within a format version every field is known. Data from an
+// untrusted source is checked with jsonsize first (restoreSetParser.decode).
 func decodeStrict(data []byte, into any) error {
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields()
@@ -581,36 +622,6 @@ func decodeStrict(data []byte, into any) error {
 	}
 	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
 		return errors.New("trailing data after the document")
-	}
-	return nil
-}
-
-// checkJSONDepth refuses JSON nested deeper than maxRestoreSetJSONDepth
-// before it is decoded.
-func checkJSONDepth(data []byte) error {
-	depth := 0
-	inString, escaped := false, false
-	for _, c := range data {
-		switch {
-		case inString:
-			switch {
-			case escaped:
-				escaped = false
-			case c == '\\':
-				escaped = true
-			case c == '"':
-				inString = false
-			}
-		case c == '"':
-			inString = true
-		case c == '{' || c == '[':
-			depth++
-			if depth > maxRestoreSetJSONDepth {
-				return fmt.Errorf("JSON nested deeper than %d", maxRestoreSetJSONDepth)
-			}
-		case c == '}' || c == ']':
-			depth--
-		}
 	}
 	return nil
 }

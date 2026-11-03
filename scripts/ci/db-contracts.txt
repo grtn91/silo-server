@@ -787,6 +787,7 @@
 ./internal/backup TestRestoreNeverSendsLiveSecretsToARestoredAddressDB
 ./internal/backup TestTemplateCollectionsAndHomeSectionsDB
 ./internal/backup TestRestoredLibrarySectionsWaitForTheRestoreDB
+./internal/backup TestManagedSectionPointedElsewhereIsRestoredDB
 ./internal/backup TestIdentityTwinsRestoreOneToOneDB
 ./internal/backup TestLayoutCollectionsMapAcrossServersDB
 ./internal/plugins TestRestoreInstallationDB
