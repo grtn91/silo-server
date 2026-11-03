@@ -116,6 +116,7 @@ const (
 	columnProfileID     = "profile_id"
 	columnBaseURL       = "base_url"
 	columnAPIKeyRef     = "api_key_ref" //nolint:gosec // G101: a column name, not a credential
+	columnURL           = "url"
 )
 
 // ownerCarried is the SQL condition, over the live row r, that the account
@@ -300,6 +301,13 @@ var secretTables = []secretTable{
 	// and their stored state, which may hold an external account's tokens.
 	// The live server's are kept, for the installations the restored data
 	// has.
+	// The plugin catalogs this server trusts to install from, with their
+	// switches: a catalog removed or turned off since the backup stays so,
+	// and the live releases (CarryPluginReleases) name live catalogs.
+	{name: "plugin_repositories", handling: secretCarried, why: "plugin catalogs this server trusts", carry: &carrySpec{
+		key: "id", same: []string{"id", columnURL}, credential: everyRow, owned: everyRow,
+		describe: `format('plugin catalog %s %L', r.id, r.url)`,
+	}},
 	{name: "plugin_runtime_configs", handling: secretCarried, why: "plugin configuration, with the keys and tokens plugins present to outside services", carry: &carrySpec{
 		key: "id", same: []string{"id", columnInstallation, "config_key"}, credential: everyRow, owned: pluginInstalled,
 		describe: `format('configuration %L of plugin installation %s', r.config_key, r.plugin_installation_id)`,
@@ -307,6 +315,12 @@ var secretTables = []secretTable{
 	{name: "plugin_instance_state", handling: secretCarried, why: "plugin state, which may hold an outside account's tokens", carry: &carrySpec{
 		key: "plugin_installation_id, host_scope, state_key", same: []string{columnInstallation, "host_scope", "state_key"}, credential: everyRow, owned: pluginInstalled,
 		describe: `format('state %L of plugin installation %s', r.state_key, r.plugin_installation_id)`,
+	}},
+	// Stream nodes are what clients' requests are routed through, some with
+	// the client's bearer: a node removed since the backup stays removed.
+	{name: "stream_nodes", handling: secretCarried, why: "stream nodes, which clients' requests are routed through", carry: &carrySpec{
+		key: "id", same: []string{"id", columnURL}, credential: everyRow, owned: everyRow,
+		describe: `format('stream node %s %L', r.id, r.name)`,
 	}},
 	{name: "notification_server_channels", handling: secretCarried, why: "server notification channels", carry: &carrySpec{
 		key: "id", same: []string{"id"}, credential: everyRow, owned: everyRow,

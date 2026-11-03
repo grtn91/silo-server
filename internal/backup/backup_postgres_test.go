@@ -498,6 +498,7 @@ func checkCredentials(t *testing.T, loader PGLoader, pool *pgxpool.Pool, dsn, in
 	checkOutboundConnections(t, loader, pool, dsn, into, restored, userID)
 	checkInterruptedWork(t, loader, pool, dsn, into, restored, userID)
 	checkOutboundSettings(t, loader, pool, dsn, into, restored)
+	checkLiveReleasesAndNodes(t, loader, pool, dsn, into, restored)
 	checkAccountRollback(t, loader, pool, dsn, into, userID, newUser)
 	checkStricterFlags(t, loader, pool, dsn, into, restored, userID)
 	checkStricterSettings(t, loader, pool, dsn, into, restored)
@@ -672,6 +673,88 @@ func checkStricterFlags(t *testing.T, loader PGLoader, pool *pgxpool.Pool, dsn, 
 	}
 }
 
+// checkLiveReleasesAndNodes: what the server launches or routes clients
+// through is the live server's. A plugin both have runs the live release,
+// archive and capabilities included; one whose id is another plugin here
+// comes back off and is reported; a stream node removed since the backup
+// stays removed.
+func checkLiveReleasesAndNodes(t *testing.T, loader PGLoader, pool *pgxpool.Pool, dsn, into string, restored *pgxpool.Pool) {
+	t.Helper()
+	ctx := t.Context()
+	exec := func(db *pgxpool.Pool, sql string, args ...any) {
+		t.Helper()
+		if _, err := db.Exec(ctx, sql, args...); err != nil {
+			t.Fatal(err)
+		}
+	}
+	base, err := strconv.ParseInt(randomHex(t, 3), 16, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	same, other := 700_000_000+base, 710_000_000+base
+	install := func(db *pgxpool.Pool, id int64, plugin, version, checksum string) {
+		t.Helper()
+		exec(db, `INSERT INTO plugin_installations (id, plugin_id, version, install_path, enabled) VALUES ($1, $2, $3, '/plugins/'||$3, true)`, id, plugin, version)
+		exec(db, `INSERT INTO plugin_archives (plugin_installation_id, manifest_json, checksum, archive_bytes) VALUES ($1, '\x7b7d', $2, '\x00')`, id, checksum)
+		exec(db, `INSERT INTO plugin_capabilities (plugin_installation_id, capability_type, capability_id, metadata) VALUES ($1, 'metadata', $2, '{}')`, id, version)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), `DELETE FROM plugin_installations WHERE id = ANY($1)`, []int64{same, other})
+		_, _ = pool.Exec(context.Background(), `DELETE FROM stream_nodes WHERE name = ANY($1)`, []string{"live-node", "removed-node"})
+	})
+	install(pool, same, "release-plugin", "2.0.0", "live")
+	install(restored, same, "release-plugin", "1.0.0", "backup")
+	install(pool, other, "live-plugin", "1.0.0", "live")
+	install(restored, other, "backup-plugin", "1.0.0", "backup")
+	off, err := loader.CarryPluginReleases(ctx, into, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var version, checksum, capability string
+	var enabled bool
+	if err := restored.QueryRow(ctx, `SELECT i.version, a.checksum, c.capability_id FROM plugin_installations i
+		JOIN plugin_archives a ON a.plugin_installation_id = i.id JOIN plugin_capabilities c ON c.plugin_installation_id = i.id
+		WHERE i.id = $1`, same).Scan(&version, &checksum, &capability); err != nil || version != "2.0.0" || checksum != "live" || capability != "2.0.0" {
+		t.Fatalf("a plugin both have runs %s %s %s (%v), want the live release", version, checksum, capability, err)
+	}
+	if err := restored.QueryRow(ctx, `SELECT enabled FROM plugin_installations WHERE id = $1`, other).Scan(&enabled); err != nil || enabled ||
+		!slices.ContainsFunc(off, func(s string) bool { return strings.Contains(s, "backup-plugin") }) {
+		t.Fatalf("an installation of another plugin here: enabled %v (%v), reported %v; want it off and reported", enabled, err, off)
+	}
+	// Reinstalled since the backup from a catalog added since: the live
+	// release names a catalog the backup does not have.
+	var catalogID int64
+	if err := pool.QueryRow(ctx, `INSERT INTO plugin_repositories (url, enabled, display_name) VALUES ($1, true, 'New catalog') RETURNING id`,
+		fmt.Sprintf("https://catalog-%d.invalid/index.json", base)).Scan(&catalogID); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), `DELETE FROM plugin_repositories WHERE id = $1`, catalogID)
+	})
+	exec(pool, `UPDATE plugin_installations SET repository_id = $2, version = '3.0.0' WHERE id = $1`, same, catalogID)
+	if _, err := loader.CarryCredentials(ctx, into, dsn); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loader.CarryPluginReleases(ctx, into, dsn); err != nil {
+		t.Fatalf("a release from a catalog added since: %v", err)
+	}
+	var repository *int64
+	if err := restored.QueryRow(ctx, `SELECT version, repository_id FROM plugin_installations WHERE id = $1`, same).Scan(&version, &repository); err != nil ||
+		version != "3.0.0" || repository == nil || *repository != catalogID {
+		t.Fatalf("reinstalled plugin = %s from %v (%v), want the live release and catalog", version, repository, err)
+	}
+	exec(pool, `INSERT INTO stream_nodes (name, type, url, enabled) VALUES ('live-node', 'transcode', 'http://live.invalid', true)`)
+	exec(restored, `INSERT INTO stream_nodes (name, type, url, enabled) VALUES ('removed-node', 'transcode', 'http://removed.invalid', true)`)
+	if _, err := loader.CarryCredentials(ctx, into, dsn); err != nil {
+		t.Fatal(err)
+	}
+	var removed, liveNodes int
+	if err := restored.QueryRow(ctx, `SELECT count(*) FILTER (WHERE name = 'removed-node'), count(*) FILTER (WHERE name = 'live-node') FROM stream_nodes`).Scan(&removed, &liveNodes); err != nil ||
+		removed != 0 || liveNodes != 1 {
+		t.Fatalf("stream nodes: %d removed since, %d live (%v); want the live set", removed, liveNodes, err)
+	}
+}
+
 // checkOutboundSettings: a full restore keeps the live mail route as a
 // unit, an SMTP host and password changed since the backup included; a
 // route the live server does not have comes back with its secret cleared
@@ -753,6 +836,11 @@ func checkInterruptedWork(t *testing.T, loader PGLoader, pool *pgxpool.Pool, dsn
 	if _, err := pool.Exec(ctx, `DELETE FROM server_settings WHERE key = $1`, config.StorageTransitionTargetKey); err != nil {
 		t.Fatal(err)
 	}
+	// The search engine's index as the backup knew it.
+	if _, err := restored.Exec(ctx, `INSERT INTO catalog_search_index_state (provider, active_index_uid, schema_version, updated_at)
+		VALUES ('meilisearch', 'silo_catalog_then', 1, now()) ON CONFLICT (provider) DO UPDATE SET active_index_uid = EXCLUDED.active_index_uid`); err != nil {
+		t.Fatal(err)
+	}
 	changed, err := loader.InterruptWork(ctx, into, dsn)
 	if err != nil {
 		t.Fatal(err)
@@ -764,9 +852,12 @@ func checkInterruptedWork(t *testing.T, loader PGLoader, pool *pgxpool.Pool, dsn
 		}
 		return s
 	}
-	var staged int
+	var staged, indexes int
 	if err := restored.QueryRow(ctx, `SELECT count(*) FROM server_settings WHERE key = $1`, config.StorageTransitionTargetKey).Scan(&staged); err != nil {
 		t.Fatal(err)
+	}
+	if err := restored.QueryRow(ctx, `SELECT count(*) FROM catalog_search_index_state`).Scan(&indexes); err != nil || indexes != 0 {
+		t.Fatalf("search index state %d (%v), want none so the index is rebuilt", indexes, err)
 	}
 	if status(queued) != adminjob.StatusCancelled || status(done) != adminjob.StatusCompleted || staged != 0 || len(changed) == 0 {
 		t.Fatalf("queued job %s, finished job %s, staged targets %d, changed %v; want it ended, history kept, no target",

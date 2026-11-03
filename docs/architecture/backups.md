@@ -462,8 +462,9 @@ segment, backslash, or NUL; no duplicate paths, sections, or item ids;
 `restore-set.json` first; every other file listed in the index with its size
 and digest, and every listed file present; blobs only under their section's
 prefixes and only keys the section references, or variants stored beside a
-referenced artwork original (in its directory and of its revision, or both
-without one; at most 16 per original); avatars a user document names
+referenced artwork original (in its directory and of its revision, or, for
+the legacy names the writer used, `original.<ext>` and `w<width>.<ext>`,
+both without one; at most 16 per original); avatars a user document names
 listed for the section; documents that decode strictly
 (unknown fields and trailing data refused) and match the index counts; and
 limits on entries (200,000), document size (64 MiB for the collections and
@@ -492,10 +493,17 @@ over the collections, template collections, and section-managed collections
 it commits; the rest are left out with `over_restore_budget`, since a
 library's collections are listed whole. The collection editors have no
 per-field limits besides the request body cap, so a restore applies none of
-its own to single fields. A set's collections list at most 1,000,000 items together. The preview
+its own to single fields. A set holds at most 5,000 settings, 1,000 libraries, 500 plugins, 20,000
+collections and as many template collections, 50,000 item artwork entries,
+64 branding assets, and 10,000 page sections, valid or not; a set beyond
+one of them is refused when read, so a preview lists a bounded number of
+items. A set's collections list at most 1,000,000 items together. The preview
 cache charges each set what it holds once read: the bytes read, jsonsize's
 estimate of its decoded documents, and its blob index; and it keeps at most
-one set of a backup this server cannot verify, dropping the older one. A
+one set of a backup this server cannot verify, dropping the older one.
+Restored rate limits are written through the rate-limit configuration's
+own checks (`RateLimitHandler.ApplyRateLimitSettingsInTx`), every other
+setting through the admin settings batch, in the item's transaction. A
 restore job claimed while the request that queued it still holds the
 subsystem lock waits up to 10 seconds for it (`lockWithin`) before it
 gives up. A set lists at most the first 100 entries of a section it
@@ -1264,6 +1272,15 @@ canceled since the backup stays canceled and a staged target is never
 revived. Leases and claims in other queues (match queues, enrichment and
 trickplay state) are local work a server reclaims when they expire.
 
+Stores kept outside Postgres whose bookkeeping is in it are rebuilt from the
+restored data: the search index state is deleted, so the indexer rebuilds
+the search engine's index from the restored catalog when Silo starts (its
+change events are not in the dump), and every taste profile is marked
+stale, so recommendations are rebuilt with the live server's embedding
+settings. Files the catalog points at (artwork, trickplay, chapter images)
+are restored with it. A selective restore needs neither: catalog writes
+queue search index events through triggers, as every other write does.
+
 ### Accounts roll back
 
 A full restore is a rollback of the accounts, by maintainer decision: every
@@ -1309,6 +1326,19 @@ that holds a bearer secret or a public capability, each one way:
   work again, and one created since would stop working. They stay in the
   dump (`marker_edit_audit` refers to API keys), and the restore replaces
   them as below.
+- What the server runs or routes clients through is the live server's:
+  stream nodes and the plugin catalogs it trusts (`plugin_repositories`)
+  are carried like the credentials above (a node or catalog removed since
+  the backup stays removed), and each plugin installation the live
+  server has, by id and plugin, takes the live release (version, install
+  path, repository, stored archive, and capabilities;
+  `CarryPluginReleases`), so a release replaced since the backup is never
+  launched again; a catalog it names that the restored data lacks is
+  dropped from the reference rather than failing the restore. An
+  installation whose id is another plugin here, and
+  every installation of another deployment's backup or a separate
+  restore, comes back off and is listed; one only the backup has is off
+  by its stricter switch. The trusted proxies are a stricter-of setting.
 - Restored with live credentials (`secretScrubbed`): connections to outside
   services that other restored data refers to (history import sources,
   subtitle provider accounts, autoscan targets, request integrations). The

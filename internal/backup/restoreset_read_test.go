@@ -277,6 +277,65 @@ func TestRestoreExtractsOnlyReferencedFiles(t *testing.T) {
 	}
 }
 
+// TestReaderFindsVariantsInConstantTime: originals of many revisions in
+// one directory, each with its variants, are read without scanning the
+// directory's originals once per variant.
+func TestReaderFindsVariantsInConstantTime(t *testing.T) {
+	const originals = 10_000
+	index, entries := testRestoreSet()
+	for i := range index.Sections {
+		if index.Sections[i].ID != SectionCollections {
+			continue
+		}
+		for r := range originals {
+			key := fmt.Sprintf("collection-images/c1/poster/original.r%d.jpg", r)
+			index.Sections[i].Blobs = append(index.Sections[i].Blobs, key)
+			entries = append(entries, testEntry{name: "blobs/" + key, data: []byte("o")},
+				testEntry{name: fmt.Sprintf("blobs/collection-images/c1/poster/w1.r%d.jpg", r), data: []byte("v")},
+				testEntry{name: fmt.Sprintf("blobs/collection-images/c1/poster/w2.r%d.jpg", r), data: []byte("v")})
+		}
+	}
+	data := buildTar(t, index, entries)
+	started := time.Now()
+	rs, err := ReadRestoreSet(context.Background(), bytes.NewReader(data), ReadOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := len(rs.blobFamily("collection-images/c1/poster/original.r7.jpg")); got != 3 {
+		t.Fatalf("family of one original = %d keys, want it and its two variants", got)
+	}
+	if elapsed := time.Since(started); elapsed > 20*time.Second {
+		t.Fatalf("reading %d originals with their variants took %v", originals, elapsed)
+	}
+}
+
+// TestArtworkFamiliesAreLinear: 20,000 keys in one directory, named like
+// originals and legacy variants, are grouped into families in one pass,
+// each kept to the ladder's size, so the index holds about one reference
+// per key.
+func TestArtworkFamiliesAreLinear(t *testing.T) {
+	rs := &RestoreSet{blobs: map[string]string{}}
+	const dir = "collection-images/c1/poster/"
+	rs.blobs[dir+"original.jpg"] = ""
+	for i := range 20_000 {
+		for _, name := range []string{"original.%d", "original.r%d.jpg", "w%d.jpg"} {
+			rs.blobs[dir+fmt.Sprintf(name, i)] = ""
+		}
+	}
+	started := time.Now()
+	x := rs.lookup()
+	if elapsed := time.Since(started); elapsed > 5*time.Second {
+		t.Fatalf("indexing took %v", elapsed)
+	}
+	members := 0
+	for _, keys := range x.variants {
+		members += len(keys)
+	}
+	if got := len(x.variants[dir+"original.jpg"]); got != maxLadderVariants || members > len(rs.blobs) {
+		t.Fatalf("legacy family of %d, %d members in all for %d keys; want it capped and about one per key", got, members, len(rs.blobs))
+	}
+}
+
 // TestSelectedBlobsIsLinear: choosing the files of every collection of a set
 // at the archive's entry limit classifies each file once. A scan per
 // selected collection would take billions of prefix checks here and run
@@ -374,7 +433,7 @@ func setDocument(index *RestoreSetIndex, entries []testEntry, name string, data 
 // entries lists the first maxUnusableListed and counts the rest in one
 // more, so a preview never builds an item for each.
 func TestUnusableEntriesAreCappedPerSection(t *testing.T) {
-	const bad = 500_000
+	const bad = maxArtworkEntries
 	index, entries := testRestoreSet()
 	setDocument(&index, entries, homeSectionsDocumentName, mustJSON(HomeSectionsDocument{Sections: []HomeSectionEntry{}}), 0)
 	for i := range index.Sections {
@@ -399,6 +458,39 @@ func TestUnusableEntriesAreCappedPerSection(t *testing.T) {
 	last := rs.Unusable[len(rs.Unusable)-1]
 	if listed != maxUnusableListed+1 || last.Label != fmt.Sprintf("%d more entries", bad-maxUnusableListed) {
 		t.Fatalf("listed %d unusable entries, the last %+v; want %d and a count of the rest", listed, last, maxUnusableListed+1)
+	}
+}
+
+// TestValidEntriesAreCappedPerSection: a set of 400,000 valid item
+// artwork entries is refused when read, quickly, rather than previewed as
+// 400,000 items.
+func TestValidEntriesAreCappedPerSection(t *testing.T) {
+	index, entries := testRestoreSet()
+	setDocument(&index, entries, homeSectionsDocumentName, mustJSON(HomeSectionsDocument{Sections: []HomeSectionEntry{}}), 0)
+	for i := range index.Sections {
+		if index.Sections[i].ID == SectionCollections {
+			index.Sections[i].Blobs = []string{}
+		}
+	}
+	entries = slices.DeleteFunc(entries, func(e testEntry) bool { return strings.HasPrefix(e.name, "blobs/collection-images/") })
+	const n = 400_000
+	var doc strings.Builder
+	doc.WriteString(`{"collections":[],"branding":[],"item_artwork":[`)
+	for i := range n {
+		if i > 0 {
+			doc.WriteByte(',')
+		}
+		fmt.Fprintf(&doc, `{"target_type":"movie","content_id":"m%d","image_type":"poster","path":"","source":"","thumbhash":"","title":"","parent_content_id":""}`, i)
+	}
+	doc.WriteString(`]}`)
+	setDocument(&index, entries, collectionsDocumentName, []byte(doc.String()), n)
+	started := time.Now()
+	_, err := ReadRestoreSet(context.Background(), bytes.NewReader(buildTar(t, index, entries)), ReadOptions{})
+	if err == nil || !strings.Contains(err.Error(), "item artwork entries") {
+		t.Fatalf("400,000 artwork entries: %v, want them refused", err)
+	}
+	if elapsed := time.Since(started); elapsed > 10*time.Second {
+		t.Fatalf("refusing took %v", elapsed)
 	}
 }
 

@@ -5,6 +5,8 @@ import (
 	"slices"
 	"strings"
 	"unicode"
+
+	"github.com/Silo-Server/silo-server/internal/artworkkey"
 )
 
 // restoreSetIndex finds a restore set's entries by the ids and keys planning
@@ -19,8 +21,11 @@ type restoreSetIndex struct {
 	plugins                                             map[string]int
 	// By backup id: a collection's or template collection's, a section's.
 	collectionIDs, templateIDs, sectionIDs map[string]int
-	// blobDirs lists the blob keys in each directory, sorted.
-	blobDirs map[string][]string
+	// variants lists, by original, the blob keys stored beside it
+	// (ladderSibling), sorted; legacyKeys are, by directory, the legacy
+	// originals (legacyOriginalName).
+	variants   map[string][]string
+	legacyKeys map[string][]string
 	// The backup's entries that count as twins of one another, by what
 	// makes them twins, and then by their backup library (noLibrary for
 	// none): sectionTwins, collectionTwins, templateTwins.
@@ -45,7 +50,7 @@ func buildRestoreSetIndex(rs *RestoreSet) *restoreSetIndex {
 		libraryNames: map[int]string{}, collections: map[string]int{}, templates: map[string]int{},
 		sections: map[string]int{}, artwork: map[string]int{}, branding: map[string]int{}, plugins: map[string]int{},
 		collectionIDs: map[string]int{}, templateIDs: map[string]int{}, sectionIDs: map[string]int{},
-		blobDirs:     map[string][]string{},
+		variants: map[string][]string{}, legacyKeys: map[string][]string{},
 		sectionTwins: map[sectionTwinKey]map[int]int{}, collectionTwins: map[string]map[int]int{}, templateTwins: map[[2]string]map[int]int{},
 	}
 	// The reader refuses two entries with one item id, so the first is
@@ -98,12 +103,34 @@ func buildRestoreSetIndex(rs *RestoreSet) *restoreSetIndex {
 	for i, doc := range rs.Plugins {
 		first(x.plugins, doc.PluginID, i)
 	}
+	// A family is grouped in one pass: a revision's variants by the
+	// original they name, legacy ones (the writer's legacy names only) by
+	// the legacy originals of their directory, of which there is one per
+	// image format. Each family keeps at most maxLadderVariants members.
 	for key := range rs.blobs {
-		dir := path.Dir(key) + "/"
-		x.blobDirs[dir] = append(x.blobDirs[dir], key)
+		switch {
+		case artworkkey.Revision(key) != "":
+			if original := artworkkey.OriginalOf(key); original != key {
+				x.variants[original] = append(x.variants[original], key)
+			}
+		case legacyOriginalName(key):
+			dir := path.Dir(key) + "/"
+			x.legacyKeys[dir] = append(x.legacyKeys[dir], key)
+		}
 	}
-	for _, keys := range x.blobDirs {
+	for key := range rs.blobs {
+		if artworkkey.Revision(key) != "" || !legacyVariantName(key) {
+			continue
+		}
+		for _, original := range x.legacyKeys[path.Dir(key)+"/"] {
+			if ladderSibling(original, key) {
+				x.variants[original] = append(x.variants[original], key)
+			}
+		}
+	}
+	for original, keys := range x.variants {
 		slices.Sort(keys)
+		x.variants[original] = keys[:min(len(keys), maxLadderVariants)]
 	}
 	return x
 }

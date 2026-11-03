@@ -2,6 +2,8 @@ package api
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -22,7 +24,7 @@ import (
 // for template collections, and the section editor's checks. A missing
 // handler leaves its section unavailable rather than half wired.
 func wireBackupRestore(deps Dependencies, admin *handlers.AdminHandler, libraries *handlers.LibraryHandler, images *handlers.AdminImageHandler, pluginHandler *handlers.PluginHandler,
-	collections *handlers.LibraryCollectionHandler, pageSections *handlers.SectionHandler) {
+	collections *handlers.LibraryCollectionHandler, pageSections *handlers.SectionHandler, rateLimits *handlers.RateLimitHandler) {
 	jobs := adminjob.NewRepository(deps.DB)
 	filesystem := handlers.NewFilesystemHandler()
 	targets := backup.RestoreTargets{
@@ -40,15 +42,7 @@ func wireBackupRestore(deps Dependencies, admin *handlers.AdminHandler, librarie
 	}
 	if admin != nil {
 		targets.ApplySettings = func(ctx context.Context, tx pgx.Tx, values map[string]string, check func(map[string]string) error) ([]string, func(context.Context), error) {
-			var guard func(handlers.AdminSettingsSnapshot) error
-			if check != nil {
-				guard = func(s handlers.AdminSettingsSnapshot) error { return check(s.Stored) }
-			}
-			result, publish, err := admin.ApplyAdminSettingsInTx(ctx, tx, values, guard)
-			if err != nil {
-				return nil, nil, err
-			}
-			return result.RestartRequiredKeys, publish, nil
+			return applyRestoredSettings(ctx, tx, admin, rateLimits, values, check)
 		}
 	}
 	if pluginHandler != nil {
@@ -103,4 +97,50 @@ func importedChanges(system *notifications.System, rec *recommendations.Worker) 
 		}
 		rec.NotifySignalsChanged(context.Background(), userID, profileID)
 	}
+}
+
+// applyRestoredSettings writes restored settings in tx, each family through
+// its editor's write path: rate limits through the rate-limit
+// configuration's (/admin/rate-limits/config), the rest through the admin
+// settings batch. Both check that the settings are as planned.
+func applyRestoredSettings(ctx context.Context, tx pgx.Tx, admin *handlers.AdminHandler, rateLimits *handlers.RateLimitHandler,
+	values map[string]string, check func(map[string]string) error) ([]string, func(context.Context), error) {
+	limits, rest := map[string]string{}, map[string]string{}
+	for key, value := range values {
+		if strings.HasPrefix(key, "ratelimit.") {
+			limits[key] = value
+		} else {
+			rest[key] = value
+		}
+	}
+	var restart []string
+	var after []func(context.Context)
+	if len(rest) > 0 {
+		var guard func(handlers.AdminSettingsSnapshot) error
+		if check != nil {
+			guard = func(s handlers.AdminSettingsSnapshot) error { return check(s.Stored) }
+		}
+		result, publish, err := admin.ApplyAdminSettingsInTx(ctx, tx, rest, guard)
+		if err != nil {
+			return nil, nil, err
+		}
+		restart, after = result.RestartRequiredKeys, append(after, publish)
+	}
+	if len(limits) > 0 {
+		if rateLimits == nil {
+			return nil, nil, errors.New("this server cannot restore rate limits")
+		}
+		publish, err := rateLimits.ApplyRateLimitSettingsInTx(ctx, tx, limits, check)
+		if err != nil {
+			return nil, nil, err
+		}
+		after = append(after, publish)
+	}
+	return restart, func(ctx context.Context) {
+		for _, f := range after {
+			if f != nil {
+				f(ctx)
+			}
+		}
+	}, nil
 }
