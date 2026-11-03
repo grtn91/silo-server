@@ -14,6 +14,7 @@ import (
 	"path"
 	"sort"
 	"strings"
+	"sync"
 	"unicode/utf8"
 
 	"github.com/Silo-Server/silo-server/internal/artworkkey"
@@ -84,6 +85,8 @@ type RestoreSet struct {
 	// metadataBytes estimates what the set holds in memory: its documents
 	// and blob keys, for the preview cache's bound.
 	metadataBytes int64
+	indexOnce     sync.Once
+	index         *restoreSetIndex
 }
 
 // HasBlob reports whether the archive carries key.
@@ -624,11 +627,10 @@ func (rs *RestoreSet) blobFamily(key string) []string {
 	if dir == "" {
 		return out
 	}
-	for other := range rs.blobs {
-		if other != key && path.Dir(other)+"/" == dir {
+	for _, other := range rs.lookup().blobDirs[dir] {
+		if other != key {
 			out = append(out, other)
 		}
 	}
-	sort.Strings(out[1:])
 	return out
 }

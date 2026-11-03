@@ -209,6 +209,31 @@ func TestRestoreExtractsOnlyTheSelectedItemsFiles(t *testing.T) {
 	}
 }
 
+// TestSelectedBlobsIsLinear: choosing the files of every collection of a set
+// at the archive's entry limit classifies each file once. A scan per
+// selected collection would take billions of prefix checks here and run
+// past the test timeout.
+func TestSelectedBlobsIsLinear(t *testing.T) {
+	const collections, perCollection = 20_000, maxRestoreSetEntries / 20_000
+	rs := &RestoreSet{blobs: make(map[string]string, maxRestoreSetEntries)}
+	selection := make([]string, 0, collections)
+	for i := range collections {
+		id := strconv.Itoa(i)
+		rs.Collections.Collections = append(rs.Collections.Collections, CollectionEntry{ID: id})
+		selection = append(selection, collectionItemID(id))
+		for j := range perCollection {
+			rs.blobs[fmt.Sprintf("%s%s/poster/w%d.jpg", collectionImagePrefix, id, j)] = ""
+		}
+	}
+	keep := selectedBlobs(rs, map[string][]string{SectionCollections: selection[:collections/2]})
+	if len(keep) != collections/2*perCollection {
+		t.Fatalf("kept %d files, want %d", len(keep), collections/2*perCollection)
+	}
+	if keep[collectionImagePrefix+strconv.Itoa(collections-1)+"/poster/w0.jpg"] {
+		t.Fatal("kept a file of a collection not selected")
+	}
+}
+
 // TestReadRestoreSetChecksBeforeDecoding: an index that does not match the
 // manifest's digest is refused before it is decoded, a failed archive check
 // stops the read before any document is decoded, and documents larger than

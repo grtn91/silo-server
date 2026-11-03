@@ -28,7 +28,6 @@ func selectedBlobs(rs *RestoreSet, sel map[string][]string) map[string]bool {
 	}
 	has := func(section, id string) bool { return chosen[pick{section, id}] }
 	keep := map[string]bool{}
-	var dirs []string
 	for _, l := range rs.Libraries.Libraries {
 		if l.Poster != "" && has(SectionLibraries, strconv.Itoa(l.ID)) {
 			keep[l.Poster] = true
@@ -46,21 +45,19 @@ func selectedBlobs(rs *RestoreSet, sel map[string][]string) map[string]bool {
 			keep[b.Blob] = true
 		}
 	}
+	images := func(id string) {
+		for _, key := range rs.lookup().collectionBlobs[id] {
+			keep[key] = true
+		}
+	}
 	for _, c := range rs.Collections.Collections {
 		if has(SectionCollections, collectionItemID(c.ID)) {
-			dirs = append(dirs, collectionImagePrefix+c.ID+"/")
+			images(c.ID)
 		}
 	}
 	for _, t := range rs.Collections.TemplateCollections {
 		if has(SectionCollections, t.itemID()) {
-			dirs = append(dirs, collectionImagePrefix+t.ID+"/")
-		}
-	}
-	for key := range rs.blobs {
-		for _, dir := range dirs {
-			if strings.HasPrefix(key, dir) {
-				keep[key] = true
-			}
+			images(t.ID)
 		}
 	}
 	return keep

@@ -7,7 +7,6 @@ package backup
 import (
 	"context"
 	"fmt"
-	"strings"
 
 	"github.com/Silo-Server/silo-server/internal/idgen"
 	"github.com/Silo-Server/silo-server/internal/sections"
@@ -61,10 +60,13 @@ func sameLibrary(a, b *int) bool {
 // as e with its type and title, e included.
 func (p *planner) sectionTwins(e HomeSectionEntry, library *int, libMap map[int]int) int {
 	n := 0
-	for _, other := range p.rs.HomeSections.Sections {
-		if other.Scope == e.Scope && other.SectionType == e.SectionType && other.Title == e.Title &&
-			sameLibrary(mappedLibrary(other.LibraryID, libMap), library) {
-			n++
+	for backupLibrary, count := range p.rs.lookup().sectionTwins[sectionTwinKey{e.Scope, e.SectionType, e.Title}] {
+		var mapped *int
+		if backupLibrary != noLibrary {
+			mapped = mappedLibrary(&backupLibrary, libMap)
+		}
+		if sameLibrary(mapped, library) {
+			n += count
 		}
 	}
 	return n
@@ -73,12 +75,8 @@ func (p *planner) sectionTwins(e HomeSectionEntry, library *int, libMap map[int]
 // isBackupSection reports whether id is the id of one of the backup's
 // sections other than e: a section here with it is that entry's.
 func (p *planner) isBackupSection(id string, e HomeSectionEntry) bool {
-	for _, other := range p.rs.HomeSections.Sections {
-		if other.ID == id && other.ID != e.ID {
-			return true
-		}
-	}
-	return false
+	_, ok := p.rs.lookup().sectionIDs[id]
+	return ok && id != e.ID
 }
 
 // matchSection finds the section here. The section with the backup's id is
@@ -123,9 +121,9 @@ func (p *planner) matchSection(ctx context.Context, e HomeSectionEntry, library 
 // case, whose library maps to library, c included.
 func (p *planner) collectionTwins(c CollectionEntry, library int, libMap map[int]int) int {
 	n := 0
-	for _, other := range p.rs.Collections.Collections {
-		if local, ok := libMap[other.LibraryID]; ok && local == library && strings.EqualFold(other.Title, c.Title) {
-			n++
+	for backupLibrary, count := range p.rs.lookup().collectionTwins[foldKey(c.Title)] {
+		if local, ok := libMap[backupLibrary]; ok && local == library {
+			n += count
 		}
 	}
 	return n
@@ -137,17 +135,10 @@ func (p *planner) isBackupCollection(id string, c CollectionEntry) bool {
 	if id == c.ID {
 		return false
 	}
-	for _, other := range p.rs.Collections.Collections {
-		if other.ID == id {
-			return true
-		}
-	}
-	for _, other := range p.rs.Collections.TemplateCollections {
-		if other.ID == id {
-			return true
-		}
-	}
-	return false
+	x := p.rs.lookup()
+	_, collection := x.collectionIDs[id]
+	_, template := x.templateIDs[id]
+	return collection || template
 }
 
 // matchCollection finds a collection here in its mapped library: the one
@@ -192,9 +183,9 @@ func (p *planner) matchCollection(ctx context.Context, c CollectionEntry, librar
 // and template whose library maps to library, t included.
 func (p *planner) templateTwins(t TemplateCollectionEntry, library int, libMap map[int]int) int {
 	n := 0
-	for _, other := range p.rs.Collections.TemplateCollections {
-		if local, ok := libMap[other.LibraryID]; ok && local == library && other.BundleID == t.BundleID && other.TemplateID == t.TemplateID {
-			n++
+	for backupLibrary, count := range p.rs.lookup().templateTwins[[2]string{t.BundleID, t.TemplateID}] {
+		if local, ok := libMap[backupLibrary]; ok && local == library {
+			n += count
 		}
 	}
 	return n
