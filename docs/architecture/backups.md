@@ -803,7 +803,10 @@ check and its commit, and a slow original worker's next item finds the job no
 longer running under its claim and writes nothing. An item's commit writes
 its heartbeat at `clock_timestamp()`, the commit's time: `NOW()` is the
 transaction's start, which an item longer than the stale window would leave
-already stale for the updater waiting behind it. Running the same restore
+already stale for the updater waiting behind it. Every heartbeat only moves
+forward (`GREATEST(heartbeat_at, clock_timestamp())`), so an ordinary
+heartbeat that waited on the row behind an item cannot write its older
+start over the item's commit. Running the same restore
 again is safe.
 
 ### Blobs a restore writes

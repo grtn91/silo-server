@@ -107,7 +107,8 @@ func TestBackupRestoreFencingDB(t *testing.T) {
 }
 
 // checkLongItem runs an item that holds the job row past a stale window
-// that starts after the item did, with recovery waiting on its row lock.
+// that starts after the item did, with an ordinary heartbeat and then
+// recovery waiting on its row lock.
 func checkLongItem(t *testing.T, r *Repository, worker *Repository, id string) {
 	t.Helper()
 	ctx := t.Context()
@@ -121,8 +122,22 @@ func checkLongItem(t *testing.T, r *Repository, worker *Repository, id string) {
 		})
 	}()
 	<-locked
-	// Anything older than now is stale: the item's transaction began
-	// before it.
+	// An ordinary heartbeat that began during the item waits on the row
+	// first, then recovery: neither may take the job for stale.
+	waitFor := func(n int) {
+		t.Helper()
+		for waiting := 0; waiting < n; {
+			if err := r.pool.QueryRow(ctx, `SELECT count(*) FROM pg_stat_activity
+				WHERE wait_event_type = 'Lock' AND query LIKE '%UPDATE admin_jobs%'`).Scan(&waiting); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	beat := make(chan error, 1)
+	go func() { beat <- worker.TouchHeartbeat(context.Background(), id) }()
+	waitFor(1)
+	// Anything older than now is stale: the item's transaction and the
+	// waiting heartbeat's statement both began before it.
 	var window time.Time
 	if err := r.pool.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&window); err != nil {
 		t.Fatal(err)
@@ -132,19 +147,12 @@ func checkLongItem(t *testing.T, r *Repository, worker *Repository, id string) {
 		_, err := r.RequeueStaleRunning(context.Background(), window)
 		recovered <- err
 	}()
-	for waiting := 0; waiting == 0; {
-		if err := r.pool.QueryRow(ctx, `SELECT count(*) FROM pg_stat_activity
-			WHERE wait_event_type = 'Lock' AND query LIKE '%UPDATE admin_jobs%'`).Scan(&waiting); err != nil {
-			t.Fatal(err)
-		}
-		select {
-		case err := <-recovered:
-			t.Fatalf("stale recovery did not wait for the item's row lock: %v", err)
-		default:
-		}
-	}
+	waitFor(2)
 	close(release)
 	if err := <-fenced; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-beat; err != nil {
 		t.Fatal(err)
 	}
 	if err := <-recovered; err != nil {
