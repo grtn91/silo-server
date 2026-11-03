@@ -124,7 +124,8 @@ func (s *Service) ExecuteRestore(ctx context.Context, run RestoreRun) (any, erro
 	if err != nil {
 		return fail(fmt.Errorf("%w: %w", errBeforeRestoreBackup, err))
 	}
-	// Follow-ups an earlier restore committed but never finished run first.
+	// Follow-ups an earlier restore committed but never finished run first;
+	// one that waits for a restore's end waits for this one's.
 	a.s.CompleteFollowUps(work)
 	if err := a.seedLibraryMap(work); err != nil {
 		return fail(err)
@@ -160,8 +161,10 @@ func (s *Service) ExecuteRestore(ctx context.Context, run RestoreRun) (any, erro
 		}
 	}
 	// Default sections of the libraries this restore created, where it
-	// wrote none of their saved ones.
-	s.CompleteFollowUps(work)
+	// wrote none of their saved ones: the one call of the final runner. A
+	// restore that stops leaves them owed to the end of the next one, which
+	// may write the saved sections still missing.
+	s.finishFollowUps(work)
 	finished := s.opts.Now().UTC()
 	report.FinishedAt = &finished
 	return report, nil
@@ -501,7 +504,7 @@ const (
 	followUpPluginInstalled = "plugin_installed"
 	// followUpLibrarySections seeds a restored library's default and home
 	// sections where the restore wrote none. It runs once the restore's
-	// items are done (CompleteFollowUps), never after the library's own
+	// items are done (finishFollowUps), never after the library's own
 	// item: a saved section the restore writes later, renamed from its
 	// default, would otherwise sit beside a fresh default.
 	followUpLibrarySections = "library_sections"
@@ -524,12 +527,15 @@ func recordFollowUp(ctx context.Context, tx pgx.Tx, kind string, id int) error {
 // Only work a restore recorded runs: a library or plugin that exists for any
 // other reason is never set up again. A follow-up whose target is gone is
 // dropped; one that fails stays for the next run. A restore job calls it
-// before its first item and after each item that recorded one.
-func (s *Service) CompleteFollowUps(ctx context.Context) { s.completeFollowUps(ctx, true) }
+// before its first item and after each item that recorded one. The ones
+// that wait for the end of a restore (followUpLibrarySections) wait for
+// finishFollowUps.
+func (s *Service) CompleteFollowUps(ctx context.Context) { s.completeFollowUps(ctx, false) }
 
-// completeFollowUpsNow is CompleteFollowUps after one item: the follow-ups
-// that wait for the end of the restore wait.
-func (s *Service) completeFollowUpsNow(ctx context.Context) { s.completeFollowUps(ctx, false) }
+// finishFollowUps is CompleteFollowUps at the end of a restore, the
+// follow-ups that wait for it included. ExecuteRestore calls it once, after
+// its last item.
+func (s *Service) finishFollowUps(ctx context.Context) { s.completeFollowUps(ctx, true) }
 
 func (s *Service) completeFollowUps(ctx context.Context, final bool) {
 	rows, err := s.opts.Pool.Query(ctx, `
@@ -659,7 +665,7 @@ func (a *applier) applyLibrary(ctx context.Context, tx pgx.Tx, id string) (appli
 			return applied{}, err
 		}
 	}
-	return applied{item: item, mapLibrary: [2]int{e.ID, folder.ID}, after: a.s.completeFollowUpsNow}, nil
+	return applied{item: item, mapLibrary: [2]int{e.ID, folder.ID}, after: a.s.CompleteFollowUps}, nil
 }
 
 // libraryInput is the library e creates, before its id and poster.
@@ -696,12 +702,7 @@ func (a *applier) restoreLibraryPoster(ctx context.Context, key string, libraryI
 
 func (a *applier) applyPlugin(ctx context.Context, tx pgx.Tx, id string) (applied, error) {
 	item := ReportItem{Kind: KindPlugin, Label: id}
-	var doc *PluginDocument
-	for i := range a.rs.Plugins {
-		if a.rs.Plugins[i].PluginID == id {
-			doc = &a.rs.Plugins[i]
-		}
-	}
+	doc := indexed(a.rs.Plugins, a.rs.lookup().plugins, id)
 	if doc == nil {
 		return leftOut(item, ReasonNotInBackup, "The backup has no such plugin."), nil
 	}
@@ -755,12 +756,7 @@ func needsInstallMessage(doc PluginDocument) string {
 
 func (a *applier) applyCollection(ctx context.Context, tx pgx.Tx, id string) (applied, error) {
 	item := ReportItem{Kind: KindCollection, Label: id}
-	var c *CollectionEntry
-	for i := range a.rs.Collections.Collections {
-		if collectionItemID(a.rs.Collections.Collections[i].ID) == id {
-			c = &a.rs.Collections.Collections[i]
-		}
-	}
+	c := indexed(a.rs.Collections.Collections, a.rs.lookup().collections, id)
 	if c == nil {
 		return leftOut(item, ReasonNotInBackup, "The backup has no such collection."), nil
 	}

@@ -72,10 +72,8 @@ func (p *planner) templateLabel(t TemplateCollectionEntry) string {
 			title = name
 		}
 	}
-	for _, l := range p.rs.Libraries.Libraries {
-		if l.ID == t.LibraryID {
-			return title + " in " + l.Name
-		}
+	if name, ok := p.rs.lookup().libraryNames[t.LibraryID]; ok {
+		return title + " in " + name
 	}
 	return title
 }
@@ -294,12 +292,7 @@ func jsonEqual(a, b json.RawMessage) bool {
 
 func (a *applier) applyTemplateCollection(ctx context.Context, tx pgx.Tx, id string) (applied, error) {
 	item := ReportItem{Kind: KindTemplateCollection, Label: id}
-	var t *TemplateCollectionEntry
-	for i := range a.rs.Collections.TemplateCollections {
-		if a.rs.Collections.TemplateCollections[i].itemID() == id {
-			t = &a.rs.Collections.TemplateCollections[i]
-		}
-	}
+	t := indexed(a.rs.Collections.TemplateCollections, a.rs.lookup().templates, id)
 	if t == nil {
 		return leftOut(item, ReasonNotInBackup, "The backup has no such collection."), nil
 	}
@@ -469,9 +462,13 @@ func missingScope(ctx context.Context, q queryer, collectionID string, scope []i
 }
 
 func missingFrom(scope, have []int) []int {
+	had := make(map[int]bool, len(have))
+	for _, id := range have {
+		had[id] = true
+	}
 	var missing []int
 	for _, id := range scope {
-		if !slices.Contains(have, id) {
+		if !had[id] {
 			missing = append(missing, id)
 		}
 	}
@@ -482,9 +479,11 @@ func missingFrom(scope, have []int) []int {
 // it, its library first: every library must be here or restored with it, as
 // for any collection (planCollection). ok is false when one can be neither.
 func templateScope(t TemplateCollectionEntry, libMap map[int]int, restorable map[int]bool) (scope []int, requires []string, ok bool) {
+	inScope, required := map[int]bool{}, map[int]bool{}
 	for _, id := range append([]int{t.LibraryID}, libraryIDsOf(t.Libraries)...) {
 		if local, mapped := libMap[id]; mapped {
-			if !slices.Contains(scope, local) {
+			if !inScope[local] {
+				inScope[local] = true
 				scope = append(scope, local)
 			}
 			continue
@@ -492,8 +491,9 @@ func templateScope(t TemplateCollectionEntry, libMap map[int]int, restorable map
 		if !restorable[id] {
 			return nil, nil, false
 		}
-		if ref := libraryRef(id); !slices.Contains(requires, ref) {
-			requires = append(requires, ref)
+		if !required[id] {
+			required[id] = true
+			requires = append(requires, libraryRef(id))
 		}
 	}
 	return scope, requires, true

@@ -942,6 +942,16 @@ func TestRestoredLibrarySectionsWaitForTheRestoreDB(t *testing.T) {
 	dbExec(t, pool, `UPDATE page_sections SET title = 'Renamed before the backup'
 		WHERE id = (SELECT id FROM page_sections WHERE library_id = $1 ORDER BY position LIMIT 1)`, library)
 	saved := countRows(t, pool, `SELECT count(*) FROM page_sections WHERE library_id = $1`, library)
+	// A template collection of the library, created again before its
+	// sections: its follow-up runs before theirs are written.
+	defaults, err := f.svc.targets.TemplateCollection("core_defaults", "tmdb_popular_movies", library, "movies")
+	if err != nil {
+		t.Fatal(err)
+	}
+	template, err := catalog.NewLibraryCollectionRepository(pool).Create(ctx, defaults.Input)
+	if err != nil {
+		t.Fatal(err)
+	}
 	source, err := backupUnderLock(t, f.svc, KindManual)
 	if err != nil {
 		t.Fatal(err)
@@ -951,7 +961,7 @@ func TestRestoredLibrarySectionsWaitForTheRestoreDB(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	selection := map[string][]string{SectionLibraries: {strconv.Itoa(library)}}
+	selection := map[string][]string{SectionLibraries: {strconv.Itoa(library)}, SectionCollections: {templateCollectionItemID(template.ID)}}
 	for _, section := range preview.Sections {
 		for _, item := range section.Items {
 			if section.ID == SectionHomeSections && item.Selectable && item.HomeSection != nil && item.HomeSection.Scope == pageScopeLibrary {
@@ -962,6 +972,9 @@ func TestRestoredLibrarySectionsWaitForTheRestoreDB(t *testing.T) {
 	report := f.restoreRequest(t, RestoreRequest{BackupID: source.ID, Digest: preview.Digest, Selection: selection})
 	restored := report.LibraryMap[strconv.Itoa(library)]
 	t.Cleanup(func() { _, _ = pool.Exec(context.Background(), `DELETE FROM media_folders WHERE id = $1`, restored) })
+	if got := report.Counts[OutcomeRestored]; got != len(selection[SectionLibraries])+len(selection[SectionCollections])+len(selection[SectionHomeSections]) {
+		t.Fatalf("restored %d items, want every selected one: %+v", got, report.Items)
+	}
 	if n := countRows(t, pool, `SELECT count(*) FROM page_sections WHERE library_id = $1`, restored); restored == 0 || n != saved {
 		t.Fatalf("restored library %d has %d sections, want the %d saved ones and no seeded defaults beside them", restored, n, saved)
 	}

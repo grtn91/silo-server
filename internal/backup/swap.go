@@ -176,7 +176,7 @@ func RestoreSwap(ctx context.Context, src *Source, loader DatabaseLoader, ctl Co
 	if err := clearLostSettings(ctx, loader, restoredURL, m, opts.Validate, opts.Cipher, out); err != nil {
 		return discard(err)
 	}
-	if err := carryLiveState(ctx, ctl, live, loader, restoredURL, opts, sameDeployment, out); err != nil {
+	if err := carryLiveState(ctx, ctl, live, loader, restoredURL, opts, sameDeployment, m.CreatedAt, out); err != nil {
 		return discard(err)
 	}
 	// A subtitle the backup left out may still be in the live storage the
@@ -252,13 +252,17 @@ func lockLive(ctx context.Context, ctl ControlDB, liveURL string) (string, func(
 	return live, unlock, err
 }
 
-// carryLiveState carries the live server's credentials into the restored
+// carryLiveState says which accounts the restore rolls back to the backup's
+// (taken), carries the live server's credentials into the restored
 // database, and keeps its stricter access settings and security switches.
 // They are as they will be at the swap only while no other client is on the
 // live database: one that connected since preflight stops the restore here,
 // and the swap checks again once the live database is closed (swap.run).
-func carryLiveState(ctx context.Context, ctl ControlDB, live string, loader DatabaseLoader, restoredURL string, opts SwapOptions, sameDeployment bool, out io.Writer) error {
+func carryLiveState(ctx context.Context, ctl ControlDB, live string, loader DatabaseLoader, restoredURL string, opts SwapOptions, sameDeployment bool, taken time.Time, out io.Writer) error {
 	if err := checkLiveIdle(ctx, ctl, live); err != nil {
+		return err
+	}
+	if err := reportAccountRollback(ctx, loader, restoredURL, opts.LiveURL, taken, sameDeployment, out); err != nil {
 		return err
 	}
 	// What is tied to an account, a profile, or an installation is the live

@@ -12,7 +12,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"slices"
 	"strings"
 
 	"github.com/jackc/pgx/v5"
@@ -108,10 +107,8 @@ func (p *planner) sectionLabel(e HomeSectionEntry) string {
 	if e.Scope != pageScopeLibrary || e.LibraryID == nil {
 		return e.Title + " (home)"
 	}
-	for _, l := range p.rs.Libraries.Libraries {
-		if l.ID == *e.LibraryID {
-			return e.Title + " (" + l.Name + ")"
-		}
+	if name, ok := p.rs.lookup().libraryNames[*e.LibraryID]; ok {
+		return e.Title + " (" + name + ")"
 	}
 	return e.Title
 }
@@ -141,13 +138,15 @@ func (p *planner) planHomeSection(ctx context.Context, e HomeSectionEntry, libMa
 		libraries = append(libraries, c.LibraryID)
 		libraries = append(libraries, libraryIDsOf(c.Libraries)...)
 	}
+	required := map[int]bool{}
 	for _, id := range libraries {
 		if _, ok := libMap[id]; ok {
 			continue
 		}
 		if restorable[id] {
-			if ref := libraryRef(id); !slices.Contains(plan.item.Requires, ref) {
-				plan.item.Requires = append(plan.item.Requires, ref)
+			if !required[id] {
+				required[id] = true
+				plan.item.Requires = append(plan.item.Requires, libraryRef(id))
 			}
 			continue
 		}
@@ -309,22 +308,16 @@ func (p *planner) managedItemsMissing(ctx context.Context, c *SectionCollectionE
 // backup, a collection the set does not carry by its id. item names the
 // collections item that would create it when it is not here.
 func (p *planner) resolveCollection(ctx context.Context, backupID string, libMap map[int]int, sameServer bool) (local, item string, err error) {
-	for _, c := range p.rs.Collections.Collections {
-		if c.ID != backupID {
-			continue
-		}
+	if c := indexed(p.rs.Collections.Collections, p.rs.lookup().collectionIDs, backupID); c != nil {
 		if mapped, ok := libMap[c.LibraryID]; ok {
-			match, _, err := p.matchCollection(ctx, c, mapped, libMap)
+			match, _, err := p.matchCollection(ctx, *c, mapped, libMap)
 			if err != nil || match != "" {
 				return match, "", err
 			}
 		}
 		return "", collectionItemID(c.ID), nil
 	}
-	for _, t := range p.rs.Collections.TemplateCollections {
-		if t.ID != backupID {
-			continue
-		}
+	if t := indexed(p.rs.Collections.TemplateCollections, p.rs.lookup().templateIDs, backupID); t != nil {
 		if mapped, ok := libMap[t.LibraryID]; ok {
 			found, err := readTemplateCollection(ctx, p.q, t.BundleID, TemplateManagementKey(t.BundleID, t.TemplateID, mapped))
 			if err != nil || found != nil {
@@ -367,12 +360,7 @@ func (p *planner) planHomeSections(ctx context.Context, libMap map[int]int, rest
 
 func (a *applier) applyHomeSection(ctx context.Context, tx pgx.Tx, id string) (applied, error) {
 	item := ReportItem{Kind: KindHomeSection, Label: id}
-	var e *HomeSectionEntry
-	for i := range a.rs.HomeSections.Sections {
-		if a.rs.HomeSections.Sections[i].itemID() == id {
-			e = &a.rs.HomeSections.Sections[i]
-		}
-	}
+	e := indexed(a.rs.HomeSections.Sections, a.rs.lookup().sections, id)
 	if e == nil {
 		return leftOut(item, ReasonNotInBackup, "The backup has no such section."), nil
 	}
@@ -480,12 +468,14 @@ func (a *applier) restoreManagedCollection(ctx context.Context, tx pgx.Tx, e Hom
 		return existing, err
 	}
 	var scope []int
+	inScope := map[int]bool{}
 	for _, id := range append([]int{c.LibraryID}, libraryIDsOf(c.Libraries)...) {
 		local, ok := libMap[id]
 		if !ok {
 			return "", nil
 		}
-		if !slices.Contains(scope, local) {
+		if !inScope[local] {
+			inScope[local] = true
 			scope = append(scope, local)
 		}
 	}

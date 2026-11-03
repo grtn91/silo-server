@@ -14,12 +14,7 @@ import (
 // stored objects.
 
 func (a *applier) artworkEntry(id string) *ItemArtworkEntry {
-	for i := range a.rs.Collections.ItemArtwork {
-		if a.rs.Collections.ItemArtwork[i].itemID() == id {
-			return &a.rs.Collections.ItemArtwork[i]
-		}
-	}
-	return nil
+	return indexed(a.rs.Collections.ItemArtwork, a.rs.lookup().artwork, id)
 }
 
 // stageArtwork writes an artwork item's objects before its transaction,
@@ -112,12 +107,7 @@ func (a *applier) applyArtwork(ctx context.Context, tx pgx.Tx, id string) (appli
 
 func (a *applier) applyBranding(ctx context.Context, tx pgx.Tx, id string) (applied, error) {
 	item := ReportItem{Kind: KindBranding, Label: id}
-	var entry *BrandingEntry
-	for i := range a.rs.Collections.Branding {
-		if a.rs.Collections.Branding[i].itemID() == id {
-			entry = &a.rs.Collections.Branding[i]
-		}
-	}
+	entry := indexed(a.rs.Collections.Branding, a.rs.lookup().branding, id)
 	if entry == nil {
 		return leftOut(item, ReasonNotInBackup, "The backup has no such branding asset."), nil
 	}
