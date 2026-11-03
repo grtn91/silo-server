@@ -1169,6 +1169,11 @@ func checkCarryAuthority(t *testing.T, loader PGLoader, pool *pgxpool.Pool, dsn,
 	keptAs(false, "want the key dropped: the backup's primary profile has no PIN")
 	exec(restored, `UPDATE user_profiles SET pin_hash = 'backup-pin' WHERE id = $1`, profile)
 	keptAs(true, "want the key kept: both primary profiles have a PIN")
+	// A profile deleted here since the backup comes back with it: the key's
+	// holder could select it, so the key is dropped.
+	exec(restored, `INSERT INTO user_profiles (id, user_id, name) VALUES ($1, $2, 'Deleted since')`, profile+"-gone", userID)
+	keptAs(false, "want the key dropped: the backup has a profile this account no longer has")
+	exec(restored, `DELETE FROM user_profiles WHERE id = $1`, profile+"-gone")
 }
 
 // checkAnotherKey: a backup taken with another SECRET_KEY restores only
