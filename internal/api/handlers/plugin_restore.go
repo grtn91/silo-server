@@ -18,6 +18,15 @@ func (h *PluginHandler) RestorePlugin(ctx context.Context, tx pgx.Tx, in plugins
 	return h.service.RestoreInstallation(ctx, tx, in)
 }
 
+// PrepareRestorePlugin reads a plugin's installed manifest before a restore
+// opens its transaction (plugins.Service.PrepareRestore).
+func (h *PluginHandler) PrepareRestorePlugin(ctx context.Context, pluginID string) error {
+	if h == nil || h.service == nil {
+		return plugins.ErrRestoreUnavailable
+	}
+	return h.service.PrepareRestore(ctx, pluginID)
+}
+
 // PluginRestored runs a restored installation's follow-ups: the lifecycle
 // change (EventPluginsChanged, resident reconcile) and the metadata provider
 // chain sync an admin upload performs. Both are idempotent, and a sync that

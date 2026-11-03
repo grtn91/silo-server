@@ -190,6 +190,11 @@ var ErrTemplateNotAvailable = errors.New("this server's collection templates do 
 
 // PluginRestorer is the plugin write path a restore uses.
 type PluginRestorer interface {
+	// PrepareRestorePlugin reads what RestorePlugin needs from outside the
+	// database (the installed manifest, through the plugin archive cache)
+	// before the restore's transaction opens: that cache's lock is held by
+	// readers that wait on the pool.
+	PrepareRestorePlugin(ctx context.Context, pluginID string) error
 	RestorePlugin(ctx context.Context, tx pgx.Tx, in plugins.RestoreInstallationInput) (plugins.RestoreInstallationResult, func(context.Context), error)
 	DecodeStoredConfig(installationID int, key string, stored []byte) (map[string]any, error)
 }

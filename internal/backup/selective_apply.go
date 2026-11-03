@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"maps"
 	"os"
 	"path"
@@ -250,6 +251,9 @@ func (a *applier) apply(ctx context.Context, section, id string) error {
 	a.current++
 	if section == SectionCollections && strings.HasPrefix(id, "artwork:") {
 		a.stageArtwork(ctx, id)
+	}
+	if section == SectionPlugins {
+		a.stagePlugin(ctx, id)
 	}
 	var result applied
 	next := a.clone()
@@ -583,6 +587,19 @@ func (a *applier) restoreLibraryPoster(ctx context.Context, key string, libraryI
 }
 
 // ---- Plugins ----
+
+// stagePlugin reads the plugin's installed manifest before the item's
+// transaction opens. Best effort: RestorePlugin reads it again, inside the
+// transaction, when this did not leave it in the cache.
+func (a *applier) stagePlugin(ctx context.Context, id string) {
+	doc := indexed(a.rs.Plugins, a.rs.lookup().plugins, id)
+	if doc == nil || a.rs.unverified || a.s.targets.Plugins == nil {
+		return
+	}
+	if err := a.s.targets.Plugins.PrepareRestorePlugin(ctx, doc.PluginID); err != nil {
+		slog.WarnContext(ctx, "reading a plugin's manifest before restoring it", "component", "backup", "plugin_id", doc.PluginID, "error", err)
+	}
+}
 
 func (a *applier) applyPlugin(ctx context.Context, tx pgx.Tx, id string) (applied, error) {
 	item := ReportItem{Kind: KindPlugin, Label: id}
