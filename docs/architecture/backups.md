@@ -48,7 +48,14 @@ backups/<server-id>/<UTC time>-<kind>/
   incomplete folder as `in_progress` only while the published active
   operation (see [Status](#status)) is that backup, and `incomplete`
   otherwise. The sweep deletes incomplete folders whose name and newest
-  object are both older than 24 hours.
+  object are both older than 24 hours, and only a folder a complete,
+  error-free listing showed without a manifest object (`folder.noManifest`):
+  deleting a complete backup is the one mistake it must not make. A folder
+  whose manifest is listed but could not be read (a timeout, a destination
+  error) is `unreadable`: listed with that status and the
+  `backup_unreadable` warning, never rotated, not counted toward
+  `backup.keep`, and never swept. A failed listing skips rotation and the
+  sweep for that run.
 
 ### Manifest
 

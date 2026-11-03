@@ -39,6 +39,7 @@ export const BACKUP_STATUS_LABELS: Record<AdminBackupStatus, string> = {
   in_progress: "In progress",
   incomplete: "Incomplete",
   unverified: "Unverified",
+  unreadable: "Unreadable",
 };
 
 /**
