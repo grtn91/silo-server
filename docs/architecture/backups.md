@@ -1199,9 +1199,15 @@ list of every data type is written, and compared for a preview, in one
 set-based statement whatever its length (settings in one per scope);
 personal collections, at most 1,000 an import, are created or merged one
 at a time. An import or restore never leaves a profile with more than
-1,000 personal collections, or 50 with a sync schedule, counting the ones
-it has (read under the account's import lock): past either, a collection
-is left out or created without its schedule, and the result says so. The
+1,000 personal collections, or 50 with a sync schedule, or 16 MB of
+collection rules, display filters, sorts, and sync sources together,
+counting the ones it has (read under the account's import lock): past
+these, a collection is left out or created without its schedule, and the
+result says so. An imported collection's sort and sync source are decoded
+into their types, refusing members they lack, and stored as the editors
+encode them; each list URL its sync fetches goes through its editor's
+canonicalizer (`collectionutil.CanonicalCollectionSource`), and a document
+with any other is refused. The
 collection editor has no such limit. From a backup this server cannot
 verify, personal collections get no sync schedule either
 (`userdata.Target.Unverified`). Once an import or restore commits, a

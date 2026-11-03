@@ -1458,8 +1458,8 @@ func (unknownItems) Resolve(context.Context, string) (string, bool, error) { ret
 // TestCollectionImportKeepsTheProfileQuotaDB: an import counts the personal
 // collections the profile has: it creates none past maxProfileCollections,
 // and none with a sync schedule past maxScheduledCollections, so repeated
-// imports cannot grow either; a backup this server cannot verify restores
-// no schedule at all.
+// imports cannot grow either, nor past the bytes their definitions hold
+// together; a backup this server cannot verify restores no schedule at all.
 func TestCollectionImportKeepsTheProfileQuotaDB(t *testing.T) {
 	pool, _ := testDB(t)
 	ctx := t.Context()
@@ -1504,6 +1504,20 @@ func TestCollectionImportKeepsTheProfileQuotaDB(t *testing.T) {
 			t.Fatalf("unverified %v: imported %+v with %d scheduled, want 1 added, 2 left out, %d scheduled", unverified, res, scheduled(tx), wantScheduled)
 		}
 		_ = tx.Rollback(ctx)
+	}
+	// The profile's collection rules already fill their bytes: nothing
+	// more fits.
+	dbExec(t, pool, `UPDATE user_personal_collections SET query_definition = jsonb_build_object('x', repeat('a', 16 << 20))
+		WHERE id = 'q-' || $1 || '-1'`, sfx)
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+	target := userdata.Target{Owner: userdata.Owner{UserID: user, ProfileID: profile}, Items: unknownItems{}, Now: time.Now(), SameServer: true,
+		Library: func(id int) (int, bool) { return id, true }, Profile: func(string) (string, bool) { return "", false }}
+	if res, err := dt.Import(ctx, tx, target, doc); err != nil || res.Added != 0 || res.LeftOut != 3 {
+		t.Fatalf("imported %+v (%v) over the definition bytes, want nothing added", res, err)
 	}
 }
 

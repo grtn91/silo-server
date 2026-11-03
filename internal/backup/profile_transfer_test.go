@@ -146,9 +146,11 @@ var importerSamples = map[string]importerSample{
 	userdata.Dismissals + " not interested": {`{"home":[],"not_interested":[`, `{"item":"m1","at":` + sampleAt + `}`, `],"dropped_series":[]}`},
 	userdata.Dismissals + " dropped":        {`{"home":[],"not_interested":[],"dropped_series":[`, `{"item":"s1","at":` + sampleAt + `}`, `]}`},
 	userdata.Notifications:                  {`{"muted_series":[`, `{"series":"s1","muted_at":` + sampleAt + `}`, `]}`},
-	userdata.Collections:                    {`{"collections":[`, `{"id":"c1","name":"A","type":"manual","watch_filter":"all","media_filter":"all","items":[],"shared_with":[]}`, `]}`},
-	userdata.Preferences + " settings":      {`{"settings":[`, `{"key":"playback.audio_language","scope":"profile_series","series":"s1","value":"\"en\""}`, `]}`},
-	userdata.Preferences + " audio":         {`{"audio":[`, `{"series":"s1","track_index":1,"language":"en","signature":null,"updated_at":` + sampleAt + `}`, `]}`},
+	userdata.Collections: {`{"collections":[`, `{"id":"c1","name":"A","type":"mdblist","watch_filter":"all","media_filter":"all","items":[],"shared_with":[],` +
+		`"sort_config":{"field":"title","order":"asc"},"source_url":"https://mdblist.com/lists/a/b",` +
+		`"source_config":{"mode":"mdblist_json","url":"https://mdblist.com/lists/a/b","library_ids":[1]}}`, `]}`},
+	userdata.Preferences + " settings": {`{"settings":[`, `{"key":"playback.audio_language","scope":"profile_series","series":"s1","value":"\"en\""}`, `]}`},
+	userdata.Preferences + " audio":    {`{"audio":[`, `{"series":"s1","track_index":1,"language":"en","signature":null,"updated_at":` + sampleAt + `}`, `]}`},
 	userdata.Preferences + " subtitles": {`{"subtitles":[`,
 		`{"series":"s1","language":"en","track_index":1,"external_path":"","mode":"always","show_forced_subtitles":null,"signature":null,"updated_at":` + sampleAt + `}`, `]}`},
 	userdata.Preferences + " library playback": {`{"library_playback":[`,
@@ -158,6 +160,33 @@ var importerSamples = map[string]importerSample{
 	userdata.Preferences + " library sort":   {`{"collection_sort":[`, `{"kind":"library","collection":"c1","field":"title","order":"asc","updated_at":` + sampleAt + `}`, `]}`},
 	userdata.Preferences + " watchlist sort": {`{"collection_sort":[`, `{"kind":"watchlist","collection":"c1","field":"title","order":"asc","updated_at":` + sampleAt + `}`, `]}`},
 	userdata.Preferences + " favorites sort": {`{"collection_sort":[`, `{"kind":"favorites","collection":"c1","field":"title","order":"asc","updated_at":` + sampleAt + `}`, `]}`},
+}
+
+// TestImportedCollectionSourcesAreTheEditors: an imported collection's
+// sort and sync source are stored as the editors encode them, and one the
+// editors would not store is refused when the document is checked: a list
+// URL on loopback or link-local, a mode its type does not sync from, or a
+// member neither type has.
+func TestImportedCollectionSourcesAreTheEditors(t *testing.T) {
+	dt, _ := userDataType(userdata.Collections)
+	doc := func(collection string) json.RawMessage {
+		return json.RawMessage(`{"collections":[{"id":"c1","name":"A","watch_filter":"all","media_filter":"all","items":[],"shared_with":[],` + collection + `}]}`)
+	}
+	if _, err := dt.Validate(doc(`"type":"mdblist","source_url":"https://mdblist.com/lists/a/b","source_config":{"mode":"mdblist_json","url":"https://mdblist.com/lists/a/b"}`)); err != nil {
+		t.Fatalf("an MDBList collection was refused: %v", err)
+	}
+	for name, collection := range map[string]string{
+		"a loopback list":           `"type":"mdblist","source_config":{"mode":"mdblist_json","url":"http://127.0.0.1:8080/lists/a/b"}`,
+		"a link-local source url":   `"type":"mdblist","source_url":"http://169.254.169.254/lists/a","source_config":{}`,
+		"a TMDB list elsewhere":     `"type":"tmdb","source_config":{"mode":"tmdb_list","url":"http://10.0.0.1/list/1"}`,
+		"a manual collection syncs": `"type":"manual","source_config":{"mode":"mdblist_json","url":"https://mdblist.com/lists/a/b"}`,
+		"an unknown source member":  `"type":"tmdb","source_config":{"mode":"tmdb_preset","preset":"popular","endpoint":"http://127.0.0.1/"}`,
+		"an unknown sort member":    `"type":"manual","sort_config":{"field":"title","order":"asc","blob":"x"}`,
+	} {
+		if _, err := dt.Validate(doc(collection)); err == nil {
+			t.Errorf("%s was accepted", name)
+		}
+	}
 }
 
 // TestEveryImporterRefusesDuplicates: each data type's document holds one

@@ -50,11 +50,11 @@ func TestCollectionImportRemapsLibrariesDB(t *testing.T) {
 	doc := collectionsDocument{Collections: []personalCollection{
 		{ID: "c1", Name: "Remapped", Type: "smart", WatchFilter: "all", MediaFilter: "all", Items: []string{}, SharedWith: []string{}, Group: group,
 			QueryDefinition: json.RawMessage(`{"library_ids":[7,8],"match":"all","groups":[]}`), SortConfig: json.RawMessage(`{}`),
-			DisplayQueryDefinition: json.RawMessage(`{"match":"all","groups":[{"match":"all","rules":[{"field":"watched","op":"is","value":false}]}]}`), SourceConfig: json.RawMessage(`{"mode":"tmdb","library_ids":[7]}`)},
+			DisplayQueryDefinition: json.RawMessage(`{"match":"all","groups":[{"match":"all","rules":[{"field":"watched","op":"is","value":false}]}]}`), SourceConfig: json.RawMessage(`{"mode":"","library_ids":[7]}`)},
 		{ID: "c2", Name: "Elsewhere", Type: "smart", WatchFilter: "all", MediaFilter: "all", Items: []string{}, SharedWith: []string{},
 			QueryDefinition: json.RawMessage(`{"library_ids":[8],"match":"all","groups":[]}`), SortConfig: json.RawMessage(`{}`), SourceConfig: json.RawMessage(`{}`)},
 		{ID: "c3", Name: "Source elsewhere", Type: "tmdb", WatchFilter: "all", MediaFilter: "all", Items: []string{}, SharedWith: []string{},
-			QueryDefinition: json.RawMessage(`{}`), SortConfig: json.RawMessage(`{}`), SourceConfig: json.RawMessage(`{"mode":"tmdb","library_ids":[8]}`)},
+			QueryDefinition: json.RawMessage(`{}`), SortConfig: json.RawMessage(`{}`), SourceConfig: json.RawMessage(`{"mode":"tmdb_preset","preset":"popular","library_ids":[8]}`)},
 	}}
 	data, _ := json.Marshal(doc)
 	target := userdata.Target{Owner: userdata.Owner{UserID: userID, ProfileID: profile}, Items: sameItems{}, Now: time.Now(),

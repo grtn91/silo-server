@@ -213,7 +213,8 @@ func decodeCollections(data json.RawMessage) (collectionsDocument, userdata.Summ
 		return doc, sum, err
 	}
 	seen := map[string]bool{}
-	for _, c := range doc.Collections {
+	for i := range doc.Collections {
+		c := &doc.Collections[i]
 		if !userdata.ValidContentID(c.ID) || seen[c.ID] || strings.TrimSpace(c.Name) == "" || !userdata.ValidText(c.Name, 512) ||
 			!userdata.ValidText(c.Description, 8192) || !collectionTypes[c.Type] {
 			return doc, sum, fmt.Errorf("personal collection %q is not valid", c.ID)
@@ -223,6 +224,14 @@ func decodeCollections(data json.RawMessage) (collectionsDocument, userdata.Summ
 			if len(raw) > 0 && !json.Valid(raw) {
 				return doc, sum, fmt.Errorf("personal collection %q carries invalid JSON", c.ID)
 			}
+		}
+		// Its sort and sync source are kept as the editors encode them.
+		var err error
+		if c.SortConfig, err = canonicalSort(c.SortConfig); err != nil {
+			return doc, sum, fmt.Errorf("personal collection %q: %w", c.ID, err)
+		}
+		if c.SourceURL, c.SourceConfig, err = canonicalSource(c.Type, c.SourceURL, c.SourceConfig); err != nil {
+			return doc, sum, fmt.Errorf("personal collection %q: %w", c.ID, err)
 		}
 		if g := c.Group; g != nil && (strings.TrimSpace(g.Slug) == "" || strings.TrimSpace(g.Label) == "" || !groupSortModes[g.DefaultSortMode] ||
 			!userdata.ValidText(g.Label, 512) || !userdata.ValidText(g.Title, 512) || !userdata.ValidText(g.Name, 512) || !userdata.ValidText(g.Slug, 512)) {
@@ -241,7 +250,7 @@ func decodeCollections(data json.RawMessage) (collectionsDocument, userdata.Summ
 			sum.Profiles = append(sum.Profiles, p)
 		}
 		if strings.HasPrefix(c.Poster, posterPrefix) {
-			if !uploadedPoster(c) {
+			if !uploadedPoster(*c) {
 				return doc, sum, fmt.Errorf("personal collection %q names another collection's poster", c.ID)
 			}
 			sum.Blobs = append(sum.Blobs, userdata.Blob{Store: userdata.StoreAssets, Key: c.Poster})
@@ -299,6 +308,10 @@ func (BackupData) Import(ctx context.Context, tx pgx.Tx, target userdata.Target,
 			if err != nil {
 				return res, err
 			}
+			if problem == errOverQuota {
+				res.LeftOut++
+				continue
+			}
 			if problem != "" {
 				res.LeftOut++
 				res.Notes = append(res.Notes, fmt.Sprintf("The collection %q was left out: %s.", c.Name, problem))
@@ -348,28 +361,50 @@ func (BackupData) Import(ctx context.Context, tx pgx.Tx, target userdata.Target,
 const (
 	maxProfileCollections   = 1000
 	maxScheduledCollections = 50
+	// maxProfileDefinitionBytes bounds the rules, display filters, sorts,
+	// and sync sources of a profile's collections together.
+	maxProfileDefinitionBytes = 16 << 20
 )
 
 // collectionQuota is what an import may still add to a profile.
 type collectionQuota struct {
-	collections, scheduled int
+	collections, scheduled, bytes int
 	// unverified withholds every schedule (userdata.Target.Unverified).
 	unverified bool
 	// What the import was refused: collections over the quota, schedules
-	// over theirs, schedules of an unverified backup.
-	overCollections, overScheduled, unverifiedSchedules int
+	// over theirs, schedules of an unverified backup, definitions over the
+	// bytes left.
+	overCollections, overScheduled, unverifiedSchedules, overBytes int
 }
 
 // profileQuota reads what the profile has, under the account lock the
 // import holds (pgstore.LockAccountForImport).
 func profileQuota(ctx context.Context, tx pgx.Tx, target userdata.Target) (*collectionQuota, error) {
-	var have, scheduled int
+	var have, scheduled, size int
 	if err := tx.QueryRow(ctx, `
-		SELECT count(*), count(*) FILTER (WHERE sync_schedule IS NOT NULL AND btrim(sync_schedule) <> '')
-		FROM user_personal_collections WHERE user_id = $1 AND creator_profile_id = $2 AND native`, target.UserID, target.ProfileID).Scan(&have, &scheduled); err != nil {
+		SELECT count(*), count(*) FILTER (WHERE sync_schedule IS NOT NULL AND btrim(sync_schedule) <> ''),
+			coalesce(sum(octet_length(query_definition::text) + octet_length(coalesce(display_query_definition::text, ''))
+				+ octet_length(sort_config::text) + octet_length(source_config::text)), 0)
+		FROM user_personal_collections WHERE user_id = $1 AND creator_profile_id = $2 AND native`, target.UserID, target.ProfileID).Scan(&have, &scheduled, &size); err != nil {
 		return nil, fmt.Errorf("counting personal collections: %w", err)
 	}
-	return &collectionQuota{collections: maxProfileCollections - have, scheduled: maxScheduledCollections - scheduled, unverified: target.Unverified}, nil
+	return &collectionQuota{collections: maxProfileCollections - have, scheduled: maxScheduledCollections - scheduled,
+		bytes: maxProfileDefinitionBytes - size, unverified: target.Unverified}, nil
+}
+
+// errOverQuota is createCollection's problem for a collection over the
+// definition bytes left, which the quota's own note reports.
+const errOverQuota = "over the quota"
+
+// takeBytes counts a new collection's definitions; false when they do not
+// fit what is left.
+func (q *collectionQuota) takeBytes(n int) bool {
+	if n > q.bytes {
+		q.overBytes++
+		return false
+	}
+	q.bytes -= n
+	return true
 }
 
 // take counts one new collection; false when the profile is at the quota.
@@ -406,6 +441,9 @@ func (q *collectionQuota) notes() []string {
 	if q.overScheduled > 0 {
 		out = append(out, fmt.Sprintf("%d collections were created without their sync schedule: a profile has at most %d scheduled collections.", q.overScheduled, maxScheduledCollections))
 	}
+	if q.overBytes > 0 {
+		out = append(out, fmt.Sprintf("%d collections were left out: a profile's collection rules hold at most %d MB together.", q.overBytes, maxProfileDefinitionBytes>>20))
+	}
 	if q.unverifiedSchedules > 0 {
 		out = append(out, fmt.Sprintf("%d collections were created without their sync schedule: schedules are not restored from a backup this server cannot verify.", q.unverifiedSchedules))
 	}
@@ -440,6 +478,9 @@ func createCollection(ctx context.Context, tx pgx.Tx, target userdata.Target, c 
 	def, problem := canonicalDefinition(query, display, c.SortConfig, source)
 	if problem != "" {
 		return problem, nil
+	}
+	if !quota.takeBytes(len(def.query) + len(def.display) + len(def.sort) + len(def.source)) {
+		return errOverQuota, nil
 	}
 	group, err := ensureGroup(ctx, tx, target.UserID, c.Group)
 	if err != nil {
