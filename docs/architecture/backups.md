@@ -456,8 +456,9 @@ segment, backslash, or NUL; no duplicate paths, sections, or item ids;
 `restore-set.json` first; every other file listed in the index with its size
 and digest, and every listed file present; blobs only under their section's
 prefixes and only keys the section references, or variants stored beside a
-referenced artwork original (in its directory and of its revision, or both
-without one; at most 16 per original); documents that decode strictly
+referenced artwork original (in its directory and of its revision, or, for
+the legacy names the writer used, `original.<ext>` and `w<width>.<ext>`,
+both without one; at most 16 per original); documents that decode strictly
 (unknown fields and trailing data refused) and match the index counts; and
 limits on entries (200,000), document size (64 MiB for the collections and
 account documents, 32 MiB for the index, 8 MiB for `libraries.json` and
@@ -492,7 +493,10 @@ one of them is refused when read, so a preview lists a bounded number of
 items. A set's collections list at most 1,000,000 items together. The preview
 cache charges each set what it holds once read: the bytes read, jsonsize's
 estimate of its decoded documents, and its blob index; and it keeps at most
-one set of a backup this server cannot verify, dropping the older one. A
+one set of a backup this server cannot verify, dropping the older one.
+Restored rate limits are written through the rate-limit configuration's
+own checks (`RateLimitHandler.ApplyRateLimitSettingsInTx`), every other
+setting through the admin settings batch, in the item's transaction. A
 restore job claimed while the request that queued it still holds the
 subsystem lock waits up to 10 seconds for it (`lockWithin`) before it
 gives up. A set lists at most the first 100 entries of a section it
