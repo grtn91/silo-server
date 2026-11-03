@@ -1074,7 +1074,7 @@ func TestAuthorityWiderThan(t *testing.T) {
 		{"admin", func(a *accountAuthority) { a.rank = 1 }, true},
 		{"break glass", func(a *accountAuthority) { a.breakGlass = true }, true},
 		{"every library", func(a *accountAuthority) { a.policy.LibraryIDs = nil }, true},
-		{"a profile only the backup has", func(a *accountAuthority) { a.profiles["old"] = profileLimits{} }, false},
+		{"a profile only the backup has", func(a *accountAuthority) { a.profiles["old"] = profileLimits{} }, true},
 		{"not a child", func(a *accountAuthority) {
 			a.profiles["kid"] = with(a.profiles["kid"], func(p *profileLimits) { p.child = false })
 		}, true},

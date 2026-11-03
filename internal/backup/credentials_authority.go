@@ -128,11 +128,10 @@ func readProfileLimits(ctx context.Context, tx pgx.Tx, userID int) (map[string]p
 
 // widerThan reports whether restored grants anything live does not: a
 // higher rank, sign-in or break-glass access live lacks, a wider account
-// policy (access.WiderThan), a library it can see that live cannot, a household manager (a primary profile)
-// without a PIN where every live one has one, or a profile on both sides
-// with a protection or restriction lifted or loosened. A profile only the
-// restored data has is otherwise not compared: the account restores it
-// whatever its credentials.
+// policy (access.WiderThan), a library it can see that live cannot, a
+// household manager (a primary profile) without a PIN where every live one
+// has one, a profile only the restored data has, or a profile on both
+// sides with a protection or restriction lifted or loosened.
 func (restored accountAuthority) widerThan(live accountAuthority) bool {
 	if restored.rank > live.rank || restored.enabled && !live.enabled || restored.breakGlass && !live.breakGlass ||
 		len(access.WiderThan(restored.policy, live.policy)) > 0 || requestsWider(restored.requests, live.requests) ||
@@ -144,8 +143,11 @@ func (restored accountAuthority) widerThan(live accountAuthority) bool {
 			return true
 		}
 	}
+	// A profile only the restored data has (deleted here since) is one a
+	// live credential's holder could select, with whatever protection it
+	// had then: wider.
 	for id, r := range restored.profiles {
-		if l, ok := live.profiles[id]; ok && r.looserThan(l) {
+		if l, ok := live.profiles[id]; !ok || r.looserThan(l) {
 			return true
 		}
 	}
