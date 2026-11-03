@@ -120,7 +120,7 @@ func TestRestoreSetReadStopsWithItsLastPreview(t *testing.T) {
 	defer cancelSecond()
 	results := make(chan error, 2)
 	go func() { _, err := c.get(first, "d", load); results <- err }()
-	<-started
+	await(t, started, "the first preview to start reading")
 	go func() { _, err := c.get(second, "d", load); results <- err }()
 	for deadline := time.Now().Add(10 * time.Second); ; {
 		c.mu.Lock()
@@ -135,7 +135,7 @@ func TestRestoreSetReadStopsWithItsLastPreview(t *testing.T) {
 		runtime.Gosched()
 	}
 	cancelFirst()
-	if err := <-results; !errors.Is(err, context.Canceled) {
+	if err := await(t, results, "the preview that left"); !errors.Is(err, context.Canceled) {
 		t.Fatalf("the preview that left = %v, want canceled", err)
 	}
 	select {
@@ -144,7 +144,7 @@ func TestRestoreSetReadStopsWithItsLastPreview(t *testing.T) {
 	default:
 	}
 	cancelSecond()
-	if err := <-results; !errors.Is(err, context.Canceled) {
+	if err := await(t, results, "the last preview"); !errors.Is(err, context.Canceled) {
 		t.Fatalf("the last preview = %v, want canceled", err)
 	}
 	select {
