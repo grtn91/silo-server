@@ -202,6 +202,8 @@ type DatabaseLoader interface {
 	// ServerID reads the server identity (serveridentity.Key) dbURL's
 	// settings hold, or "" when they hold none.
 	ServerID(ctx context.Context, dbURL string) (string, error)
+	// AccountRollback compares dbURL's accounts with liveURL's, by id.
+	AccountRollback(ctx context.Context, dbURL, liveURL string) (AccountRollback, error)
 }
 
 // clearLostSettings removes, from a restored database taken with another
