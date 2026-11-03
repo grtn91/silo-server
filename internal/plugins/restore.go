@@ -98,7 +98,9 @@ func (s *Service) RestoreInstallation(ctx context.Context, tx pgx.Tx, in Restore
 		return result, nil, ErrPluginNotInstalled
 	}
 	inst := installs[0]
-	_, manifest, err := s.loadForManifestRead(ctx, inst.ID, false)
+	// The installation and its manifest are read through the transaction:
+	// it may hold the pool's last connection.
+	manifest, err := s.readInstalledManifestFrom(ctx, inst, txStore)
 	if err != nil {
 		return result, nil, err
 	}

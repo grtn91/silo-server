@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -127,6 +128,48 @@ func TestRestoreInstallationDB(t *testing.T) {
 				t.Fatalf("restoring again = %+v, %v; want nothing changed", second, err)
 			}
 		})
+	}
+}
+
+// TestRestoreInstallationOnOneConnectionDB: a restore item's transaction
+// may hold a pool's only connection, so RestoreInstallation reads the
+// installation and its manifest through the transaction: with a service
+// that has nothing cached, it finishes instead of waiting on the pool.
+func TestRestoreInstallationOnOneConnectionDB(t *testing.T) {
+	pool := restoreTestPool(t)
+	ctx := t.Context()
+	cipher, err := secret.New([]byte("plugin-restore-test-key-0123456789abcdef"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := newRestoreFixture(t, pool, cipher)
+	pluginID := f.newPluginID()
+	manifest := testPluginManifest(t, pluginID, "1.0.0")
+	archivePath := filepath.Join(t.TempDir(), "plugin.zip")
+	writePluginArchive(t, archivePath, manifest)
+	if _, err := f.svc.installer.InstallLocal(ctx, InstallArchiveRequest{ArchivePath: archivePath}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := pool.Config().Copy()
+	cfg.MaxConns = 1
+	one, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(one.Close)
+	cold := newRestoreFixture(t, one, cipher)
+	done := make(chan error, 1)
+	go func() {
+		_, err := cold.restore(RestoreInstallationInput{PluginID: pluginID, Version: "1.0.0", SourceInstallationID: 1})
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Minute):
+		t.Fatal("RestoreInstallation waited on the pool its transaction holds")
 	}
 }
 

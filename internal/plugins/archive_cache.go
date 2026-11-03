@@ -125,10 +125,46 @@ func (c *ArchiveCache) Manifest(ctx context.Context, installation *Installation)
 	return c.ensure(ctx, installation, true)
 }
 
+// ManifestFrom is Manifest reading a stored archive, when it needs one,
+// through archives (a store bound to the caller's transaction) and never
+// writing one back: inside a transaction that holds a pool's last
+// connection, nothing may wait on the pool.
+func (c *ArchiveCache) ManifestFrom(ctx context.Context, installation *Installation, archives archiveStore) (*pluginv1.PluginManifest, error) {
+	return c.ensureFrom(ctx, installation, true, archives, false)
+}
+
 func (c *ArchiveCache) ensure(
 	ctx context.Context,
 	installation *Installation,
 	trustVerified bool,
+) (*pluginv1.PluginManifest, error) {
+	return c.ensureFrom(ctx, installation, trustVerified, c.archives, true)
+}
+
+// checkStoredArchive requires a stored archive to be the installation's:
+// its checksum, manifest, plugin id, and version.
+func checkStoredArchive(installation *Installation, archive *InstallationArchive, manifestBytes []byte, manifest *pluginv1.PluginManifest) error {
+	if archive.Checksum != manifest.GetChecksum() {
+		return unreadableArchivef("stored plugin archive checksum mismatch for installation %d", installation.ID)
+	}
+	if len(archive.ManifestJSON) > 0 && !bytes.Equal(archive.ManifestJSON, manifestBytes) {
+		return unreadableArchivef("stored plugin manifest mismatch for installation %d", installation.ID)
+	}
+	if manifest.GetPluginId() != installation.PluginID {
+		return unreadableArchivef("stored plugin archive plugin_id %q does not match installation %q", manifest.GetPluginId(), installation.PluginID)
+	}
+	if manifest.GetVersion() != installation.Version {
+		return unreadableArchivef("stored plugin archive version %q does not match installation %q", manifest.GetVersion(), installation.Version)
+	}
+	return nil
+}
+
+func (c *ArchiveCache) ensureFrom(
+	ctx context.Context,
+	installation *Installation,
+	trustVerified bool,
+	archives archiveStore,
+	persist bool,
 ) (*pluginv1.PluginManifest, error) {
 	if installation == nil {
 		return nil, fmt.Errorf("plugin installation is required")
@@ -160,37 +196,24 @@ func (c *ArchiveCache) ensure(
 	// The installed files failed the check; forget any earlier verification.
 	delete(c.verified, installation.ID)
 
-	archive, err := c.archives.GetArchive(ctx, installation.ID)
+	archive, err := archives.GetArchive(ctx, installation.ID)
 	if err != nil {
 		return nil, fmt.Errorf("load stored plugin archive for installation %d: %w", installation.ID, err)
 	}
 
 	reader, manifestBytes, manifest, err := openPluginArchive(archive.Bytes)
 	if err != nil {
-		reader, manifestBytes, manifest, err = c.recoverLegacyBinaryArchive(ctx, installation.ID, archive, err)
+		var persistTo archiveStore
+		if persist {
+			persistTo = archives
+		}
+		reader, manifestBytes, manifest, err = c.recoverLegacyBinaryArchive(ctx, installation.ID, archive, err, persistTo)
 		if err != nil {
 			return nil, unreadableArchivef("open stored plugin archive for installation %d: %w", installation.ID, err)
 		}
 	}
-	if archive.Checksum != manifest.GetChecksum() {
-		return nil, unreadableArchivef("stored plugin archive checksum mismatch for installation %d", installation.ID)
-	}
-	if len(archive.ManifestJSON) > 0 && !bytes.Equal(archive.ManifestJSON, manifestBytes) {
-		return nil, unreadableArchivef("stored plugin manifest mismatch for installation %d", installation.ID)
-	}
-	if manifest.GetPluginId() != installation.PluginID {
-		return nil, unreadableArchivef(
-			"stored plugin archive plugin_id %q does not match installation %q",
-			manifest.GetPluginId(),
-			installation.PluginID,
-		)
-	}
-	if manifest.GetVersion() != installation.Version {
-		return nil, unreadableArchivef(
-			"stored plugin archive version %q does not match installation %q",
-			manifest.GetVersion(),
-			installation.Version,
-		)
+	if err := checkStoredArchive(installation, archive, manifestBytes, manifest); err != nil {
+		return nil, err
 	}
 
 	installDir := filepath.Dir(binaryPath)
@@ -309,6 +332,7 @@ func (c *ArchiveCache) recoverLegacyBinaryArchive(
 	installationID int,
 	archive *InstallationArchive,
 	openErr error,
+	persistTo archiveStore,
 ) (*zip.Reader, []byte, *pluginv1.PluginManifest, error) {
 	if archive == nil || len(archive.ManifestJSON) == 0 || len(archive.Bytes) == 0 {
 		return nil, nil, nil, openErr
@@ -338,7 +362,10 @@ func (c *ArchiveCache) recoverLegacyBinaryArchive(
 	// Persist the repaired archive so future preloads skip recovery, but don't
 	// fail startup over a write error — the in-memory archive is already valid
 	// and recovery will retry on the next preload.
-	if err := c.archives.SaveArchive(ctx, installationID, manifestBytes, manifest.GetChecksum(), archiveBytes); err != nil {
+	if persistTo == nil {
+		return reader, manifestBytes, manifest, nil
+	}
+	if err := persistTo.SaveArchive(ctx, installationID, manifestBytes, manifest.GetChecksum(), archiveBytes); err != nil {
 		slog.WarnContext(
 			ctx,
 			"failed to persist recovered legacy plugin archive; will retry on next preload",

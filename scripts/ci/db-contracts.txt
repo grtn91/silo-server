@@ -790,8 +790,10 @@
 ./internal/backup TestTemplateCollectionsAndHomeSectionsDB
 ./internal/backup TestRestoredLibrarySectionsWaitForTheRestoreDB
 ./internal/backup TestManagedSectionPointedElsewhereIsRestoredDB
+./internal/backup TestSelectiveRestoreOnOneConnectionDB
 ./internal/backup TestIdentityTwinsRestoreOneToOneDB
 ./internal/plugins TestRestoreInstallationDB
+./internal/plugins TestRestoreInstallationOnOneConnectionDB
 ./internal/adminjob TestBackupRestoreFencingDB
 ./internal/catalog TestGroupingWaitsForTheEditorDB
 ./internal/api/handlers TestLibraryRestoredReportsFailedSetupDB

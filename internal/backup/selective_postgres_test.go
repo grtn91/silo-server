@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -199,6 +200,12 @@ type selectiveFixture struct {
 func newSelectiveFixture(t *testing.T) *selectiveFixture {
 	t.Helper()
 	pool, dsn := backuptest.Database(t)
+	return newSelectiveFixtureOn(t, pool, dsn)
+}
+
+// newSelectiveFixtureOn is newSelectiveFixture with every part on pool.
+func newSelectiveFixtureOn(t *testing.T, pool *pgxpool.Pool, dsn string) *selectiveFixture {
+	t.Helper()
 	tools := testTools(t)
 	masterKey := []byte("selective-restore-test-key-0123456789")
 	cipher, err := secret.New(masterKey)
@@ -1309,5 +1316,67 @@ func checkChangesNothing(t *testing.T, again *SelectiveReport) {
 		if item.Outcome == OutcomeRestored || item.Outcome == OutcomeFailed {
 			t.Fatalf("restoring again: %s %s", item.ID, item.Outcome)
 		}
+	}
+}
+
+// TestSelectiveRestoreOnOneConnectionDB: Silo may run with a pool of one
+// connection, and a restore item's fenced transaction holds it, so nothing
+// an item does may wait on the pool. A restore of every item a preview
+// offers, libraries, settings, collections with their template and
+// artwork, and page sections, runs on such a pool with nothing cached and
+// finishes; any pool use inside an item would hang until the deadline.
+func TestSelectiveRestoreOnOneConnectionDB(t *testing.T) {
+	_, dsn := backuptest.Database(t)
+	cfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.MaxConns = 1
+	pool, err := pgxpool.NewWithConfig(t.Context(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	f := newSelectiveFixtureOn(t, pool, dsn)
+	wirePageTargets(f, new(bool), &[]string{})
+	seed := seedSelective(t, f.pool, f.settings, f.store)
+	pages := seedPages(t, f)
+	source, err := backupUnderLock(t, f.svc, KindManual)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.lose(t, seed)
+	f.losePages(t, pages)
+	// A fresh service: no restore set, settings, or installation cached.
+	targets := f.svc.targets
+	f.svc = New(f.svc.opts)
+	f.svc.SetRestoreTargets(targets)
+	preview, err := f.svc.Preview(t.Context(), source.ID, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	selection := map[string][]string{}
+	for _, section := range preview.Sections {
+		for _, item := range section.Items {
+			if item.Selectable {
+				selection[section.ID] = append(selection[section.ID], item.ID)
+			}
+		}
+	}
+	if len(selection[SectionLibraries]) == 0 || len(selection[SectionCollections]) == 0 || len(selection[SectionHomeSections]) == 0 {
+		t.Fatalf("selection %v leaves out a section", selection)
+	}
+	done := make(chan *SelectiveReport, 1)
+	go func() {
+		report, _ := f.restore(t, source.ID, preview.Digest, selection, &testFence{pool: f.pool})
+		done <- report
+	}()
+	select {
+	case report := <-done:
+		if report == nil || report.Error != "" || report.Counts[OutcomeFailed] != 0 {
+			t.Fatalf("restore on one connection = %+v", report)
+		}
+	case <-time.After(2 * time.Minute):
+		t.Fatal("a restore item waited on the pool its own transaction holds")
 	}
 }
