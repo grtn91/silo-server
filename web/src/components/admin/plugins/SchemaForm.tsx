@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 
-import { ArrowDown, ArrowUp, Loader2, Plus } from "lucide-react";
+import { ArrowDown, ArrowUp, Loader2, Plus, Trash2 } from "lucide-react";
 
 import type { PluginAdminForm, PluginAdminFormField, PluginAdminFormSection } from "@/api/types";
 import {
@@ -24,10 +24,12 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Switch } from "@/components/ui/switch";
 import { useT } from "@/i18n";
 
+import { OrderedMultiSelect } from "./OrderedMultiSelect";
 import {
   addSlots,
   effectiveValue,
   evaluateShowWhen,
+  removeSlotValues,
   swapSlotValues,
   validateSchemaValues,
   type SchemaOption,
@@ -132,6 +134,7 @@ function SchemaFormSection({
   addButton,
   onMoveUp,
   onMoveDown,
+  onRemove,
 }: {
   section: PluginAdminFormSection;
   values: Record<string, unknown>;
@@ -144,6 +147,8 @@ function SchemaFormSection({
   /** Trade places with the slot before or after; set only for a list's slots that have one. */
   onMoveUp?: () => void;
   onMoveDown?: () => void;
+  /** Remove this slot from its list; set only for a list's slots. */
+  onRemove?: () => void;
 }) {
   // null = operator hasn't toggled; fall back to collapsed_default. forceOpen
   // (the section has unresolved errors) always wins so setup can't be hidden.
@@ -190,6 +195,17 @@ function SchemaFormSection({
         onClick={onMoveDown}
       >
         <ArrowDown aria-hidden="true" />
+      </Button>
+      <Button
+        type="button"
+        size="icon-xs"
+        variant="ghost"
+        disabled={!onRemove}
+        aria-label={t("web.admin.settings.requests.shared.delete")}
+        title={t("web.admin.settings.requests.shared.delete")}
+        onClick={onRemove}
+      >
+        <Trash2 aria-hidden="true" />
       </Button>
     </>
   ) : null;
@@ -379,6 +395,17 @@ export function SchemaForm({
       }
       const current = effectiveValue(field, values);
       const selected = Array.isArray(current) ? current.map((v) => String(v)) : [];
+      if (field.ordered && (options.length > 0 || selected.length > 0)) {
+        return (
+          <OrderedMultiSelect
+            options={options}
+            selected={selected}
+            onChange={(next) => setField(field.key, next)}
+            disabled={locked}
+            describedBy={describedBy}
+          />
+        );
+      }
       if (options.length === 0) {
         return (
           <p className="text-muted-foreground rounded-md border border-dashed px-3 py-2 text-xs">
@@ -575,6 +602,20 @@ export function SchemaForm({
     return () => onChange(swapSlotValues(section, other, values));
   }
 
+  // Removes a slot from its list: the shown slots after it move up, and the
+  // list shows one slot fewer unless this was its only one.
+  function slotRemover(section: PluginAdminFormSection): (() => void) | undefined {
+    const group = section.add_group;
+    if (!group) return undefined;
+    const shown = (descriptor.sections ?? []).filter(
+      (candidate) => candidate.add_group === group && !slots.hidden.has(candidate.key),
+    );
+    return () => {
+      setRevealedSlots((current) => ({ ...current, [group]: Math.max(1, shown.length - 1) }));
+      onChange(removeSlotValues(shown, shown.indexOf(section), values));
+    };
+  }
+
   const sections = descriptor.sections ?? [];
   const groupedKeys = new Set<string>();
   for (const section of sections) {
@@ -610,6 +651,7 @@ export function SchemaForm({
             addButton={renderAddButton(section)}
             onMoveUp={slotMover(section, -1)}
             onMoveDown={slotMover(section, 1)}
+            onRemove={slotRemover(section)}
           />
         ))}
     </div>

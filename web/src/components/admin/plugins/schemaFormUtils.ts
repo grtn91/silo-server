@@ -348,6 +348,31 @@ export function swapSlotValues(
   return next;
 }
 
+/**
+ * The values after one slot of a list is removed. `slots` are the list's
+ * shown slots in order. The slots after the removed one move up a place, by
+ * the position of their fields as in swapSlotValues, and the last shown slot
+ * is emptied, which leaves its fields on their defaults.
+ */
+export function removeSlotValues(
+  slots: { field_keys: string[] }[],
+  index: number,
+  values: Record<string, unknown>,
+): Record<string, unknown> {
+  const next = { ...values };
+  for (let i = index; i < slots.length; i++) {
+    const slot = slots[i];
+    const following = slots[i + 1];
+    if (!slot) continue;
+    slot.field_keys.forEach((key, position) => {
+      const from = following?.field_keys[position];
+      if (from === undefined) delete next[key];
+      else next[key] = values[from];
+    });
+  }
+  return next;
+}
+
 export type BuildSchemaValuesOptions = {
   /**
    * Send an emptied non-secret field as an explicit clear ("" for a string

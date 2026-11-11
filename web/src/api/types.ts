@@ -3957,6 +3957,8 @@ export interface PluginAdminFormField {
   show_when?: PluginAdminFormCondition[];
   validation?: PluginAdminFormValidation;
   exclusive_group_field?: string;
+  /** The order of a multi-select's values matters; the form lets the admin arrange them. */
+  ordered?: boolean;
   /**
    * Names a host-known value this field can be populated from in one click.
    * Used by autoscan source config so a path field can be filled from Silo's

@@ -39,6 +39,8 @@ type AdminFormFieldView struct {
 	ShowWhen            []AdminFormConditionView `json:"show_when,omitempty"`
 	Validation          *AdminFormValidationView `json:"validation,omitempty"`
 	ExclusiveGroupField string                   `json:"exclusive_group_field,omitempty"`
+	// Ordered says the order of a multi-select's values matters.
+	Ordered bool `json:"ordered,omitempty"`
 }
 
 type AdminFormOptionView struct {
@@ -126,7 +128,7 @@ func AdminFormViewFromProto(form *pluginv1.AdminFormDescriptor) *AdminFormView {
 			Placeholder: field.GetPlaceholder(), Required: field.GetRequired(), Secret: field.GetSecret(),
 			Multiline: field.GetMultiline(), DefaultValue: defaultValue, Options: options, Rows: field.GetRows(),
 			DynamicOptions: field.GetDynamicOptions(), ShowWhen: adminFormConditionViews(field.GetShowWhen()),
-			Validation: validation, ExclusiveGroupField: field.GetExclusiveGroupField(),
+			Validation: validation, ExclusiveGroupField: field.GetExclusiveGroupField(), Ordered: field.GetOrdered(),
 		})
 	}
 	sections := make([]AdminFormSectionView, 0, len(form.GetSections()))

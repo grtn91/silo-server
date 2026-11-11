@@ -4,6 +4,8 @@ import type { PluginAdminForm, PluginAdminFormField } from "@/api/types";
 import { describe, expect, it } from "vitest";
 import {
   addSlots,
+  removeSlotValues,
+  swapSlotValues,
   buildSchemaValues,
   coerceFieldValue,
   parseFieldTypes,
@@ -351,5 +353,37 @@ describe("addSlots", () => {
     const all = addSlots(slotted, {}, { groups: 3 });
     expect(all.hidden.size).toBe(0);
     expect(all.addAfter.size).toBe(0);
+  });
+});
+
+describe("slot values", () => {
+  const slots = [1, 2, 3].map((n) => ({ field_keys: [`g${n}_name`, `g${n}_folders`] }));
+  const values = {
+    g1_name: "one",
+    g1_folders: ["/a"],
+    g2_name: "two",
+    g3_name: "three",
+    g3_folders: ["/c"],
+    other: true,
+  };
+
+  it("trades two slots' values by field position", () => {
+    expect(swapSlotValues(slots[0]!, slots[1]!, values)).toEqual({
+      ...values,
+      g1_name: "two",
+      g1_folders: undefined,
+      g2_name: "one",
+      g2_folders: ["/a"],
+    });
+  });
+
+  it("removes a slot by moving the later ones up and emptying the last", () => {
+    expect(removeSlotValues(slots, 1, values)).toEqual({
+      g1_name: "one",
+      g1_folders: ["/a"],
+      g2_name: "three",
+      g2_folders: ["/c"],
+      other: true,
+    });
   });
 });

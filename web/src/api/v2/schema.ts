@@ -19932,6 +19932,8 @@ export interface components {
       label: string;
       multiline: boolean;
       options: components["schemas"]["AdminFormOption"][];
+      /** @description The order of a multi-select's values matters. The form shows the chosen values as a list that can be put in order. */
+      ordered?: boolean;
       placeholder?: string;
       required: boolean;
       /** Format: int32 */

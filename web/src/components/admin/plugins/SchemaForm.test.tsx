@@ -339,8 +339,61 @@ describe("SchemaForm add groups", () => {
     expect(screen.getByText("First name")).toBeInTheDocument();
   });
 
+  it("removes a slot: the ones after it move up and the list gets shorter", () => {
+    const onChange = vi.fn();
+    const { rerender } = render(
+      <SchemaForm
+        descriptor={slotted}
+        values={{ slot_1_name: "one", slot_2_name: "two" }}
+        onChange={onChange}
+      />,
+    );
+    fireEvent.click(screen.getAllByRole("button", { name: "Delete" })[0]!);
+    expect(onChange).toHaveBeenCalledWith({ slot_1_name: "two" });
+    rerender(
+      <SchemaForm descriptor={slotted} values={{ slot_1_name: "two" }} onChange={onChange} />,
+    );
+    expect(screen.queryByText("Second name")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Add slot" })).toBeInTheDocument();
+  });
+
   it("shows a slot that already holds a value", () => {
     render(<SchemaForm descriptor={slotted} values={{ slot_2_name: "x" }} onChange={vi.fn()} />);
     expect(screen.getByText("Second name")).toBeInTheDocument();
+  });
+});
+
+describe("SchemaForm ordered multi-select", () => {
+  const ordered: PluginAdminForm = {
+    fields: [
+      field("folders", "Folders", "MULTI_SELECT", {
+        ordered: true,
+        options: [
+          { value: "/a", label: "Disk A" },
+          { value: "/b", label: "Disk B" },
+          { value: "/c", label: "Disk C" },
+        ],
+      }),
+    ],
+  };
+
+  it("lists the chosen values in their order and adds a value at the end", () => {
+    const onChange = vi.fn();
+    render(
+      <SchemaForm descriptor={ordered} values={{ folders: ["/c", "/a"] }} onChange={onChange} />,
+    );
+    const rows = screen.getAllByRole("listitem").map((row) => row.textContent);
+    expect(rows).toEqual(["1Disk C", "2Disk A"]);
+    fireEvent.click(screen.getByRole("button", { name: "Disk B" }));
+    expect(onChange).toHaveBeenCalledWith({ folders: ["/c", "/a", "/b"] });
+  });
+
+  it("removes a chosen value", () => {
+    const onChange = vi.fn();
+    render(
+      <SchemaForm descriptor={ordered} values={{ folders: ["/c", "/a"] }} onChange={onChange} />,
+    );
+    fireEvent.click(screen.getAllByRole("button", { name: "Delete" })[0]!);
+    expect(onChange).toHaveBeenCalledWith({ folders: ["/a"] });
   });
 });
