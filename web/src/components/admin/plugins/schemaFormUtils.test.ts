@@ -3,6 +3,7 @@
 import type { PluginAdminForm, PluginAdminFormField } from "@/api/types";
 import { describe, expect, it } from "vitest";
 import {
+  addSlots,
   buildSchemaValues,
   coerceFieldValue,
   parseFieldTypes,
@@ -295,5 +296,60 @@ describe("buildSchemaValues explicit clears", () => {
       ca_pem: "",
       max_age: null,
     });
+  });
+});
+
+describe("addSlots", () => {
+  const slotSection = (n: number) => ({
+    key: `group_${n}`,
+    title: `Group ${n}`,
+    collapsible: false,
+    collapsed_default: false,
+    field_keys: [`group_${n}_name`, `group_${n}_folders`, `group_${n}_mode`],
+    add_group: "groups",
+    add_label: "Add group",
+  });
+  const slotFields = (n: number): PluginAdminFormField[] => [
+    field(`group_${n}_name`, "Name", "TEXT"),
+    field(`group_${n}_folders`, "Folders", "MULTI_SELECT", { dynamic_options: true }),
+    field(`group_${n}_mode`, "Mode", "SELECT", {
+      default_value: "in_order",
+      options: [
+        { value: "in_order", label: "In order" },
+        { value: "distribute", label: "Most free space" },
+      ],
+    }),
+  ];
+  const slotted: PluginAdminForm = {
+    fields: [1, 2, 3].flatMap(slotFields),
+    sections: [1, 2, 3].map(slotSection),
+  };
+
+  it("shows only the first slot of an empty list, followed by the add button", () => {
+    const slots = addSlots(slotted, {});
+    expect([...slots.hidden]).toEqual(["group_2", "group_3"]);
+    expect(slots.addAfter.get("group_1")).toEqual({ group: "groups", label: "Add group" });
+  });
+
+  it("shows every slot up to the last one in use", () => {
+    const slots = addSlots(slotted, { group_2_folders: ["/a"] });
+    expect([...slots.hidden]).toEqual(["group_3"]);
+    expect([...slots.addAfter.keys()]).toEqual(["group_2"]);
+  });
+
+  it("does not count a default value or an empty one as use", () => {
+    const slots = addSlots(slotted, {
+      group_2_mode: "in_order",
+      group_3_name: "  ",
+      group_3_folders: [],
+    });
+    expect([...slots.hidden]).toEqual(["group_2", "group_3"]);
+  });
+
+  it("shows the slots the admin asked for and drops the button on the last", () => {
+    expect([...addSlots(slotted, {}, { groups: 2 }).hidden]).toEqual(["group_3"]);
+    const all = addSlots(slotted, {}, { groups: 3 });
+    expect(all.hidden.size).toBe(0);
+    expect(all.addAfter.size).toBe(0);
   });
 });

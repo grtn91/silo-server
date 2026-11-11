@@ -151,8 +151,8 @@ github.com/gorilla/websocket v1.5.3 h1:saDtZ6Pbx/0u+bgYQ3q96pZgCzfhKXGPqt7kZ72aN
 github.com/gorilla/websocket v1.5.3/go.mod h1:YR8l580nyteQvAITg2hZ9XVh4b55+EU/adAjf1fMHhE=
 github.com/grpc-ecosystem/grpc-gateway/v2 v2.29.0 h1:5VipnvEpbqr2gA2VbM+nYVbkIF28c5ZQfqCBQ5g2xfk=
 github.com/grpc-ecosystem/grpc-gateway/v2 v2.29.0/go.mod h1:Hyl3n6Twe1hvtd9XUXDec4pTvgMSEixRuQKPTMH2bNs=
-github.com/grtn91/silo-plugin-sdk v0.32.2-0.20261111162054-6349f38bd415 h1:Hd76ckWisVLd+q/+SCyVKACQrq128i+gQS1b+p3IyyE=
-github.com/grtn91/silo-plugin-sdk v0.32.2-0.20261111162054-6349f38bd415/go.mod h1:+r4X2TAiB9Gk22sUj1gFWUj65lll1P1/dMS+Ncvy3Y0=
+github.com/grtn91/silo-plugin-sdk v0.32.2-0.20261111200612-fee6f26ddfbc h1:ws6voWvn5wihAoD7skTI9gt2cun39Dp/BC+5hq+SC58=
+github.com/grtn91/silo-plugin-sdk v0.32.2-0.20261111200612-fee6f26ddfbc/go.mod h1:+r4X2TAiB9Gk22sUj1gFWUj65lll1P1/dMS+Ncvy3Y0=
 github.com/h2non/bimg v1.1.9 h1:WH20Nxko9l/HFm4kZCA3Phbgu2cbHvYzxwxn9YROEGg=
 github.com/h2non/bimg v1.1.9/go.mod h1:R3+UiYwkK4rQl6KVFTOFJHitgLbZXBZNFh2cv3AEbp8=
 github.com/hashicorp/go-hclog v1.6.3 h1:Qr2kF+eVWjTiYmU7Y31tYlP1h0q/X3Nl3tPGdaB11/k=

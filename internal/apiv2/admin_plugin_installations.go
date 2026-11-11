@@ -108,6 +108,8 @@ type AdminPluginFormSection struct {
 	CollapsedDefault bool                 `json:"collapsed_default"`
 	FieldKeys        []string             `json:"field_keys"`
 	ShowWhen         []AdminFormCondition `json:"show_when"`
+	AddGroup         string               `json:"add_group,omitempty" doc:"Sections with the same add_group are the slots of one list. The form shows the slots in use and a button that reveals the next."`
+	AddLabel         string               `json:"add_label,omitempty" doc:"The text of the button that reveals the next slot."`
 }
 type AdminPluginForm struct {
 	Fields      []AdminPluginFormField   `json:"fields"`
@@ -302,7 +304,7 @@ func adminPluginFormOf(f *plugins.AdminFormView) (*AdminPluginForm, error) {
 		out.Fields = append(out.Fields, item)
 	}
 	for _, s := range f.Sections {
-		out.Sections = append(out.Sections, AdminPluginFormSection{Key: s.Key, Title: s.Title, Description: s.Description, Collapsible: s.Collapsible, CollapsedDefault: s.CollapsedDefault, FieldKeys: NonNil(s.FieldKeys), ShowWhen: adminPluginFormConditionsOf(s.ShowWhen)})
+		out.Sections = append(out.Sections, AdminPluginFormSection{Key: s.Key, Title: s.Title, Description: s.Description, Collapsible: s.Collapsible, CollapsedDefault: s.CollapsedDefault, FieldKeys: NonNil(s.FieldKeys), ShowWhen: adminPluginFormConditionsOf(s.ShowWhen), AddGroup: s.AddGroup, AddLabel: s.AddLabel})
 	}
 	return out, nil
 }

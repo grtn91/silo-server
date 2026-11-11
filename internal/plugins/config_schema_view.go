@@ -70,6 +70,10 @@ type AdminFormSectionView struct {
 	CollapsedDefault bool                     `json:"collapsed_default"`
 	FieldKeys        []string                 `json:"field_keys"`
 	ShowWhen         []AdminFormConditionView `json:"show_when,omitempty"`
+	// AddGroup names the list this section is one slot of, and AddLabel the
+	// button that reveals the next slot. Empty for an ordinary section.
+	AddGroup string `json:"add_group,omitempty"`
+	AddLabel string `json:"add_label,omitempty"`
 }
 
 func ConfigSchemaViews(schemas []*pluginv1.ConfigSchema) []ConfigSchemaView {
@@ -134,6 +138,7 @@ func AdminFormViewFromProto(form *pluginv1.AdminFormDescriptor) *AdminFormView {
 			Key: section.GetKey(), Title: section.GetTitle(), Description: section.GetDescription(),
 			Collapsible: section.GetCollapsible(), CollapsedDefault: section.GetCollapsedDefault(),
 			FieldKeys: append([]string(nil), section.GetFieldKeys()...), ShowWhen: adminFormConditionViews(section.GetShowWhen()),
+			AddGroup: section.GetAddGroup(), AddLabel: section.GetAddLabel(),
 		})
 	}
 	return &AdminFormView{Fields: fields, SubmitLabel: form.GetSubmitLabel(), Sections: sections}

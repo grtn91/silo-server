@@ -1,8 +1,14 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 
-import { Loader2 } from "lucide-react";
+import { ArrowDown, ArrowUp, Loader2, Plus } from "lucide-react";
 
 import type { PluginAdminForm, PluginAdminFormField, PluginAdminFormSection } from "@/api/types";
+import {
+  Accordion,
+  AccordionContent,
+  AccordionItem,
+  AccordionTrigger,
+} from "@/components/ui/accordion";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -19,8 +25,10 @@ import { Switch } from "@/components/ui/switch";
 import { useT } from "@/i18n";
 
 import {
+  addSlots,
   effectiveValue,
   evaluateShowWhen,
+  swapSlotValues,
   validateSchemaValues,
   type SchemaOption,
 } from "./schemaFormUtils";
@@ -121,6 +129,9 @@ function SchemaFormSection({
   forceOpen,
   expanded,
   renderFields,
+  addButton,
+  onMoveUp,
+  onMoveDown,
 }: {
   section: PluginAdminFormSection;
   values: Record<string, unknown>;
@@ -128,6 +139,11 @@ function SchemaFormSection({
   forceOpen: boolean;
   expanded: boolean;
   renderFields: (keys: string[]) => React.ReactNode;
+  /** The button that reveals the next slot, when this is a list's last shown one. */
+  addButton?: React.ReactNode;
+  /** Trade places with the slot before or after; set only for a list's slots that have one. */
+  onMoveUp?: () => void;
+  onMoveDown?: () => void;
 }) {
   // null = operator hasn't toggled; fall back to collapsed_default. forceOpen
   // (the section has unresolved errors) always wins so setup can't be hidden.
@@ -138,25 +154,106 @@ function SchemaFormSection({
     return null;
   }
 
-  const collapsible = section.collapsible && !expanded;
+  // A list's slots stay collapsible in a form that opens its sections: a
+  // long list is the reason to fold them.
+  const isSlot = Boolean(section.add_group);
+  const collapsible = section.collapsible && (!expanded || isSlot);
+  // A slot whose first field is its name shows the name in its header, so a
+  // folded slot can be told from the others.
+  const first = isSlot ? fields.find((field) => field.key === section.field_keys[0]) : undefined;
+  const firstValue = first?.control === "TEXT" ? values[first.key] : undefined;
+  const slotName = typeof firstValue === "string" ? firstValue.trim() : "";
+  const heading = slotName ? `${section.title}: ${slotName}` : section.title;
   const open = forceOpen || (userOpen ?? !section.collapsed_default);
   const showFields = collapsible ? open : true;
 
+  const moveButtons = isSlot ? (
+    <>
+      <Button
+        type="button"
+        size="icon-xs"
+        variant="ghost"
+        disabled={!onMoveUp}
+        aria-label={t("web.admin.settings.requests.list.moveUp")}
+        title={t("web.admin.settings.requests.list.moveUp")}
+        onClick={onMoveUp}
+      >
+        <ArrowUp aria-hidden="true" />
+      </Button>
+      <Button
+        type="button"
+        size="icon-xs"
+        variant="ghost"
+        disabled={!onMoveDown}
+        aria-label={t("web.admin.settings.requests.list.moveDown")}
+        title={t("web.admin.settings.requests.list.moveDown")}
+        onClick={onMoveDown}
+      >
+        <ArrowDown aria-hidden="true" />
+      </Button>
+    </>
+  ) : null;
+
+  // A list's slot folds as an accordion: the whole header is the trigger.
+  // The move buttons sit beside the trigger, since a button cannot hold one.
+  if (isSlot && collapsible) {
+    return (
+      <>
+        <section className="border-border/70 bg-muted/10 rounded-lg border">
+          <Accordion
+            type="single"
+            collapsible
+            value={open ? section.key : ""}
+            onValueChange={(value) => setUserOpen(value === section.key)}
+          >
+            <AccordionItem value={section.key} className="border-b-0">
+              <div className="flex items-center gap-1 pe-3 [&>h3]:min-w-0 [&>h3]:flex-1">
+                <AccordionTrigger className="items-center px-4 py-3 hover:no-underline">
+                  <span className="grid gap-0.5">
+                    <span className="text-foreground text-sm font-semibold">{heading}</span>
+                    {section.description ? (
+                      <span className="text-muted-foreground text-xs leading-relaxed font-normal">
+                        {section.description}
+                      </span>
+                    ) : null}
+                  </span>
+                </AccordionTrigger>
+                {moveButtons}
+              </div>
+              <AccordionContent className="px-4 pb-4">
+                {renderFields(section.field_keys)}
+              </AccordionContent>
+            </AccordionItem>
+          </Accordion>
+        </section>
+        {addButton}
+      </>
+    );
+  }
+
   return (
-    <section className="border-border/70 bg-muted/10 space-y-3 rounded-lg border p-4">
-      <div className="flex items-center justify-between gap-2">
-        <div className="space-y-0.5">
-          <Label className="text-foreground text-sm font-semibold">{section.title}</Label>
-          <FieldDescription text={section.description} />
+    <>
+      <section className="border-border/70 bg-muted/10 space-y-3 rounded-lg border p-4">
+        <div className="flex items-center justify-between gap-2">
+          <div className="space-y-0.5">
+            <Label className="text-foreground text-sm font-semibold">{heading}</Label>
+            <FieldDescription text={section.description} />
+          </div>
+          <div className="flex shrink-0 items-center gap-1">
+            {moveButtons}
+            {collapsible ? (
+              <Button type="button" size="xs" variant="ghost" onClick={() => setUserOpen(!open)}>
+                {open
+                  ? t("web.common.schemaForm.hideSection")
+                  : t("web.common.schemaForm.showSection")}
+              </Button>
+            ) : null}
+          </div>
         </div>
-        {collapsible ? (
-          <Button type="button" size="xs" variant="ghost" onClick={() => setUserOpen(!open)}>
-            {open ? t("web.common.schemaForm.hideSection") : t("web.common.schemaForm.showSection")}
-          </Button>
-        ) : null}
-      </div>
-      {showFields ? renderFields(section.field_keys) : null}
-    </section>
+        {showFields ? renderFields(section.field_keys) : null}
+      </section>
+      {addButton}
+    </>
   );
 }
 
@@ -175,6 +272,12 @@ export function SchemaForm({
 }: Props) {
   const t = useT();
   const hidden = useMemo(() => new Set(hiddenKeys), [hiddenKeys]);
+  // How many slots of each add group the admin has asked for with its button.
+  const [revealedSlots, setRevealedSlots] = useState<Record<string, number>>({});
+  const slots = useMemo(
+    () => addSlots(descriptor, values, revealedSlots),
+    [descriptor, values, revealedSlots],
+  );
   const byKey = useMemo(() => {
     const map = new Map<string, PluginAdminFormField>();
     for (const field of descriptor.fields) {
@@ -438,6 +541,40 @@ export function SchemaForm({
     return <div className="grid gap-4">{nodes}</div>;
   }
 
+  // The button after a list's last shown slot. It reveals the next one.
+  function renderAddButton(section: PluginAdminFormSection): React.ReactNode {
+    const add = slots.addAfter.get(section.key);
+    if (!add) return null;
+    const shown = (descriptor.sections ?? []).filter(
+      (candidate) => candidate.add_group === add.group && !slots.hidden.has(candidate.key),
+    ).length;
+    return (
+      <div>
+        <Button
+          type="button"
+          size="sm"
+          variant="outline"
+          onClick={() => setRevealedSlots((current) => ({ ...current, [add.group]: shown + 1 }))}
+        >
+          <Plus aria-hidden="true" />
+          {add.label}
+        </Button>
+      </div>
+    );
+  }
+
+  // Trades a slot's values with the shown slot before (-1) or after (+1) it
+  // in its list. Undefined when there is none.
+  function slotMover(section: PluginAdminFormSection, step: -1 | 1): (() => void) | undefined {
+    if (!section.add_group) return undefined;
+    const shown = (descriptor.sections ?? []).filter(
+      (candidate) => candidate.add_group === section.add_group && !slots.hidden.has(candidate.key),
+    );
+    const other = shown[shown.indexOf(section) + step];
+    if (!other) return undefined;
+    return () => onChange(swapSlotValues(section, other, values));
+  }
+
   const sections = descriptor.sections ?? [];
   const groupedKeys = new Set<string>();
   for (const section of sections) {
@@ -458,7 +595,9 @@ export function SchemaForm({
     <div className="grid gap-5">
       {ungroupedFields.length > 0 ? renderFieldList(ungroupedFields) : null}
       {sections
-        .filter((section) => resolveKeys(section.field_keys).length > 0)
+        .filter(
+          (section) => resolveKeys(section.field_keys).length > 0 && !slots.hidden.has(section.key),
+        )
         .map((section) => (
           <SchemaFormSection
             key={section.key}
@@ -468,6 +607,9 @@ export function SchemaForm({
             forceOpen={section.field_keys.some((key) => mergedErrors[key] != null)}
             expanded={expandSections}
             renderFields={(keys) => renderFieldList(resolveKeys(keys))}
+            addButton={renderAddButton(section)}
+            onMoveUp={slotMover(section, -1)}
+            onMoveDown={slotMover(section, 1)}
           />
         ))}
     </div>

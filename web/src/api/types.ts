@@ -3935,6 +3935,10 @@ export interface PluginAdminFormSection {
   collapsed_default: boolean;
   field_keys: string[];
   show_when?: PluginAdminFormCondition[];
+  /** Sections with the same add_group are the slots of one list the admin grows. */
+  add_group?: string;
+  /** The text of the button that reveals the next slot. */
+  add_label?: string;
 }
 
 export interface PluginAdminFormField {

@@ -16919,6 +16919,14 @@
       "AdminPluginFormSection": {
         "additionalProperties": false,
         "properties": {
+          "add_group": {
+            "description": "Sections with the same add_group are the slots of one list. The form shows the slots in use and a button that reveals the next.",
+            "type": "string"
+          },
+          "add_label": {
+            "description": "The text of the button that reveals the next slot.",
+            "type": "string"
+          },
           "collapsed_default": {
             "type": "boolean"
           },
