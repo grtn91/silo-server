@@ -19932,6 +19932,8 @@ export interface components {
       label: string;
       multiline: boolean;
       options: components["schemas"]["AdminFormOption"][];
+      /** @description The order of a multi-select's values matters. The form shows the chosen values as a list that can be put in order. */
+      ordered?: boolean;
       placeholder?: string;
       required: boolean;
       /** Format: int32 */
@@ -19941,6 +19943,10 @@ export interface components {
       validation?: components["schemas"]["AdminPluginFormValidation"];
     };
     AdminPluginFormSection: {
+      /** @description Sections with the same add_group are the slots of one list. The form shows the slots in use and a button that reveals the next. */
+      add_group?: string;
+      /** @description The text of the button that reveals the next slot. */
+      add_label?: string;
       collapsed_default: boolean;
       collapsible: boolean;
       description?: string;

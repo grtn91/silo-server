@@ -271,6 +271,108 @@ export function fieldIsVisible(
   );
 }
 
+export type AddSlots = {
+  /** Keys of the slot sections the form does not show yet. */
+  hidden: Set<string>;
+  /** The slot section each list's add button follows, by section key. */
+  addAfter: Map<string, { group: string; label: string }>;
+};
+
+function slotInUse(
+  descriptor: PluginAdminForm,
+  fieldKeys: string[],
+  values: Record<string, unknown>,
+): boolean {
+  return fieldKeys.some((key) => {
+    const value = values[key];
+    if (isEmpty(value)) return false;
+    const field = descriptor.fields.find((candidate) => candidate.key === key);
+    return stringify(value) !== stringify(field?.default_value);
+  });
+}
+
+/**
+ * Which slots of the form's add groups show. Sections with the same
+ * `add_group` are the slots of one list. A list shows its first slot, every
+ * slot up to the last one holding a value other than its fields' defaults,
+ * and as many as `revealed` says the admin asked for. While a slot is left,
+ * the last shown one is followed by the add button.
+ */
+export function addSlots(
+  descriptor: PluginAdminForm,
+  values: Record<string, unknown>,
+  revealed: Record<string, number> = {},
+): AddSlots {
+  const groups = new Map<string, NonNullable<PluginAdminForm["sections"]>>();
+  for (const section of descriptor.sections ?? []) {
+    if (!section.add_group) continue;
+    const slots = groups.get(section.add_group) ?? [];
+    slots.push(section);
+    groups.set(section.add_group, slots);
+  }
+  const out: AddSlots = { hidden: new Set(), addAfter: new Map() };
+  for (const [group, slots] of groups) {
+    let shown = Math.max(1, revealed[group] ?? 0);
+    slots.forEach((slot, index) => {
+      if (slotInUse(descriptor, slot.field_keys, values)) shown = Math.max(shown, index + 1);
+    });
+    shown = Math.min(shown, slots.length);
+    for (const slot of slots.slice(shown)) out.hidden.add(slot.key);
+    const last = slots[shown - 1];
+    if (last && shown < slots.length) {
+      out.addAfter.set(last.key, { group, label: last.add_label || "+" });
+    }
+  }
+  return out;
+}
+
+/**
+ * The values after two slots of a list trade places. Slots declare the same
+ * fields in the same order, so each field's value moves to the field at the
+ * same position in the other slot.
+ */
+export function swapSlotValues(
+  a: { field_keys: string[] },
+  b: { field_keys: string[] },
+  values: Record<string, unknown>,
+): Record<string, unknown> {
+  const next = { ...values };
+  const count = Math.min(a.field_keys.length, b.field_keys.length);
+  for (let i = 0; i < count; i++) {
+    const keyA = a.field_keys[i];
+    const keyB = b.field_keys[i];
+    if (keyA === undefined || keyB === undefined) continue;
+    next[keyA] = values[keyB];
+    next[keyB] = values[keyA];
+  }
+  return next;
+}
+
+/**
+ * The values after one slot of a list is removed. `slots` are the list's
+ * shown slots in order. The slots after the removed one move up a place, by
+ * the position of their fields as in swapSlotValues, and the last shown slot
+ * is emptied, which leaves its fields on their defaults.
+ */
+export function removeSlotValues(
+  slots: { field_keys: string[] }[],
+  index: number,
+  values: Record<string, unknown>,
+): Record<string, unknown> {
+  const next = { ...values };
+  for (let i = index; i < slots.length; i++) {
+    const slot = slots[i];
+    const following = slots[i + 1];
+    if (!slot) continue;
+    slot.field_keys.forEach((key, position) => {
+      const from = following?.field_keys[position];
+      if (from === undefined) delete next[key];
+      else next[key] = values[from];
+    });
+  }
+  return next;
+}
+
 export type BuildSchemaValuesOptions = {
   /**
    * Send an emptied non-secret field as an explicit clear ("" for a string

@@ -3935,6 +3935,10 @@ export interface PluginAdminFormSection {
   collapsed_default: boolean;
   field_keys: string[];
   show_when?: PluginAdminFormCondition[];
+  /** Sections with the same add_group are the slots of one list the admin grows. */
+  add_group?: string;
+  /** The text of the button that reveals the next slot. */
+  add_label?: string;
 }
 
 export interface PluginAdminFormField {
@@ -3953,6 +3957,8 @@ export interface PluginAdminFormField {
   show_when?: PluginAdminFormCondition[];
   validation?: PluginAdminFormValidation;
   exclusive_group_field?: string;
+  /** The order of a multi-select's values matters; the form lets the admin arrange them. */
+  ordered?: boolean;
   /**
    * Names a host-known value this field can be populated from in one click.
    * Used by autoscan source config so a path field can be filled from Silo's

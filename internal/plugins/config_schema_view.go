@@ -39,6 +39,8 @@ type AdminFormFieldView struct {
 	ShowWhen            []AdminFormConditionView `json:"show_when,omitempty"`
 	Validation          *AdminFormValidationView `json:"validation,omitempty"`
 	ExclusiveGroupField string                   `json:"exclusive_group_field,omitempty"`
+	// Ordered says the order of a multi-select's values matters.
+	Ordered bool `json:"ordered,omitempty"`
 }
 
 type AdminFormOptionView struct {
@@ -70,6 +72,10 @@ type AdminFormSectionView struct {
 	CollapsedDefault bool                     `json:"collapsed_default"`
 	FieldKeys        []string                 `json:"field_keys"`
 	ShowWhen         []AdminFormConditionView `json:"show_when,omitempty"`
+	// AddGroup names the list this section is one slot of, and AddLabel the
+	// button that reveals the next slot. Empty for an ordinary section.
+	AddGroup string `json:"add_group,omitempty"`
+	AddLabel string `json:"add_label,omitempty"`
 }
 
 func ConfigSchemaViews(schemas []*pluginv1.ConfigSchema) []ConfigSchemaView {
@@ -122,7 +128,7 @@ func AdminFormViewFromProto(form *pluginv1.AdminFormDescriptor) *AdminFormView {
 			Placeholder: field.GetPlaceholder(), Required: field.GetRequired(), Secret: field.GetSecret(),
 			Multiline: field.GetMultiline(), DefaultValue: defaultValue, Options: options, Rows: field.GetRows(),
 			DynamicOptions: field.GetDynamicOptions(), ShowWhen: adminFormConditionViews(field.GetShowWhen()),
-			Validation: validation, ExclusiveGroupField: field.GetExclusiveGroupField(),
+			Validation: validation, ExclusiveGroupField: field.GetExclusiveGroupField(), Ordered: field.GetOrdered(),
 		})
 	}
 	sections := make([]AdminFormSectionView, 0, len(form.GetSections()))
@@ -134,6 +140,7 @@ func AdminFormViewFromProto(form *pluginv1.AdminFormDescriptor) *AdminFormView {
 			Key: section.GetKey(), Title: section.GetTitle(), Description: section.GetDescription(),
 			Collapsible: section.GetCollapsible(), CollapsedDefault: section.GetCollapsedDefault(),
 			FieldKeys: append([]string(nil), section.GetFieldKeys()...), ShowWhen: adminFormConditionViews(section.GetShowWhen()),
+			AddGroup: section.GetAddGroup(), AddLabel: section.GetAddLabel(),
 		})
 	}
 	return &AdminFormView{Fields: fields, SubmitLabel: form.GetSubmitLabel(), Sections: sections}

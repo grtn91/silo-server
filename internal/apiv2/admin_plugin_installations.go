@@ -99,6 +99,7 @@ type AdminPluginFormField struct {
 	ShowWhen            []AdminFormCondition       `json:"show_when"`
 	Validation          *AdminPluginFormValidation `json:"validation,omitempty"`
 	ExclusiveGroupField string                     `json:"exclusive_group_field,omitempty"`
+	Ordered             bool                       `json:"ordered,omitempty" doc:"The order of a multi-select's values matters. The form shows the chosen values as a list that can be put in order."`
 }
 type AdminPluginFormSection struct {
 	Key              string               `json:"key"`
@@ -108,6 +109,8 @@ type AdminPluginFormSection struct {
 	CollapsedDefault bool                 `json:"collapsed_default"`
 	FieldKeys        []string             `json:"field_keys"`
 	ShowWhen         []AdminFormCondition `json:"show_when"`
+	AddGroup         string               `json:"add_group,omitempty" doc:"Sections with the same add_group are the slots of one list. The form shows the slots in use and a button that reveals the next."`
+	AddLabel         string               `json:"add_label,omitempty" doc:"The text of the button that reveals the next slot."`
 }
 type AdminPluginForm struct {
 	Fields      []AdminPluginFormField   `json:"fields"`
@@ -285,7 +288,7 @@ func adminPluginFormOf(f *plugins.AdminFormView) (*AdminPluginForm, error) {
 	}
 	out := &AdminPluginForm{Fields: make([]AdminPluginFormField, 0, len(f.Fields)), SubmitLabel: f.SubmitLabel, Sections: make([]AdminPluginFormSection, 0, len(f.Sections))}
 	for _, fld := range f.Fields {
-		item := AdminPluginFormField{Key: fld.Key, Label: fld.Label, Description: fld.Description, Control: fld.Control, Placeholder: fld.Placeholder, Required: fld.Required, Secret: fld.Secret, Multiline: fld.Multiline, Options: make([]AdminFormOption, 0, len(fld.Options)), Rows: fld.Rows, DynamicOptions: fld.DynamicOptions, ShowWhen: adminPluginFormConditionsOf(fld.ShowWhen), ExclusiveGroupField: fld.ExclusiveGroupField}
+		item := AdminPluginFormField{Key: fld.Key, Label: fld.Label, Description: fld.Description, Control: fld.Control, Placeholder: fld.Placeholder, Required: fld.Required, Secret: fld.Secret, Multiline: fld.Multiline, Options: make([]AdminFormOption, 0, len(fld.Options)), Rows: fld.Rows, DynamicOptions: fld.DynamicOptions, ShowWhen: adminPluginFormConditionsOf(fld.ShowWhen), ExclusiveGroupField: fld.ExclusiveGroupField, Ordered: fld.Ordered}
 		if fld.DefaultValue != nil {
 			raw, err := json.Marshal(fld.DefaultValue)
 			if err != nil {
@@ -302,7 +305,7 @@ func adminPluginFormOf(f *plugins.AdminFormView) (*AdminPluginForm, error) {
 		out.Fields = append(out.Fields, item)
 	}
 	for _, s := range f.Sections {
-		out.Sections = append(out.Sections, AdminPluginFormSection{Key: s.Key, Title: s.Title, Description: s.Description, Collapsible: s.Collapsible, CollapsedDefault: s.CollapsedDefault, FieldKeys: NonNil(s.FieldKeys), ShowWhen: adminPluginFormConditionsOf(s.ShowWhen)})
+		out.Sections = append(out.Sections, AdminPluginFormSection{Key: s.Key, Title: s.Title, Description: s.Description, Collapsible: s.Collapsible, CollapsedDefault: s.CollapsedDefault, FieldKeys: NonNil(s.FieldKeys), ShowWhen: adminPluginFormConditionsOf(s.ShowWhen), AddGroup: s.AddGroup, AddLabel: s.AddLabel})
 	}
 	return out, nil
 }

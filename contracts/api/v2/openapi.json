@@ -16879,6 +16879,10 @@
             },
             "type": "array"
           },
+          "ordered": {
+            "description": "The order of a multi-select's values matters. The form shows the chosen values as a list that can be put in order.",
+            "type": "boolean"
+          },
           "placeholder": {
             "type": "string"
           },
@@ -16919,6 +16923,14 @@
       "AdminPluginFormSection": {
         "additionalProperties": false,
         "properties": {
+          "add_group": {
+            "description": "Sections with the same add_group are the slots of one list. The form shows the slots in use and a button that reveals the next.",
+            "type": "string"
+          },
+          "add_label": {
+            "description": "The text of the button that reveals the next slot.",
+            "type": "string"
+          },
           "collapsed_default": {
             "type": "boolean"
           },
